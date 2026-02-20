@@ -25,6 +25,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/api/modules"
 	ampmodule "github.com/router-for-me/CLIProxyAPI/v6/internal/api/modules/amp"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/console"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/managementasset"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
@@ -152,6 +153,9 @@ type Server struct {
 	// management handler
 	mgmt *managementHandlers.Handler
 
+	// consoleManager handles Token console operations
+	consoleManager *console.ConsoleManager
+
 	// ampModule is the Amp routing module for model mapping hot-reload
 	ampModule *ampmodule.AmpModule
 
@@ -245,6 +249,7 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 		currentPath:         wd,
 		envManagementSecret: envManagementSecret,
 		wsRoutes:            make(map[string]struct{}),
+		consoleManager:      console.NewConsoleManager(),
 	}
 	s.wsAuthEnabled.Store(cfg.WebsocketAuth)
 	// Save initial YAML snapshot
@@ -313,6 +318,13 @@ func (s *Server) setupRoutes() {
 	if _, err := os.Stat(consolePath); err == nil {
 		s.engine.Static("/console", consolePath)
 		log.Infof("Token console static files served from: %s", consolePath)
+	}
+
+	// 外部仪表板静态文件
+	dashboardPath := filepath.Join(s.currentPath, "web", "token-console", "public")
+	if _, err := os.Stat(dashboardPath); err == nil {
+		s.engine.Static("/dashboard", dashboardPath)
+		log.Infof("External dashboard static files served from: %s", dashboardPath)
 	}
 
 	s.engine.GET("/management.html", s.serveManagementControlPanel)
@@ -431,6 +443,9 @@ func (s *Server) setupRoutes() {
 		c.String(http.StatusOK, oauthCallbackSuccessHTML)
 	})
 
+	// Management API adapter routes for external dashboard compatibility
+	s.setupManagementAPIRoutes()
+
 	// Management routes are registered lazily by registerManagementRoutes when a secret is configured.
 }
 
@@ -469,6 +484,57 @@ func (s *Server) AttachWebsocketRoute(path string, handler http.Handler) {
 	}
 
 	s.engine.GET(trimmed, conditionalAuth, finalHandler)
+}
+
+// setupManagementAPIRoutes configures the management API adapter routes for external dashboard compatibility
+func (s *Server) setupManagementAPIRoutes() {
+	if s == nil || s.engine == nil || s.consoleManager == nil {
+		return
+	}
+
+	// Create management API adapter
+	adapter := console.NewManagementAPIAdapter(s.consoleManager)
+
+	// Management API routes (no auth required for compatibility)
+	mgmt := s.engine.Group("/v0/management")
+	{
+		// Usage and statistics
+		mgmt.GET("/usage", adapter.GetUsageStatistics)
+		mgmt.GET("/activity", adapter.GetActivityLogs)
+		mgmt.GET("/stats/trends", adapter.GetUsageTrends)
+		mgmt.GET("/events", adapter.GetEvents)
+
+		// Logs
+		mgmt.GET("/logs", adapter.GetLogs)
+		mgmt.DELETE("/logs", adapter.DeleteLogs)
+
+		// API Keys
+		mgmt.GET("/api-keys", adapter.GetAPIKeys)
+		mgmt.PUT("/api-keys", adapter.PutAPIKeys)
+		mgmt.DELETE("/api-keys", adapter.DeleteAPIKeys)
+
+		// Auth status
+		mgmt.GET("/get-auth-status", adapter.GetAuthStatus)
+
+		// Configuration
+		mgmt.GET("/config", adapter.GetConfig)
+		mgmt.GET("/config/yaml", adapter.GetConfigYAML)
+		mgmt.PUT("/config/yaml", adapter.PutConfigYAML)
+
+		// Debug settings
+		mgmt.GET("/debug", adapter.GetDebug)
+		mgmt.PUT("/debug", adapter.PutDebug)
+
+		// Usage statistics settings
+		mgmt.GET("/usage-statistics-enabled", adapter.GetUsageStatisticsEnabled)
+		mgmt.PUT("/usage-statistics-enabled", adapter.PutUsageStatisticsEnabled)
+
+		// Request log settings
+		mgmt.GET("/request-log", adapter.GetRequestLog)
+		mgmt.PUT("/request-log", adapter.PutRequestLog)
+	}
+
+	log.Info("Management API adapter routes registered for external dashboard compatibility")
 }
 
 func (s *Server) registerManagementRoutes() {
