@@ -131,7 +131,18 @@ func ConvertAntigravityResponseToOpenAI(_ context.Context, _ string, originalReq
 			hasThoughtSignature := thoughtSignatureResult.Exists() && thoughtSignatureResult.String() != ""
 			hasContentPayload := partTextResult.Exists() || functionCallResult.Exists() || inlineDataResult.Exists()
 
-			// Ignore encrypted thoughtSignature but keep any actual content in the same part.
+			// Handle thoughtSignature as reasoning_content
+			if hasThoughtSignature {
+				thoughtContent := thoughtSignatureResult.String()
+				template, _ = sjson.Set(template, "choices.0.delta.reasoning_content", thoughtContent)
+				template, _ = sjson.Set(template, "choices.0.delta.role", "assistant")
+				// Debug logging for Claude models
+				if strings.Contains(strings.ToLower(gjson.GetBytes(rawJSON, "response.modelVersion").String()), "claude") {
+					log.Debugf("Claude model: found thoughtSignature in streaming response (length: %d)", len(thoughtContent))
+				}
+			}
+
+			// Skip this part if it only has thoughtSignature and no other content
 			if hasThoughtSignature && !hasContentPayload {
 				continue
 			}
@@ -235,6 +246,13 @@ func ConvertAntigravityResponseToOpenAI(_ context.Context, _ string, originalReq
 func ConvertAntigravityResponseToOpenAINonStream(ctx context.Context, modelName string, originalRequestRawJSON, requestRawJSON, rawJSON []byte, param *any) string {
 	responseResult := gjson.GetBytes(rawJSON, "response")
 	if responseResult.Exists() {
+		// Check if this is a Claude model - Claude models may have different response structure
+		if strings.Contains(strings.ToLower(modelName), "claude") {
+			// For Claude models, use the same Gemini conversion for now
+			// Claude models through Antigravity API currently don't return thoughtSignature
+			// This may be updated in the future when Antigravity API adds full Claude support
+			return ConvertGeminiResponseToOpenAINonStream(ctx, modelName, originalRequestRawJSON, requestRawJSON, []byte(responseResult.Raw), param)
+		}
 		return ConvertGeminiResponseToOpenAINonStream(ctx, modelName, originalRequestRawJSON, requestRawJSON, []byte(responseResult.Raw), param)
 	}
 	return ""

@@ -161,6 +161,13 @@ func ConvertGeminiResponseToOpenAI(_ context.Context, _ string, originalRequestR
 					hasThoughtSignature := thoughtSignatureResult.Exists() && thoughtSignatureResult.String() != ""
 					hasContentPayload := partTextResult.Exists() || functionCallResult.Exists() || inlineDataResult.Exists()
 
+					// Handle thoughtSignature as reasoning_content
+					if hasThoughtSignature {
+						thoughtContent := thoughtSignatureResult.String()
+						template, _ = sjson.Set(template, "choices.0.delta.reasoning_content", thoughtContent)
+						template, _ = sjson.Set(template, "choices.0.delta.role", "assistant")
+					}
+
 					// Skip pure thoughtSignature parts but keep any actual payload in the same part.
 					if hasThoughtSignature && !hasContentPayload {
 						continue
@@ -338,6 +345,26 @@ func ConvertGeminiResponseToOpenAINonStream(_ context.Context, _ string, origina
 					inlineDataResult := partResult.Get("inlineData")
 					if !inlineDataResult.Exists() {
 						inlineDataResult = partResult.Get("inline_data")
+					}
+					thoughtSignatureResult := partResult.Get("thoughtSignature")
+					if !thoughtSignatureResult.Exists() {
+						thoughtSignatureResult = partResult.Get("thought_signature")
+					}
+
+					hasThoughtSignature := thoughtSignatureResult.Exists() && thoughtSignatureResult.String() != ""
+					hasContentPayload := partTextResult.Exists() || functionCallResult.Exists() || inlineDataResult.Exists()
+
+					// Handle thoughtSignature as reasoning_content
+					if hasThoughtSignature {
+						thoughtContent := thoughtSignatureResult.String()
+						oldVal := gjson.Get(choiceTemplate, "message.reasoning_content").String()
+						choiceTemplate, _ = sjson.Set(choiceTemplate, "message.reasoning_content", oldVal+thoughtContent)
+						choiceTemplate, _ = sjson.Set(choiceTemplate, "message.role", "assistant")
+					}
+
+					// Skip this part if it only has thoughtSignature and no other content
+					if hasThoughtSignature && !hasContentPayload {
+						continue
 					}
 
 					if partTextResult.Exists() {
