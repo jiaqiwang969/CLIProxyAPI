@@ -1,0 +1,874 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Token 看板 - CLIProxyAPI</title>
+    <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@3/dist/chart.min.js"></script>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+        }
+
+        header {
+            background: rgba(255, 255, 255, 0.95);
+            padding: 20px;
+            border-radius: 10px;
+            margin-bottom: 30px;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+        }
+
+        header h1 {
+            color: #333;
+            font-size: 28px;
+            margin-bottom: 10px;
+        }
+
+        header p {
+            color: #666;
+            font-size: 14px;
+        }
+
+        .nav-tabs {
+            display: flex;
+            gap: 10px;
+            margin-top: 20px;
+            border-bottom: 2px solid #eee;
+        }
+
+        .nav-tab {
+            padding: 10px 20px;
+            background: none;
+            border: none;
+            cursor: pointer;
+            font-size: 14px;
+            color: #666;
+            border-bottom: 3px solid transparent;
+            transition: all 0.3s;
+        }
+
+        .nav-tab.active {
+            color: #667eea;
+            border-bottom-color: #667eea;
+        }
+
+        .nav-tab:hover {
+            color: #667eea;
+        }
+
+        .content {
+            display: none;
+        }
+
+        .content.active {
+            display: block;
+        }
+
+        /* 统计卡片 */
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 20px;
+            margin-bottom: 30px;
+        }
+
+        .stat-card {
+            background: rgba(255, 255, 255, 0.95);
+            padding: 20px;
+            border-radius: 10px;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+            transition: transform 0.3s;
+        }
+
+        .stat-card:hover {
+            transform: translateY(-5px);
+        }
+
+        .stat-card h3 {
+            color: #666;
+            font-size: 14px;
+            margin-bottom: 10px;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+
+        .stat-card .value {
+            font-size: 32px;
+            font-weight: bold;
+            color: #333;
+            margin-bottom: 10px;
+        }
+
+        .stat-card .unit {
+            color: #999;
+            font-size: 12px;
+        }
+
+        .stat-card.primary .value {
+            color: #667eea;
+        }
+
+        .stat-card.success .value {
+            color: #10b981;
+        }
+
+        .stat-card.warning .value {
+            color: #f59e0b;
+        }
+
+        .stat-card.danger .value {
+            color: #ef4444;
+        }
+
+        /* 进度条 */
+        .progress-bar {
+            width: 100%;
+            height: 8px;
+            background: #eee;
+            border-radius: 4px;
+            overflow: hidden;
+            margin-top: 10px;
+        }
+
+        .progress-fill {
+            height: 100%;
+            background: linear-gradient(90deg, #667eea, #764ba2);
+            transition: width 0.3s;
+        }
+
+        /* 表格 */
+        .table-container {
+            background: rgba(255, 255, 255, 0.95);
+            border-radius: 10px;
+            overflow: hidden;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+            margin-bottom: 30px;
+        }
+
+        .table-header {
+            padding: 20px;
+            border-bottom: 1px solid #eee;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .table-header h2 {
+            color: #333;
+            font-size: 18px;
+        }
+
+        .search-box {
+            display: flex;
+            gap: 10px;
+        }
+
+        .search-box input {
+            padding: 8px 12px;
+            border: 1px solid #ddd;
+            border-radius: 5px;
+            font-size: 14px;
+        }
+
+        .search-box button {
+            padding: 8px 16px;
+            background: #667eea;
+            color: white;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 14px;
+            transition: background 0.3s;
+        }
+
+        .search-box button:hover {
+            background: #764ba2;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+
+        th {
+            background: #f9fafb;
+            padding: 12px 20px;
+            text-align: left;
+            font-weight: 600;
+            color: #666;
+            font-size: 13px;
+            border-bottom: 1px solid #eee;
+        }
+
+        td {
+            padding: 12px 20px;
+            border-bottom: 1px solid #eee;
+            font-size: 14px;
+            color: #333;
+        }
+
+        tr:hover {
+            background: #f9fafb;
+        }
+
+        .badge {
+            display: inline-block;
+            padding: 4px 12px;
+            border-radius: 20px;
+            font-size: 12px;
+            font-weight: 600;
+        }
+
+        .badge.success {
+            background: #d1fae5;
+            color: #065f46;
+        }
+
+        .badge.warning {
+            background: #fef3c7;
+            color: #92400e;
+        }
+
+        .badge.danger {
+            background: #fee2e2;
+            color: #991b1b;
+        }
+
+        .badge.info {
+            background: #dbeafe;
+            color: #0c2d6b;
+        }
+
+        /* 图表容器 */
+        .chart-container {
+            background: rgba(255, 255, 255, 0.95);
+            padding: 20px;
+            border-radius: 10px;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+            margin-bottom: 30px;
+        }
+
+        .chart-container h2 {
+            color: #333;
+            font-size: 18px;
+            margin-bottom: 20px;
+        }
+
+        .chart-wrapper {
+            position: relative;
+            height: 300px;
+        }
+
+        /* 日志 */
+        .log-item {
+            padding: 12px 20px;
+            border-bottom: 1px solid #eee;
+            display: flex;
+            gap: 15px;
+            align-items: flex-start;
+        }
+
+        .log-item:last-child {
+            border-bottom: none;
+        }
+
+        .log-time {
+            color: #999;
+            font-size: 12px;
+            min-width: 150px;
+            font-family: 'Courier New', monospace;
+        }
+
+        .log-content {
+            flex: 1;
+        }
+
+        .log-method {
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 3px;
+            font-size: 12px;
+            font-weight: 600;
+            margin-right: 10px;
+        }
+
+        .log-method.get {
+            background: #dbeafe;
+            color: #0c2d6b;
+        }
+
+        .log-method.post {
+            background: #d1fae5;
+            color: #065f46;
+        }
+
+        .log-method.put {
+            background: #fef3c7;
+            color: #92400e;
+        }
+
+        .log-method.delete {
+            background: #fee2e2;
+            color: #991b1b;
+        }
+
+        .log-status {
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 3px;
+            font-size: 12px;
+            font-weight: 600;
+        }
+
+        .log-status.success {
+            background: #d1fae5;
+            color: #065f46;
+        }
+
+        .log-status.error {
+            background: #fee2e2;
+            color: #991b1b;
+        }
+
+        /* 密钥管理 */
+        .key-item {
+            padding: 15px 20px;
+            border-bottom: 1px solid #eee;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .key-item:last-child {
+            border-bottom: none;
+        }
+
+        .key-info h3 {
+            color: #333;
+            font-size: 14px;
+            margin-bottom: 5px;
+        }
+
+        .key-info p {
+            color: #999;
+            font-size: 12px;
+        }
+
+        .key-value {
+            font-family: 'Courier New', monospace;
+            color: #666;
+            font-size: 12px;
+            background: #f9fafb;
+            padding: 8px 12px;
+            border-radius: 5px;
+            margin: 5px 0;
+            word-break: break-all;
+        }
+
+        .key-actions {
+            display: flex;
+            gap: 10px;
+        }
+
+        .btn {
+            padding: 8px 16px;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 12px;
+            transition: all 0.3s;
+        }
+
+        .btn-primary {
+            background: #667eea;
+            color: white;
+        }
+
+        .btn-primary:hover {
+            background: #764ba2;
+        }
+
+        .btn-danger {
+            background: #ef4444;
+            color: white;
+        }
+
+        .btn-danger:hover {
+            background: #dc2626;
+        }
+
+        .btn-secondary {
+            background: #e5e7eb;
+            color: #333;
+        }
+
+        .btn-secondary:hover {
+            background: #d1d5db;
+        }
+
+        /* 模态框 */
+        .modal {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(0, 0, 0, 0.5);
+            z-index: 1000;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .modal.active {
+            display: flex;
+        }
+
+        .modal-content {
+            background: white;
+            padding: 30px;
+            border-radius: 10px;
+            max-width: 500px;
+            width: 90%;
+            box-shadow: 0 20px 25px rgba(0, 0, 0, 0.15);
+        }
+
+        .modal-header {
+            font-size: 20px;
+            font-weight: bold;
+            color: #333;
+            margin-bottom: 20px;
+        }
+
+        .modal-body {
+            margin-bottom: 20px;
+        }
+
+        .form-group {
+            margin-bottom: 15px;
+        }
+
+        .form-group label {
+            display: block;
+            color: #333;
+            font-size: 14px;
+            margin-bottom: 5px;
+            font-weight: 600;
+        }
+
+        .form-group input,
+        .form-group textarea {
+            width: 100%;
+            padding: 10px;
+            border: 1px solid #ddd;
+            border-radius: 5px;
+            font-size: 14px;
+            font-family: inherit;
+        }
+
+        .form-group textarea {
+            resize: vertical;
+            min-height: 100px;
+        }
+
+        .modal-footer {
+            display: flex;
+            gap: 10px;
+            justify-content: flex-end;
+        }
+
+        /* 响应式 */
+        @media (max-width: 768px) {
+            .stats-grid {
+                grid-template-columns: 1fr;
+            }
+
+            .table-header {
+                flex-direction: column;
+                gap: 15px;
+            }
+
+            .search-box {
+                width: 100%;
+            }
+
+            .search-box input {
+                flex: 1;
+            }
+
+            .nav-tabs {
+                overflow-x: auto;
+            }
+
+            .key-item {
+                flex-direction: column;
+                gap: 10px;
+            }
+        }
+
+        /* 加载动画 */
+        .loading {
+            display: inline-block;
+            width: 20px;
+            height: 20px;
+            border: 3px solid #f3f3f3;
+            border-top: 3px solid #667eea;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+        }
+
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+
+        .empty-state {
+            text-align: center;
+            padding: 40px 20px;
+            color: #999;
+        }
+
+        .empty-state p {
+            font-size: 14px;
+            margin-bottom: 10px;
+        }
+    </style>
+</head>
+<body>
+    <div id="app">
+        <div class="container">
+            <header>
+                <h1>🔑 Token 看板</h1>
+                <p>实时监控 API 使用情况和 Token 消耗</p>
+                <div class="nav-tabs">
+                    <button class="nav-tab active" @click="activeTab = 'dashboard'">📊 仪表板</button>
+                    <button class="nav-tab" @click="activeTab = 'logs'">📝 日志</button>
+                    <button class="nav-tab" @click="activeTab = 'keys'">🔐 密钥管理</button>
+                </div>
+            </header>
+
+            <!-- 仪表板 -->
+            <div class="content active" v-if="activeTab === 'dashboard'">
+                <div class="stats-grid">
+                    <div class="stat-card primary">
+                        <h3>总 Token 数</h3>
+                        <div class="value">{{ stats.totalTokens.toLocaleString() }}</div>
+                        <div class="unit">个</div>
+                    </div>
+                    <div class="stat-card success">
+                        <h3>已使用 Token</h3>
+                        <div class="value">{{ stats.usedTokens.toLocaleString() }}</div>
+                        <div class="unit">个</div>
+                        <div class="progress-bar">
+                            <div class="progress-fill" :style="{ width: stats.usagePercent + '%' }"></div>
+                        </div>
+                    </div>
+                    <div class="stat-card warning">
+                        <h3>剩余 Token</h3>
+                        <div class="value">{{ stats.remainingTokens.toLocaleString() }}</div>
+                        <div class="unit">个</div>
+                    </div>
+                    <div class="stat-card danger">
+                        <h3>API 调用次数</h3>
+                        <div class="value">{{ stats.apiCalls.toLocaleString() }}</div>
+                        <div class="unit">次</div>
+                    </div>
+                </div>
+
+                <div class="chart-container">
+                    <h2>Token 使用趋势</h2>
+                    <div class="chart-wrapper">
+                        <canvas id="usageChart"></canvas>
+                    </div>
+                </div>
+
+                <div class="table-container">
+                    <div class="table-header">
+                        <h2>模型使用统计</h2>
+                    </div>
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>模型名称</th>
+                                <th>调用次数</th>
+                                <th>消耗 Token</th>
+                                <th>平均耗时</th>
+                                <th>成功率</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr v-for="model in stats.models" :key="model.name">
+                                <td>{{ model.name }}</td>
+                                <td>{{ model.calls }}</td>
+                                <td>{{ model.tokens }}</td>
+                                <td>{{ model.avgTime }}ms</td>
+                                <td><span class="badge success">{{ model.successRate }}%</span></td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+
+            <!-- 日志 -->
+            <div class="content" v-if="activeTab === 'logs'">
+                <div class="table-container">
+                    <div class="table-header">
+                        <h2>API 调用日志</h2>
+                        <div class="search-box">
+                            <input type="text" v-model="logFilter" placeholder="搜索日志...">
+                            <button @click="refreshLogs">刷新</button>
+                        </div>
+                    </div>
+                    <div v-if="filteredLogs.length > 0">
+                        <div v-for="log in filteredLogs" :key="log.id" class="log-item">
+                            <div class="log-time">{{ log.timestamp }}</div>
+                            <div class="log-content">
+                                <span class="log-method" :class="log.method.toLowerCase()">{{ log.method }}</span>
+                                <span>{{ log.endpoint }}</span>
+                                <span class="log-status" :class="log.status >= 400 ? 'error' : 'success'">{{ log.status }}</span>
+                                <div style="margin-top: 5px; color: #999; font-size: 12px;">
+                                    Token: {{ log.tokens }} | 耗时: {{ log.duration }}ms
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                    <div v-else class="empty-state">
+                        <p>暂无日志数据</p>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 密钥管理 -->
+            <div class="content" v-if="activeTab === 'keys'">
+                <div class="table-container">
+                    <div class="table-header">
+                        <h2>API 密钥</h2>
+                        <button class="btn btn-primary" @click="showAddKeyModal = true">+ 新增密钥</button>
+                    </div>
+                    <div v-if="apiKeys.length > 0">
+                        <div v-for="key in apiKeys" :key="key.id" class="key-item">
+                            <div class="key-info">
+                                <h3>{{ key.name }}</h3>
+                                <p>创建时间: {{ key.createdAt }}</p>
+                                <p>最后使用: {{ key.lastUsed }}</p>
+                                <div class="key-value">{{ key.value }}</div>
+                            </div>
+                            <div class="key-actions">
+                                <button class="btn btn-secondary" @click="copyToClipboard(key.value)">复制</button>
+                                <button class="btn btn-danger" @click="deleteKey(key.id)">删除</button>
+                            </div>
+                        </div>
+                    </div>
+                    <div v-else class="empty-state">
+                        <p>暂无 API 密钥</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- 新增密钥模态框 -->
+        <div class="modal" :class="{ active: showAddKeyModal }">
+            <div class="modal-content">
+                <div class="modal-header">新增 API 密钥</div>
+                <div class="modal-body">
+                    <div class="form-group">
+                        <label>密钥名称</label>
+                        <input type="text" v-model="newKey.name" placeholder="例如: 生产环境密钥">
+                    </div>
+                    <div class="form-group">
+                        <label>描述</label>
+                        <textarea v-model="newKey.description" placeholder="输入密钥描述..."></textarea>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button class="btn btn-secondary" @click="showAddKeyModal = false">取消</button>
+                    <button class="btn btn-primary" @click="addKey">创建</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const { createApp, ref, computed, onMounted } = Vue;
+
+        createApp({
+            setup() {
+                const activeTab = ref('dashboard');
+                const logFilter = ref('');
+                const showAddKeyModal = ref(false);
+                const newKey = ref({ name: '', description: '' });
+                let usageChart = null;
+
+                const stats = ref({
+                    totalTokens: 100000,
+                    usedTokens: 65432,
+                    remainingTokens: 34568,
+                    apiCalls: 1234,
+                    usagePercent: 65.43,
+                    models: [
+                        { name: 'claude-sonnet-4-6', calls: 456, tokens: 23456, avgTime: 1200, successRate: 99.8 },
+                        { name: 'claude-opus-4-6', calls: 234, tokens: 18765, avgTime: 1500, successRate: 99.9 },
+                        { name: 'gemini-3.1-pro', calls: 345, tokens: 15234, avgTime: 800, successRate: 99.5 },
+                        { name: 'gpt-4', calls: 199, tokens: 7977, avgTime: 1100, successRate: 99.7 },
+                    ]
+                });
+
+                const logs = ref([
+                    { id: 1, timestamp: '2026-02-20 18:45:32', method: 'POST', endpoint: '/v1/chat/completions', status: 200, tokens: 1234, duration: 1200 },
+                    { id: 2, timestamp: '2026-02-20 18:44:15', method: 'GET', endpoint: '/v1/models', status: 200, tokens: 0, duration: 50 },
+                    { id: 3, timestamp: '2026-02-20 18:43:48', method: 'POST', endpoint: '/v1/chat/completions', status: 200, tokens: 2345, duration: 1500 },
+                    { id: 4, timestamp: '2026-02-20 18:42:20', method: 'POST', endpoint: '/v1/embeddings', status: 200, tokens: 567, duration: 800 },
+                    { id: 5, timestamp: '2026-02-20 18:41:05', method: 'POST', endpoint: '/v1/chat/completions', status: 429, tokens: 0, duration: 100 },
+                ]);
+
+                const apiKeys = ref([
+                    { id: 1, name: '生产环境密钥', value: 'sk-prod-abc123def456ghi789jkl', createdAt: '2026-01-15', lastUsed: '2026-02-20 18:45:32' },
+                    { id: 2, name: '测试环境密钥', value: 'sk-test-xyz789uvw456rst123opq', createdAt: '2026-02-01', lastUsed: '2026-02-20 17:30:00' },
+                ]);
+
+                const filteredLogs = computed(() => {
+                    if (!logFilter.value) return logs.value;
+                    return logs.value.filter(log =>
+                        log.endpoint.includes(logFilter.value) ||
+                        log.method.includes(logFilter.value) ||
+                        log.status.toString().includes(logFilter.value)
+                    );
+                });
+
+                const refreshLogs = () => {
+                    // 模拟刷新日志
+                    console.log('刷新日志...');
+                };
+
+                const copyToClipboard = (text) => {
+                    navigator.clipboard.writeText(text).then(() => {
+                        alert('已复制到剪贴板');
+                    });
+                };
+
+                const deleteKey = (id) => {
+                    if (confirm('确定要删除这个密钥吗？')) {
+                        apiKeys.value = apiKeys.value.filter(key => key.id !== id);
+                    }
+                };
+
+                const addKey = () => {
+                    if (!newKey.value.name) {
+                        alert('请输入密钥名称');
+                        return;
+                    }
+                    const key = {
+                        id: Math.max(...apiKeys.value.map(k => k.id), 0) + 1,
+                        name: newKey.value.name,
+                        value: 'sk-' + Math.random().toString(36).substr(2, 30),
+                        createdAt: new Date().toLocaleDateString('zh-CN'),
+                        lastUsed: '-'
+                    };
+                    apiKeys.value.push(key);
+                    newKey.value = { name: '', description: '' };
+                    showAddKeyModal.value = false;
+                };
+
+                const initChart = () => {
+                    const ctx = document.getElementById('usageChart');
+                    if (!ctx) return;
+
+                    if (usageChart) {
+                        usageChart.destroy();
+                    }
+
+                    usageChart = new Chart(ctx, {
+                        type: 'line',
+                        data: {
+                            labels: ['周一', '周二', '周三', '周四', '周五', '周六', '周日'],
+                            datasets: [
+                                {
+                                    label: 'Token 消耗',
+                                    data: [8000, 9500, 7200, 10500, 12300, 11800, 9700],
+                                    borderColor: '#667eea',
+                                    backgroundColor: 'rgba(102, 126, 234, 0.1)',
+                                    tension: 0.4,
+                                    fill: true,
+                                    pointRadius: 5,
+                                    pointBackgroundColor: '#667eea',
+                                    pointBorderColor: '#fff',
+                                    pointBorderWidth: 2,
+                                },
+                                {
+                                    label: 'API 调用次数',
+                                    data: [120, 150, 100, 180, 200, 190, 160],
+                                    borderColor: '#764ba2',
+                                    backgroundColor: 'rgba(118, 75, 162, 0.1)',
+                                    tension: 0.4,
+                                    fill: true,
+                                    pointRadius: 5,
+                                    pointBackgroundColor: '#764ba2',
+                                    pointBorderColor: '#fff',
+                                    pointBorderWidth: 2,
+                                }
+                            ]
+                        },
+                        options: {
+                            responsive: true,
+                            maintainAspectRatio: false,
+                            plugins: {
+                                legend: {
+                                    display: true,
+                                    position: 'top',
+                                }
+                            },
+                            scales: {
+                                y: {
+                                    beginAtZero: true,
+                                    grid: {
+                                        color: 'rgba(0, 0, 0, 0.05)'
+                                    }
+                                },
+                                x: {
+                                    grid: {
+                                        display: false
+                                    }
+                                }
+                            }
+                        }
+                    });
+                };
+
+                onMounted(() => {
+                    setTimeout(initChart, 100);
+                });
+
+                return {
+                    activeTab,
+                    logFilter,
+                    showAddKeyModal,
+                    newKey,
+                    stats,
+                    logs,
+                    apiKeys,
+                    filteredLogs,
+                    refreshLogs,
+                    copyToClipboard,
+                    deleteKey,
+                    addKey,
+                };
+            }
+        }).mount('#app');
+    </script>
+</body>
+</html>
