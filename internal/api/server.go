@@ -308,6 +308,13 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 // setupRoutes configures the API routes for the server.
 // It defines the endpoints and associates them with their respective handlers.
 func (s *Server) setupRoutes() {
+	// Token 看板静态文件
+	consolePath := filepath.Join(s.currentPath, "web", "token-console", "public")
+	if _, err := os.Stat(consolePath); err == nil {
+		s.engine.Static("/console", consolePath)
+		log.Infof("Token console static files served from: %s", consolePath)
+	}
+
 	s.engine.GET("/management.html", s.serveManagementControlPanel)
 	openaiHandlers := openai.NewOpenAIAPIHandler(s.handlers)
 	geminiHandlers := gemini.NewGeminiAPIHandler(s.handlers)
