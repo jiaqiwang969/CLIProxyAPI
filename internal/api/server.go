@@ -313,24 +313,17 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 // setupRoutes configures the API routes for the server.
 // It defines the endpoints and associates them with their respective handlers.
 func (s *Server) setupRoutes() {
-	// Token 看板静态文件
+	// Token 看板静态文件 - 使用外部仪表板
 	consolePath := filepath.Join(s.currentPath, "web", "token-console", "public")
 	if _, err := os.Stat(consolePath); err == nil {
 		s.engine.Static("/console", consolePath)
 		log.Infof("Token console static files served from: %s", consolePath)
 	}
 
-	// 外部仪表板静态文件
-	dashboardPath := filepath.Join(s.currentPath, "web", "token-console", "public")
-	if _, err := os.Stat(dashboardPath); err == nil {
-		s.engine.Static("/dashboard", dashboardPath)
-		log.Infof("External dashboard static files served from: %s", dashboardPath)
-	}
-
-	// 管理仪表板路由
+	// 管理仪表板路由 - 指向外部仪表板
 	s.engine.GET("/management", func(c *gin.Context) {
-		managementDashboardPath := filepath.Join(s.currentPath, "web", "token-console", "public", "management-dashboard.html")
-		c.File(managementDashboardPath)
+		indexPath := filepath.Join(s.currentPath, "web", "token-console", "public", "index.html")
+		c.File(indexPath)
 	})
 
 	s.engine.GET("/management.html", s.serveManagementControlPanel)
