@@ -327,6 +327,12 @@ func (s *Server) setupRoutes() {
 		log.Infof("External dashboard static files served from: %s", dashboardPath)
 	}
 
+	// 管理仪表板路由
+	s.engine.GET("/management", func(c *gin.Context) {
+		managementDashboardPath := filepath.Join(s.currentPath, "web", "token-console", "public", "management-dashboard.html")
+		c.File(managementDashboardPath)
+	})
+
 	s.engine.GET("/management.html", s.serveManagementControlPanel)
 	openaiHandlers := openai.NewOpenAIAPIHandler(s.handlers)
 	geminiHandlers := gemini.NewGeminiAPIHandler(s.handlers)
