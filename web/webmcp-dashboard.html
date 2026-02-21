@@ -1,0 +1,445 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WebMCP 工具管理 - CLIProxyAPI</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+        }
+
+        .header {
+            background: white;
+            border-radius: 8px;
+            padding: 30px;
+            margin-bottom: 30px;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+        }
+
+        .header h1 {
+            font-size: 32px;
+            color: #333;
+            margin-bottom: 10px;
+        }
+
+        .header p {
+            color: #666;
+            font-size: 16px;
+        }
+
+        .stats {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 20px;
+            margin-top: 20px;
+        }
+
+        .stat-card {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 20px;
+            border-radius: 8px;
+            text-align: center;
+        }
+
+        .stat-value {
+            font-size: 32px;
+            font-weight: bold;
+            margin-bottom: 5px;
+        }
+
+        .stat-label {
+            font-size: 14px;
+            opacity: 0.9;
+        }
+
+        .main-content {
+            background: white;
+            border-radius: 8px;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+            overflow: hidden;
+        }
+
+        .sidebar {
+            display: flex;
+            gap: 20px;
+            margin-bottom: 30px;
+        }
+
+        .quick-actions {
+            background: white;
+            border-radius: 8px;
+            padding: 20px;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+            flex: 0 0 250px;
+        }
+
+        .quick-actions h3 {
+            margin-bottom: 15px;
+            color: #333;
+            font-size: 16px;
+        }
+
+        .action-btn {
+            display: block;
+            width: 100%;
+            padding: 12px;
+            margin-bottom: 10px;
+            background: #667eea;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 14px;
+            transition: all 0.3s;
+        }
+
+        .action-btn:hover {
+            background: #5568d3;
+            transform: translateX(5px);
+        }
+
+        .action-btn.secondary {
+            background: #f0f0f0;
+            color: #333;
+        }
+
+        .action-btn.secondary:hover {
+            background: #e0e0e0;
+        }
+
+        .content-area {
+            flex: 1;
+        }
+
+        .loading-spinner {
+            display: inline-block;
+            width: 20px;
+            height: 20px;
+            border: 3px solid #f3f3f3;
+            border-top: 3px solid #667eea;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+        }
+
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+
+        .alert {
+            padding: 15px;
+            margin-bottom: 20px;
+            border-radius: 4px;
+            display: none;
+        }
+
+        .alert.show {
+            display: block;
+        }
+
+        .alert.success {
+            background: #c8e6c9;
+            color: #2e7d32;
+            border-left: 4px solid #2e7d32;
+        }
+
+        .alert.error {
+            background: #ffcdd2;
+            color: #c62828;
+            border-left: 4px solid #c62828;
+        }
+
+        .alert.info {
+            background: #bbdefb;
+            color: #1565c0;
+            border-left: 4px solid #1565c0;
+        }
+
+        #webmcp-container {
+            margin-top: 20px;
+        }
+
+        .footer {
+            text-align: center;
+            color: white;
+            margin-top: 40px;
+            font-size: 14px;
+        }
+
+        .footer a {
+            color: white;
+            text-decoration: none;
+        }
+
+        .footer a:hover {
+            text-decoration: underline;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <!-- 头部 -->
+        <div class="header">
+            <h1>🚀 WebMCP 工具管理系统</h1>
+            <p>强大的工具编排、工作流管理和性能监控平台</p>
+
+            <div class="stats">
+                <div class="stat-card">
+                    <div class="stat-value" id="stat-tools">0</div>
+                    <div class="stat-label">已注册工具</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-value" id="stat-workflows">0</div>
+                    <div class="stat-label">已定义工作流</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-value" id="stat-executions">0</div>
+                    <div class="stat-label">执行记录</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-value" id="stat-metrics">0</div>
+                    <div class="stat-label">性能指标</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- 提示信息 -->
+        <div class="alert" id="alert-success"></div>
+        <div class="alert" id="alert-error"></div>
+        <div class="alert" id="alert-info"></div>
+
+        <!-- 主要内容 -->
+        <div style="display: flex; gap: 20px;">
+            <!-- 快速操作 -->
+            <div class="quick-actions">
+                <h3>⚡ 快速操作</h3>
+                <button class="action-btn" id="btn-init-examples">初始化示例数据</button>
+                <button class="action-btn secondary" id="btn-export-data">导出数据</button>
+                <button class="action-btn secondary" id="btn-import-data">导入数据</button>
+                <button class="action-btn secondary" id="btn-refresh-all">刷新所有数据</button>
+                <button class="action-btn secondary" id="btn-clear-cache">清空缓存</button>
+            </div>
+
+            <!-- WebMCP 容器 -->
+            <div class="content-area">
+                <div id="webmcp-container"></div>
+            </div>
+        </div>
+
+        <!-- 页脚 -->
+        <div class="footer">
+            <p>WebMCP Dashboard Integration v1.0.0 |
+                <a href="https://github.com/router-for-me/CLIProxyAPI" target="_blank">GitHub</a> |
+                <a href="#" onclick="showDocumentation()">文档</a>
+            </p>
+        </div>
+    </div>
+
+    <!-- 脚本 -->
+    <script src="/api/webmcp/dashboard/webmcp-dashboard-manager.js"></script>
+    <script src="/api/webmcp/dashboard/webmcp-dashboard-ui.js"></script>
+    <script src="/api/webmcp/dashboard/webmcp-examples.js"></script>
+
+    <script>
+        // 初始化
+        let manager;
+        let ui;
+
+        async function init() {
+            try {
+                // 创建管理器
+                manager = new WebMCPDashboardManager('/api/webmcp');
+
+                // 创建UI
+                ui = new WebMCPDashboardUI(manager, 'webmcp-container');
+
+                // 监听事件
+                manager.on('tools:loaded', updateStats);
+                manager.on('workflows:loaded', updateStats);
+                manager.on('executions:loaded', updateStats);
+                manager.on('metrics:all-loaded', updateStats);
+                manager.on('error', handleError);
+
+                // 绑定按钮事件
+                document.getElementById('btn-init-examples').addEventListener('click', initializeExamples);
+                document.getElementById('btn-export-data').addEventListener('click', exportData);
+                document.getElementById('btn-import-data').addEventListener('click', importData);
+                document.getElementById('btn-refresh-all').addEventListener('click', refreshAll);
+                document.getElementById('btn-clear-cache').addEventListener('click', clearCache);
+
+                // 加载初始数据
+                await manager.listTools();
+
+                showAlert('success', '✓ WebMCP 系统已就绪！');
+            } catch (error) {
+                console.error('初始化失败:', error);
+                showAlert('error', '✗ 初始化失败: ' + error.message);
+            }
+        }
+
+        function updateStats() {
+            const stats = manager.getToolStats();
+            document.getElementById('stat-tools').textContent = stats.totalTools;
+            document.getElementById('stat-workflows').textContent = stats.totalWorkflows;
+            document.getElementById('stat-executions').textContent = stats.totalExecutions;
+            document.getElementById('stat-metrics').textContent = stats.metricsTracked;
+        }
+
+        async function initializeExamples() {
+            try {
+                showAlert('info', '正在初始化示例数据...');
+
+                const examples = getExampleData();
+
+                // 注册所有示例工具
+                for (const tool of examples.tools) {
+                    await manager.registerTool(tool);
+                }
+
+                // 定义所有示例工作流
+                for (const workflow of examples.workflows) {
+                    await manager.defineWorkflow(workflow);
+                }
+
+                // 定义所有示例权限
+                for (const permission of examples.permissions) {
+                    await manager.definePermission(permission);
+                }
+
+                // 刷新数据
+                await manager.listTools();
+                await manager.listWorkflows();
+                await manager.getAllMetrics();
+
+                updateStats();
+                showAlert('success', '✓ 示例数据初始化成功！已加载 ' + examples.tools.length + ' 个工具和 ' + examples.workflows.length + ' 个工作流');
+            } catch (error) {
+                console.error('初始化示例数据失败:', error);
+                showAlert('error', '✗ 初始化失败: ' + error.message);
+            }
+        }
+
+        async function exportData() {
+            try {
+                const result = await manager.exportData();
+                const dataStr = JSON.stringify(result.data, null, 2);
+                const dataBlob = new Blob([dataStr], { type: 'application/json' });
+                const url = URL.createObjectURL(dataBlob);
+                const link = document.createElement('a');
+                link.href = url;
+                link.download = `webmcp-export-${new Date().toISOString().split('T')[0]}.json`;
+                link.click();
+                URL.revokeObjectURL(url);
+                showAlert('success', '✓ 数据导出成功！');
+            } catch (error) {
+                console.error('导出失败:', error);
+                showAlert('error', '✗ 导出失败: ' + error.message);
+            }
+        }
+
+        async function importData() {
+            const input = document.createElement('input');
+            input.type = 'file';
+            input.accept = '.json';
+            input.onchange = async (e) => {
+                try {
+                    const file = e.target.files[0];
+                    const text = await file.text();
+                    const data = JSON.parse(text);
+                    await manager.importData(data);
+                    await manager.listTools();
+                    await manager.listWorkflows();
+                    updateStats();
+                    showAlert('success', '✓ 数据导入成功！');
+                } catch (error) {
+                    console.error('导入失败:', error);
+                    showAlert('error', '✗ 导入失败: ' + error.message);
+                }
+            };
+            input.click();
+        }
+
+        async function refreshAll() {
+            try {
+                showAlert('info', '正在刷新所有数据...');
+                await manager.listTools();
+                await manager.listWorkflows();
+                await manager.listExecutions();
+                await manager.getAllMetrics();
+                updateStats();
+                showAlert('success', '✓ 数据刷新成功！');
+            } catch (error) {
+                console.error('刷新失败:', error);
+                showAlert('error', '✗ 刷新失败: ' + error.message);
+            }
+        }
+
+        function clearCache() {
+            if (confirm('确定要清空所有缓存吗？')) {
+                manager.clearCache();
+                updateStats();
+                showAlert('success', '✓ 缓存已清空！');
+            }
+        }
+
+        function handleError(error) {
+            console.error('API 错误:', error);
+            showAlert('error', '✗ 错误: ' + error.error);
+        }
+
+        function showAlert(type, message) {
+            const alertId = `alert-${type}`;
+            const alert = document.getElementById(alertId);
+            alert.textContent = message;
+            alert.classList.add('show');
+            setTimeout(() => {
+                alert.classList.remove('show');
+            }, 5000);
+        }
+
+        function showDocumentation() {
+            alert(`WebMCP 工具管理系统 - 使用指南
+
+1. 工具管理
+   - 注册新工具：点击"注册新工具"按钮
+   - 搜索工具：使用搜索栏和类别过滤
+   - 查看工具详情：点击工具卡片
+
+2. 工作流管理
+   - 创建工作流：点击"创建工作流"按钮
+   - 执行工作流：点击工作流卡片上的"执行"按钮
+   - 查看执行记录：切换到"执行记录"标签页
+
+3. 性能监控
+   - 查看工具指标：切换到"指标"标签页
+   - 监控执行性能：查看平均耗时、成功率等
+
+4. 数据管理
+   - 导出数据：点击"导出数据"按钮
+   - 导入数据：点击"导入数据"按钮
+   - 初始化示例：点击"初始化示例数据"按钮
+
+更多信息请访问：https://github.com/router-for-me/CLIProxyAPI`);
+        }
+
+        // 页面加载时初始化
+        document.addEventListener('DOMContentLoaded', init);
+    </script>
+</body>
+</html>

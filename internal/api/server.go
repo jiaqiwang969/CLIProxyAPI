@@ -356,6 +356,11 @@ func (s *Server) setupRoutes() {
 		v1beta.GET("/models/*action", geminiHandlers.GeminiGetHandler)
 	}
 
+	// WebMCP routes
+	webmcpAdapter := console.NewWebMCPAdapter()
+	webmcpHandler := console.NewWebMCPHandler(webmcpAdapter)
+	webmcpHandler.RegisterRoutes(s.engine)
+
 	// Root endpoint
 	s.engine.GET("/", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{
