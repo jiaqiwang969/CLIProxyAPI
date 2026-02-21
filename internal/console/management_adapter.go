@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
 )
 
 // ManagementAPIAdapter provides compatibility layer for external dashboard
@@ -23,38 +24,11 @@ func NewManagementAPIAdapter(manager *ConsoleManager) *ManagementAPIAdapter {
 
 // GetUsageStatistics handles GET /v0/management/usage
 func (a *ManagementAPIAdapter) GetUsageStatistics(c *gin.Context) {
-	stats := a.manager.GetStats()
-
-	// Build model stats map
-	modelStats := make(map[string]map[string]interface{})
-	for _, model := range stats.Models {
-		modelStats[model.Name] = map[string]interface{}{
-			"tokens":   model.TokenCount,
-			"requests": model.CallCount,
-		}
-	}
+	snapshot := usage.GetRequestStatistics().Snapshot()
 
 	c.JSON(http.StatusOK, gin.H{
-		"usage": gin.H{
-			"total_tokens":   stats.TotalTokens,
-			"total_requests": stats.APICallCount,
-			"apis": gin.H{
-				"claude": gin.H{
-					"models": gin.H{
-						"claude-opus-4-6": modelStats["claude-opus-4-6"],
-						"claude-sonnet-4-6": modelStats["claude-sonnet-4-6"],
-						"claude-haiku-4-5-20251001": modelStats["claude-haiku-4-5-20251001"],
-					},
-				},
-				"gemini": gin.H{
-					"models": gin.H{
-						"gemini-3.1-pro-high": modelStats["gemini-3.1-pro-high"],
-						"gemini-3.1-pro": modelStats["gemini-3.1-pro"],
-						"gemini-3.1-flash": modelStats["gemini-3.1-flash"],
-					},
-				},
-			},
-		},
+		"usage":           snapshot,
+		"failed_requests": snapshot.FailureCount,
 	})
 }
 
@@ -271,7 +245,7 @@ func (a *ManagementAPIAdapter) PutDebug(c *gin.Context) {
 // GetUsageStatisticsEnabled handles GET /v0/management/usage-statistics-enabled
 func (a *ManagementAPIAdapter) GetUsageStatisticsEnabled(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
-		"usage-statistics-enabled": true,
+		"usage-statistics-enabled": usage.StatisticsEnabled(),
 	})
 }
 
@@ -285,8 +259,11 @@ func (a *ManagementAPIAdapter) PutUsageStatisticsEnabled(c *gin.Context) {
 		return
 	}
 
+	usage.SetStatisticsEnabled(req.Value)
+
 	c.JSON(http.StatusOK, gin.H{
-		"message": "Usage statistics setting updated",
+		"message":                  "Usage statistics setting updated",
+		"usage-statistics-enabled": usage.StatisticsEnabled(),
 	})
 }
 
