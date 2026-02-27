@@ -636,7 +636,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 				result.RetryAfter = ra
 			}
 			m.MarkResult(execCtx, result)
-			if isRequestInvalidError(errExec) {
+			if shouldStopOnInvalidRequest(provider, errExec) {
 				return cliproxyexecutor.Response{}, errExec
 			}
 			lastErr = errExec
@@ -690,6 +690,10 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			}
 			if ra := retryAfterFromError(errExec); ra != nil {
 				result.RetryAfter = ra
+			}
+			if status := statusCodeFromError(errExec); status >= http.StatusBadRequest && status < http.StatusInternalServerError {
+				lastErr = errExec
+				continue
 			}
 			m.MarkResult(execCtx, result)
 			if isRequestInvalidError(errExec) {
@@ -746,7 +750,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			result := Result{AuthID: auth.ID, Provider: provider, Model: routeModel, Success: false, Error: rerr}
 			result.RetryAfter = retryAfterFromError(errStream)
 			m.MarkResult(execCtx, result)
-			if isRequestInvalidError(errStream) {
+			if shouldStopOnInvalidRequest(provider, errStream) {
 				return nil, errStream
 			}
 			lastErr = errStream
@@ -1517,6 +1521,19 @@ func isRequestInvalidError(err error) bool {
 		return false
 	}
 	return strings.Contains(err.Error(), "invalid_request_error")
+}
+
+// shouldStopOnInvalidRequest decides whether invalid_request_error should stop
+// fallback within the current request.
+//
+// Current policy:
+// - claude provider: keep trying next key on invalid_request_error.
+// - other providers: preserve historical behavior and stop immediately.
+func shouldStopOnInvalidRequest(provider string, err error) bool {
+	if !isRequestInvalidError(err) {
+		return false
+	}
+	return strings.TrimSpace(strings.ToLower(provider)) != "claude"
 }
 
 func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Duration, now time.Time) {
