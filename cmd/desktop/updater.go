@@ -16,13 +16,6 @@ import (
 	wailsRuntime "github.com/wailsapp/wails/v2/pkg/runtime"
 )
 
-// Windows process creation flags (not exposed by Go's syscall package)
-const (
-	_CREATE_NEW_CONSOLE         = 0x00000010
-	_CREATE_NEW_PROCESS_GROUP   = 0x00000200
-	_CREATE_BREAKAWAY_FROM_JOB  = 0x01000000
-)
-
 // findProjectRoot 从 exe 路径向上查找包含 .git 的项目根目录
 func findProjectRoot() string {
 	exe, err := os.Executable()
@@ -85,6 +78,9 @@ func updaterLog(format string, args ...interface{}) {
 // checkForUpdates 检查后端仓库是否有更新，有则弹窗询问用户
 // 注意：前端 management.html 由后端 managementasset 包自动从 GitHub Releases 下载，无需单独检查
 func (a *App) checkForUpdates() {
+	// 等待 Wails 窗口完全就绪，确保弹窗能正常显示
+	time.Sleep(5 * time.Second)
+
 	root := findProjectRoot()
 	if root == "" {
 		updaterLog("updater: project root not found, skip update check")
@@ -181,12 +177,12 @@ func createDetachedProcess(cmdLine string, workDir string) error {
 	var pi syscall.ProcessInformation
 
 	// 先尝试 BREAKAWAY（脱离 Wails 的 Job Object）
-	flags := uint32(_CREATE_BREAKAWAY_FROM_JOB | _CREATE_NEW_PROCESS_GROUP | _CREATE_NEW_CONSOLE)
+	flags := uint32(0x01000210) // CREATE_BREAKAWAY_FROM_JOB | CREATE_NEW_PROCESS_GROUP | CREATE_NEW_CONSOLE
 	err = syscall.CreateProcess(nil, cmdLinePtr, nil, nil, false, flags, nil, workDirPtr, &si, &pi)
 	if err != nil {
 		// 降级：不带 BREAKAWAY
 		log.Warnf("updater: CreateProcess with BREAKAWAY failed: %v, retrying without", err)
-		flags = uint32(_CREATE_NEW_PROCESS_GROUP | _CREATE_NEW_CONSOLE)
+		flags = 0x00000210 // CREATE_NEW_PROCESS_GROUP | CREATE_NEW_CONSOLE
 		err = syscall.CreateProcess(nil, cmdLinePtr, nil, nil, false, flags, nil, workDirPtr, &si, &pi)
 	}
 	if err != nil {
@@ -214,8 +210,7 @@ func (a *App) doUpgradeAndRestart(root string) {
 	newExe := filepath.Join(root, "cmd", "desktop", "build", "bin", "CLIProxyAPI.exe")
 
 	// 创建 .cmd 启动器
-	lockPath := filepath.Join(os.TempDir(), "cliproxyapi_upgrade.lock")
-	batContent := fmt.Sprintf("@echo off\r\nchcp 65001 >nul\r\ntitle CLIProxyAPI Upgrade\r\necho === CLIProxyAPI Upgrade ===\r\necho started > \"%s\"\r\ncd /d \"%s\"\r\npowershell -ExecutionPolicy Bypass -File \"%s\" -AutoLaunch \"%s\"\r\nif %%errorlevel%% neq 0 pause\r\ndel /f \"%s\" 2>nul\r\n", lockPath, root, upgradeScript, newExe, lockPath)
+	batContent := fmt.Sprintf("@echo off\r\nchcp 65001 >nul\r\ntitle CLIProxyAPI Upgrade\r\necho === CLIProxyAPI Upgrade ===\r\ncd /d \"%s\"\r\npowershell -ExecutionPolicy Bypass -File \"%s\" -AutoLaunch \"%s\"\r\nif %%errorlevel%% neq 0 pause\r\n", root, upgradeScript, newExe)
 	batPath := filepath.Join(os.TempDir(), "cliproxyapi_upgrade.cmd")
 	if err := os.WriteFile(batPath, []byte(batContent), 0644); err != nil {
 		wailsRuntime.MessageDialog(a.ctx, wailsRuntime.MessageDialogOptions{
@@ -240,14 +235,8 @@ func (a *App) doUpgradeAndRestart(root string) {
 		return
 	}
 
-	// 等待升级脚本启动（通过 lock 文件确认，超时 10 秒）
-	deadline := time.Now().Add(10 * time.Second)
-	for time.Now().Before(deadline) {
-		if _, err := os.Stat(lockPath); err == nil {
-			break
-		}
-		time.Sleep(200 * time.Millisecond)
-	}
+	// 等待确保子进程已启动
+	time.Sleep(2 * time.Second)
 
 	// 退出当前进程
 	wailsRuntime.Quit(a.ctx)

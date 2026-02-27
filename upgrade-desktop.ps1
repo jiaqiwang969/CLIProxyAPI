@@ -103,33 +103,13 @@ if ($LASTEXITCODE -ne 0) {
     Exit-WithPause 1
 }
 
-# 合并官方最新代码（保留本地桌面端文件）
-Write-Info "合并官方最新代码..."
-git merge origin/main --no-edit 2>&1
+# 强制同步到 origin/main（丢弃所有本地改动）
+Write-Info "同步到最新版本..."
+git reset --hard origin/main
+git clean -fd 2>$null
 if ($LASTEXITCODE -ne 0) {
-    # go.mod/go.sum 冲突是常见的（官方仓库没有 wails 依赖），自动解决
-    $conflictFiles = git diff --name-only --diff-filter=U 2>$null
-    if ($conflictFiles) {
-        Write-Info "检测到合并冲突，尝试自动解决..."
-        foreach ($cf in ($conflictFiles -split "`n")) {
-            $cf = $cf.Trim()
-            if (-not $cf) { continue }
-            if ($cf -match '^go\.(mod|sum)$') {
-                git checkout --theirs $cf 2>$null
-                git add $cf 2>$null
-                Write-Info "  已自动解决: $cf (使用官方版本)"
-            }
-        }
-        # 检查是否还有未解决的冲突
-        $remaining = git diff --name-only --diff-filter=U 2>$null
-        if ($remaining) {
-            Write-Host "以下文件存在无法自动解决的合并冲突:" -ForegroundColor Red
-            Write-Host "  $remaining" -ForegroundColor Red
-            git merge --abort 2>$null
-            Exit-WithPause 1
-        }
-        git commit --no-edit 2>$null
-    }
+    Write-Host "  git reset 失败 (exit code: $LASTEXITCODE)" -ForegroundColor Red
+    Exit-WithPause 1
 }
 
 $newBackend = git rev-parse --short HEAD
@@ -143,16 +123,8 @@ if ($oldBackend -eq $newBackend) {
 
 # 重新添加固定版本的 wails 依赖（官方仓库没有这个依赖）
 Write-Info "添加固定版本 wails 依赖..."
-go mod edit -require "github.com/wailsapp/wails/v2@v2.11.0"
-go mod tidy
-
-# 提交 go.mod/go.sum 变更，确保下次升级时工作区干净
-$goModDirty = git diff --name-only go.mod go.sum 2>$null
-if ($goModDirty) {
-    git add go.mod go.sum
-    git commit -m "chore: re-add wails dependency after upstream merge" --no-verify 2>$null
-    Write-Info "已提交 go.mod/go.sum 变更"
-}
+go get github.com/wailsapp/wails/v2@v2.11.0 2>$null
+go mod tidy 2>$null
 
 # ── 步骤 2: 构建 exe ──
 Write-Step "2/3" "同步图标并构建..."
