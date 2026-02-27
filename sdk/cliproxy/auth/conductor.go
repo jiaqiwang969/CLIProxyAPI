@@ -54,6 +54,8 @@ const (
 	CloseAllExecutionSessionsID = "__all_execution_sessions__"
 )
 
+const executionOperationCountTokens = "count_tokens"
+
 // RefreshEvaluator allows runtime state to override refresh decisions.
 type RefreshEvaluator interface {
 	ShouldRefresh(now time.Time, auth *Auth) bool
@@ -170,12 +172,12 @@ func NewManager(store Store, selector Selector, hook Hook) *Manager {
 		hook = NoopHook{}
 	}
 	manager := &Manager{
-		store:           store,
-		executors:       make(map[string]ProviderExecutor),
-		selector:        selector,
-		hook:            hook,
-		auths:           make(map[string]*Auth),
-		providerOffsets: make(map[string]int),
+		store:            store,
+		executors:        make(map[string]ProviderExecutor),
+		selector:         selector,
+		hook:             hook,
+		auths:            make(map[string]*Auth),
+		providerOffsets:  make(map[string]int),
 		refreshSemaphore: make(chan struct{}, refreshMaxConcurrency),
 	}
 	// atomic.Value requires non-nil initial value.
@@ -647,6 +649,9 @@ func (m *Manager) executeWithFallback(
 				return errCtx
 			}
 			lastErr = err
+			if shouldStopOnInvalidRequest(provider, err) {
+				return err
+			}
 			continue
 		}
 		return nil
@@ -687,6 +692,9 @@ func (m *Manager) executeMixedAttempt(
 			result.RetryAfter = ra
 		}
 	}
+	if err != nil && shouldSkipCountTokensFailureState(execCtx, err) {
+		return err
+	}
 	m.MarkResult(execCtx, result)
 	return err
 }
@@ -713,8 +721,9 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 	}
 
 	var resp cliproxyexecutor.Response
+	countCtx := context.WithValue(ctx, executionOperationContextKey{}, executionOperationCountTokens)
 	err := m.executeWithFallback(ctx, providers, req, opts, func(ctx context.Context, executor ProviderExecutor, auth *Auth, provider, routeModel string) error {
-		return m.executeMixedAttempt(ctx, auth, provider, routeModel, req, opts, func(execCtx context.Context, execReq cliproxyexecutor.Request) error {
+		return m.executeMixedAttempt(countCtx, auth, provider, routeModel, req, opts, func(execCtx context.Context, execReq cliproxyexecutor.Request) error {
 			var errExec error
 			resp, errExec = executor.CountTokens(execCtx, auth, execReq, opts)
 			return errExec
@@ -728,15 +737,24 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		return nil, &Error{Code: "provider_not_found", Message: "no provider supplied"}
 	}
 
-	var chunks <-chan cliproxyexecutor.StreamChunk
+	var streamResult *cliproxyexecutor.StreamResult
 	err := m.executeWithFallback(ctx, providers, req, opts, func(ctx context.Context, executor ProviderExecutor, auth *Auth, provider, routeModel string) error {
 		return m.executeMixedAttempt(ctx, auth, provider, routeModel, req, opts, func(execCtx context.Context, execReq cliproxyexecutor.Request) error {
 			var errExec error
-			chunks, errExec = executor.ExecuteStream(execCtx, auth, execReq, opts)
+			streamResult, errExec = executor.ExecuteStream(execCtx, auth, execReq, opts)
 			if errExec != nil {
 				return errExec
 			}
+			if streamResult == nil {
+				return &Error{Code: "executor_error", Message: "stream result is nil"}
+			}
 
+			in := streamResult.Chunks
+			if in == nil {
+				empty := make(chan cliproxyexecutor.StreamChunk)
+				close(empty)
+				in = empty
+			}
 			out := make(chan cliproxyexecutor.StreamChunk)
 			go func(streamCtx context.Context, streamAuth *Auth, streamProvider string, streamChunks <-chan cliproxyexecutor.StreamChunk) {
 				defer close(out)
@@ -768,12 +786,15 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 				if !failed {
 					m.MarkResult(streamCtx, Result{AuthID: streamAuth.ID, Provider: streamProvider, Model: routeModel, Success: true})
 				}
-			}(execCtx, auth.Clone(), provider, chunks)
-			chunks = out
+			}(execCtx, auth.Clone(), provider, in)
+			streamResult = &cliproxyexecutor.StreamResult{
+				Headers: streamResult.Headers,
+				Chunks:  out,
+			}
 			return nil
 		})
 	})
-	return chunks, err
+	return streamResult, err
 }
 
 func ensureRequestedModelMetadata(opts cliproxyexecutor.Options, requestedModel string) cliproxyexecutor.Options {
@@ -1518,6 +1539,25 @@ func shouldStopOnInvalidRequest(provider string, err error) bool {
 	return strings.TrimSpace(strings.ToLower(provider)) != "claude"
 }
 
+func shouldSkipCountTokensFailureState(ctx context.Context, err error) bool {
+	if err == nil || !isCountTokensOperation(ctx) {
+		return false
+	}
+	status := statusCodeFromError(err)
+	return status >= http.StatusBadRequest && status < http.StatusInternalServerError && status != http.StatusTooManyRequests
+}
+
+type executionOperationContextKey struct{}
+
+func isCountTokensOperation(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	raw := ctx.Value(executionOperationContextKey{})
+	op, _ := raw.(string)
+	return strings.EqualFold(strings.TrimSpace(op), executionOperationCountTokens)
+}
+
 func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Duration, now time.Time) {
 	if auth == nil {
 		return
@@ -1803,6 +1843,7 @@ func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model s
 		}
 		m.mu.Unlock()
 	}
+	publishSelectedAuthMetadata(opts.Metadata, authCopy.ID)
 	return authCopy, executor, providerKey, nil
 }
 

@@ -60,7 +60,7 @@ func (e *providerScriptedExecutor) Execute(_ context.Context, auth *Auth, _ clip
 	return seq[idx].resp, seq[idx].err
 }
 
-func (e *providerScriptedExecutor) ExecuteStream(_ context.Context, auth *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (<-chan cliproxyexecutor.StreamChunk, error) {
+func (e *providerScriptedExecutor) ExecuteStream(_ context.Context, auth *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
 	e.mu.Lock()
 	seq := e.streamOutcomes[auth.ID]
 	idx := e.streamCalls[auth.ID]
@@ -70,7 +70,7 @@ func (e *providerScriptedExecutor) ExecuteStream(_ context.Context, auth *Auth, 
 		e.mu.Unlock()
 		ch := make(chan cliproxyexecutor.StreamChunk)
 		close(ch)
-		return ch, nil
+		return &cliproxyexecutor.StreamResult{Chunks: ch}, nil
 	}
 
 	var outcome streamScriptedOutcome
@@ -90,7 +90,7 @@ func (e *providerScriptedExecutor) ExecuteStream(_ context.Context, auth *Auth, 
 		ch <- chunk
 	}
 	close(ch)
-	return ch, nil
+	return &cliproxyexecutor.StreamResult{Chunks: ch}, nil
 }
 
 func (e *providerScriptedExecutor) Refresh(_ context.Context, auth *Auth) (*Auth, error) {
@@ -224,7 +224,7 @@ func TestExecuteStreamMixedOnce_ClaudeInvalidRequestFallsBack(t *testing.T) {
 	}
 
 	var received int
-	for chunk := range stream {
+	for chunk := range stream.Chunks {
 		if chunk.Err != nil {
 			t.Fatalf("unexpected stream chunk error: %v", chunk.Err)
 		}

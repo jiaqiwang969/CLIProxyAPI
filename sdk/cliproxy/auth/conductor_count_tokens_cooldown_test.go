@@ -44,7 +44,7 @@ func (e *scriptedProviderExecutor) Execute(_ context.Context, auth *Auth, _ clip
 	return e.nextOutcome(auth.ID, false)
 }
 
-func (e *scriptedProviderExecutor) ExecuteStream(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (<-chan cliproxyexecutor.StreamChunk, error) {
+func (e *scriptedProviderExecutor) ExecuteStream(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
 	return nil, &Error{
 		Code:       "not_implemented",
 		Message:    "ExecuteStream not implemented in test executor",

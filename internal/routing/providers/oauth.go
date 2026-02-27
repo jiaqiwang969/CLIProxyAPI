@@ -12,10 +12,10 @@ import (
 
 // OAuthProvider wraps OAuth-based auths as routing.Provider.
 type OAuthProvider struct {
-	name      string
-	auths     []*coreauth.Auth
-	mu        sync.RWMutex
-	executor  coreauth.ProviderExecutor
+	name     string
+	auths    []*coreauth.Auth
+	mu       sync.RWMutex
+	executor coreauth.ProviderExecutor
 }
 
 // NewOAuthProvider creates a new OAuth provider.
@@ -82,7 +82,16 @@ func (p *OAuthProvider) ExecuteStream(ctx context.Context, model string, req exe
 		return nil, ErrNoAvailableAuth
 	}
 
-	return p.executor.ExecuteStream(ctx, auth, req, executor.Options{})
+	streamResult, err := p.executor.ExecuteStream(ctx, auth, req, executor.Options{})
+	if err != nil {
+		return nil, err
+	}
+	if streamResult == nil || streamResult.Chunks == nil {
+		empty := make(chan executor.StreamChunk)
+		close(empty)
+		return empty, nil
+	}
+	return streamResult.Chunks, nil
 }
 
 // AddAuth adds an auth to this provider.

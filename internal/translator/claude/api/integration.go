@@ -1,11 +1,9 @@
 package api
 
 import (
-	"encoding/json"
 	"os"
 
 	"github.com/gin-gonic/gin"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/translator/claude/api"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/translator/router"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
@@ -13,13 +11,13 @@ import (
 
 // ClaudeHandlerIntegration 提供Claude处理器的集成功能
 type ClaudeHandlerIntegration struct {
-	backendRouter *api.ClaudeBackendRouter
+	backendRouter *ClaudeBackendRouter
 }
 
 // NewClaudeHandlerIntegration 创建新的集成实例
 func NewClaudeHandlerIntegration() *ClaudeHandlerIntegration {
 	return &ClaudeHandlerIntegration{
-		backendRouter: api.NewClaudeBackendRouter(),
+		backendRouter: NewClaudeBackendRouter(),
 	}
 }
 
@@ -75,6 +73,6 @@ func (i *ClaudeHandlerIntegration) IsClaudeDirectAPIAvailable() bool {
 }
 
 // GetDirectAPIHandler 获取Claude直接API处理器
-func (i *ClaudeHandlerIntegration) GetDirectAPIHandler() *api.ClaudeDirectAPIHandler {
+func (i *ClaudeHandlerIntegration) GetDirectAPIHandler() *ClaudeDirectAPIHandler {
 	return i.backendRouter.GetDirectAPIHandler()
 }
