@@ -321,6 +321,10 @@ attemptLoop:
 
 			recordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
 			bodyBytes, errRead := io.ReadAll(httpResp.Body)
+	if err := SanityCheckResponse(bodyBytes); err != nil {
+		recordAPIResponseError(ctx, e.cfg, err)
+		return cliproxyexecutor.Response{}, err
+	}
 			if errClose := httpResp.Body.Close(); errClose != nil {
 				log.Errorf("antigravity executor: close response body error: %v", errClose)
 			}
@@ -537,6 +541,11 @@ attemptLoop:
 					line = FilterSSEUsageMetadata(line)
 
 					payload := jsonPayload(line)
+		if err := SanityCheckStreamChunk(line); err != nil {
+			recordAPIResponseError(ctx, e.cfg, err)
+			out <- cliproxyexecutor.StreamChunk{Err: err}
+			continue
+		}
 					if payload == nil {
 						continue
 					}
@@ -929,6 +938,11 @@ attemptLoop:
 					line = FilterSSEUsageMetadata(line)
 
 					payload := jsonPayload(line)
+		if err := SanityCheckStreamChunk(line); err != nil {
+			recordAPIResponseError(ctx, e.cfg, err)
+			out <- cliproxyexecutor.StreamChunk{Err: err}
+			continue
+		}
 					if payload == nil {
 						continue
 					}
