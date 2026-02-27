@@ -183,21 +183,8 @@ func ConvertOpenAIRequestToClaude(modelName string, inputRawJSON []byte, stream 
 							msg, _ = sjson.SetRaw(msg, "content.-1", textPart)
 
 						case "image_url":
-							// Convert OpenAI image format to Claude Code format
-							imageURL := part.Get("image_url.url").String()
-							if strings.HasPrefix(imageURL, "data:") {
-								// Extract base64 data and media type from data URL
-								parts := strings.Split(imageURL, ",")
-								if len(parts) == 2 {
-									mediaTypePart := strings.Split(parts[0], ";")[0]
-									mediaType := strings.TrimPrefix(mediaTypePart, "data:")
-									data := parts[1]
-
-									imagePart := `{"type":"image","source":{"type":"base64","media_type":"","data":""}}`
-									imagePart, _ = sjson.Set(imagePart, "source.media_type", mediaType)
-									imagePart, _ = sjson.Set(imagePart, "source.data", data)
-									msg, _ = sjson.SetRaw(msg, "content.-1", imagePart)
-								}
+							if imagePart := convertOpenAIImageURLToClaudePart(part.Get("image_url.url").String()); imagePart != "" {
+								msg, _ = sjson.SetRaw(msg, "content.-1", imagePart)
 							}
 
 						case "file":
@@ -262,11 +249,45 @@ func ConvertOpenAIRequestToClaude(modelName string, inputRawJSON []byte, stream 
 			case "tool":
 				// Handle tool result messages conversion
 				toolCallID := message.Get("tool_call_id").String()
-				content := message.Get("content").String()
+				toolContent := message.Get("content")
+				contentValue := ""
+
+				switch {
+				case toolContent.Type == gjson.String:
+					contentValue = toolContent.String()
+				case toolContent.IsArray():
+					claudeContent := "[]"
+					hasContent := false
+					toolContent.ForEach(func(_, part gjson.Result) bool {
+						switch part.Get("type").String() {
+						case "text":
+							textPart := `{"type":"text","text":""}`
+							textPart, _ = sjson.Set(textPart, "text", part.Get("text").String())
+							claudeContent, _ = sjson.SetRaw(claudeContent, "-1", textPart)
+							hasContent = true
+						case "image_url":
+							if imagePart := convertOpenAIImageURLToClaudePart(part.Get("image_url.url").String()); imagePart != "" {
+								claudeContent, _ = sjson.SetRaw(claudeContent, "-1", imagePart)
+								hasContent = true
+							}
+						}
+						return true
+					})
+					if hasContent {
+						contentValue = claudeContent
+					}
+				default:
+					// Preserve raw JSON for non-string, non-array tool content
+					contentValue = toolContent.Raw
+				}
 
 				msg := `{"role":"user","content":[{"type":"tool_result","tool_use_id":"","content":""}]}`
 				msg, _ = sjson.Set(msg, "content.0.tool_use_id", toolCallID)
-				msg, _ = sjson.Set(msg, "content.0.content", content)
+				if gjson.Valid(contentValue) && gjson.Parse(contentValue).IsArray() {
+					msg, _ = sjson.SetRaw(msg, "content.0.content", contentValue)
+				} else {
+					msg, _ = sjson.Set(msg, "content.0.content", contentValue)
+				}
 				out, _ = sjson.SetRaw(out, "messages.-1", msg)
 				messageIndex++
 			}
@@ -328,4 +349,28 @@ func ConvertOpenAIRequestToClaude(modelName string, inputRawJSON []byte, stream 
 	}
 
 	return []byte(out)
+}
+
+func convertOpenAIImageURLToClaudePart(imageURL string) string {
+	if imageURL == "" {
+		return ""
+	}
+
+	if strings.HasPrefix(imageURL, "data:") {
+		parts := strings.Split(imageURL, ",")
+		if len(parts) == 2 {
+			mediaTypePart := strings.Split(parts[0], ";")[0]
+			mediaType := strings.TrimPrefix(mediaTypePart, "data:")
+			data := parts[1]
+
+			imagePart := `{"type":"image","source":{"type":"base64","media_type":"","data":""}}`
+			imagePart, _ = sjson.Set(imagePart, "source.media_type", mediaType)
+			imagePart, _ = sjson.Set(imagePart, "source.data", data)
+			return imagePart
+		}
+	}
+
+	imagePart := `{"type":"image","source":{"type":"url","url":""}}`
+	imagePart, _ = sjson.Set(imagePart, "source.url", imageURL)
+	return imagePart
 }

@@ -175,7 +175,12 @@ func ConvertClaudeRequestToOpenAI(modelName string, inputRawJSON []byte, stream 
 						// Collect tool_result to emit after the main message (ensures tool results follow tool_calls)
 						toolResultJSON := `{"role":"tool","tool_call_id":"","content":""}`
 						toolResultJSON, _ = sjson.Set(toolResultJSON, "tool_call_id", part.Get("tool_use_id").String())
-						toolResultJSON, _ = sjson.Set(toolResultJSON, "content", convertClaudeToolResultContentToString(part.Get("content")))
+						toolContent, toolContentIsJSON := convertClaudeToolResultContent(part.Get("content"))
+						if toolContentIsJSON {
+							toolResultJSON, _ = sjson.SetRaw(toolResultJSON, "content", toolContent)
+						} else {
+							toolResultJSON, _ = sjson.Set(toolResultJSON, "content", toolContent)
+						}
 						toolResults = append(toolResults, toolResultJSON)
 					}
 					return true
@@ -366,42 +371,106 @@ func convertClaudeContentPart(part gjson.Result) (string, bool) {
 	}
 }
 
-func convertClaudeToolResultContentToString(content gjson.Result) string {
+func convertClaudeToolResultContent(content gjson.Result) (string, bool) {
 	if !content.Exists() {
-		return ""
+		return "", false
 	}
 
-	if content.Type == gjson.String {
-		return content.String()
+	partsJSON := "[]"
+	hasParts := false
+	hasImage := false
+
+	appendText := func(text string) {
+		if strings.TrimSpace(text) == "" {
+			return
+		}
+		textContent := `{"type":"text","text":""}`
+		textContent, _ = sjson.Set(textContent, "text", text)
+		partsJSON, _ = sjson.SetRaw(partsJSON, "-1", textContent)
+		hasParts = true
 	}
 
-	if content.IsArray() {
-		var parts []string
+	appendPart := func(partStr string) {
+		if partStr == "" {
+			return
+		}
+		partsJSON, _ = sjson.SetRaw(partsJSON, "-1", partStr)
+		if gjson.Get(partStr, "type").String() == "image_url" {
+			hasImage = true
+		}
+		hasParts = true
+	}
+
+	switch {
+	case content.Type == gjson.String:
+		appendText(content.String())
+	case content.IsArray():
 		content.ForEach(func(_, item gjson.Result) bool {
 			switch {
 			case item.Type == gjson.String:
-				parts = append(parts, item.String())
-			case item.IsObject() && item.Get("text").Exists() && item.Get("text").Type == gjson.String:
-				parts = append(parts, item.Get("text").String())
+				appendText(item.String())
+			case item.IsObject():
+				if partStr, ok := convertClaudeContentPart(item); ok {
+					appendPart(partStr)
+				} else if txt := item.Get("text"); txt.Exists() && txt.Type == gjson.String {
+					appendText(txt.String())
+				} else {
+					appendPart(item.Raw)
+				}
 			default:
-				parts = append(parts, item.Raw)
+				appendPart(item.Raw)
 			}
 			return true
 		})
-
-		joined := strings.Join(parts, "\n\n")
-		if strings.TrimSpace(joined) != "" {
-			return joined
+	case content.IsObject():
+		if partStr, ok := convertClaudeContentPart(content); ok {
+			appendPart(partStr)
+		} else if txt := content.Get("text"); txt.Exists() && txt.Type == gjson.String {
+			appendText(txt.String())
+		} else {
+			return content.Raw, false
 		}
-		return content.Raw
+	default:
+		return content.Raw, false
+	}
+
+	if hasParts {
+		arr := gjson.Parse(partsJSON).Array()
+		if !hasImage {
+			allText := true
+			textParts := make([]string, 0, len(arr))
+			for _, v := range arr {
+				if v.Get("type").String() == "text" {
+					textParts = append(textParts, v.Get("text").String())
+				} else {
+					allText = false
+					break
+				}
+			}
+
+			if allText && len(textParts) > 0 {
+				joined := strings.Join(textParts, "\n\n")
+				if strings.TrimSpace(joined) != "" {
+					if len(textParts) == 1 {
+						return textParts[0], false
+					}
+					return joined, false
+				}
+			}
+		}
+
+		return partsJSON, true
+	}
+
+	if content.Type == gjson.String {
+		return content.String(), false
 	}
 
 	if content.IsObject() {
 		if text := content.Get("text"); text.Exists() && text.Type == gjson.String {
-			return text.String()
+			return text.String(), false
 		}
-		return content.Raw
 	}
 
-	return content.Raw
+	return content.Raw, false
 }
