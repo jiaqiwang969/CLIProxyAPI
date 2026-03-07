@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -27,6 +28,22 @@ const auggieChatStreamPath = "/chat-stream"
 // AuggieExecutor handles Auggie-specific revalidation and upstream requests.
 type AuggieExecutor struct {
 	cfg *config.Config
+}
+
+type auggieGetModelsUpstreamModel struct {
+	Name string `json:"name"`
+}
+
+type auggieGetModelsFeatureFlags struct {
+	ModelInfoRegistry string `json:"model_info_registry"`
+}
+
+type auggieModelInfoRegistryEntry struct {
+	ByokProvider string `json:"byokProvider"`
+	Description  string `json:"description"`
+	Disabled     bool   `json:"disabled"`
+	DisplayName  string `json:"displayName"`
+	IsDefault    bool   `json:"isDefault"`
 }
 
 func NewAuggieExecutor(cfg *config.Config) *AuggieExecutor { return &AuggieExecutor{cfg: cfg} }
@@ -156,20 +173,126 @@ func (e *AuggieExecutor) fetchModels(ctx context.Context, auth *cliproxyauth.Aut
 		return nil, nil
 	}
 
-	type auggieModel struct {
-		Name string `json:"name"`
-	}
 	var response struct {
-		DefaultModel string        `json:"default_model"`
-		Models       []auggieModel `json:"models"`
+		DefaultModel string                         `json:"default_model"`
+		Models       []auggieGetModelsUpstreamModel `json:"models"`
+		FeatureFlags auggieGetModelsFeatureFlags    `json:"feature_flags"`
 	}
 	if err := json.Unmarshal(body, &response); err != nil {
 		return nil, nil
 	}
 
 	now := time.Now().Unix()
-	models := make([]*registry.ModelInfo, 0, len(response.Models))
-	for _, model := range response.Models {
+	models, defaultModel, usedRegistry := buildAuggieModelsFromGetModelsResponse(now, response.DefaultModel, response.Models, response.FeatureFlags.ModelInfoRegistry)
+	updated := auth.Clone()
+	if updated.Metadata == nil {
+		updated.Metadata = make(map[string]any)
+	}
+	markAuggieAuthActive(updated, time.Now().UTC())
+	if usedRegistry {
+		if defaultModel != "" {
+			updated.Metadata["default_model"] = defaultModel
+		} else {
+			delete(updated.Metadata, "default_model")
+		}
+		if rawDefaultModel := strings.TrimSpace(response.DefaultModel); rawDefaultModel != "" && rawDefaultModel != defaultModel {
+			updated.Metadata["default_model_raw"] = rawDefaultModel
+		} else {
+			delete(updated.Metadata, "default_model_raw")
+		}
+	} else if defaultModel := strings.TrimSpace(response.DefaultModel); defaultModel != "" {
+		updated.Metadata["default_model"] = defaultModel
+		delete(updated.Metadata, "default_model_raw")
+	} else {
+		delete(updated.Metadata, "default_model")
+		delete(updated.Metadata, "default_model_raw")
+	}
+	if len(models) == 0 {
+		return nil, updated
+	}
+	return models, updated
+}
+
+func buildAuggieModelsFromGetModelsResponse(now int64, rawDefaultModel string, upstreamModels []auggieGetModelsUpstreamModel, rawModelInfoRegistry string) ([]*registry.ModelInfo, string, bool) {
+	if models, defaultModel, ok := buildAuggieModelsFromInfoRegistry(now, rawDefaultModel, rawModelInfoRegistry); ok {
+		return models, defaultModel, true
+	}
+	return buildAuggieModelsFromNames(now, upstreamModels), strings.TrimSpace(rawDefaultModel), false
+}
+
+func buildAuggieModelsFromInfoRegistry(now int64, rawDefaultModel, rawModelInfoRegistry string) ([]*registry.ModelInfo, string, bool) {
+	rawModelInfoRegistry = strings.TrimSpace(rawModelInfoRegistry)
+	if rawModelInfoRegistry == "" {
+		return nil, "", false
+	}
+
+	var entries map[string]auggieModelInfoRegistryEntry
+	if err := json.Unmarshal([]byte(rawModelInfoRegistry), &entries); err != nil {
+		log.Debugf("auggie get-models: failed to parse model_info_registry: %v", err)
+		return nil, "", false
+	}
+
+	ids := make([]string, 0, len(entries))
+	for id, entry := range entries {
+		id = strings.TrimSpace(id)
+		if id == "" || entry.Disabled {
+			continue
+		}
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool {
+		left := auggieModelInfoSortKey(ids[i], entries[ids[i]])
+		right := auggieModelInfoSortKey(ids[j], entries[ids[j]])
+		if left == right {
+			return ids[i] < ids[j]
+		}
+		return left < right
+	})
+
+	defaultModel := ""
+	if id := strings.TrimSpace(rawDefaultModel); id != "" {
+		if entry, ok := entries[id]; ok && !entry.Disabled {
+			defaultModel = id
+		}
+	}
+	if defaultModel == "" {
+		for _, id := range ids {
+			if entries[id].IsDefault {
+				defaultModel = id
+				break
+			}
+		}
+	}
+
+	models := make([]*registry.ModelInfo, 0, len(ids))
+	for _, id := range ids {
+		entry := entries[id]
+		displayName := strings.TrimSpace(entry.DisplayName)
+		if displayName == "" {
+			displayName = id
+		}
+		description := strings.TrimSpace(entry.Description)
+		if description == "" {
+			description = displayName
+		}
+		models = append(models, &registry.ModelInfo{
+			ID:          id,
+			Name:        id,
+			DisplayName: displayName,
+			Description: description,
+			Version:     id,
+			Object:      "model",
+			Created:     now,
+			OwnedBy:     "auggie",
+			Type:        "auggie",
+		})
+	}
+	return models, defaultModel, true
+}
+
+func buildAuggieModelsFromNames(now int64, upstreamModels []auggieGetModelsUpstreamModel) []*registry.ModelInfo {
+	models := make([]*registry.ModelInfo, 0, len(upstreamModels))
+	for _, model := range upstreamModels {
 		name := strings.TrimSpace(model.Name)
 		if name == "" {
 			continue
@@ -186,18 +309,14 @@ func (e *AuggieExecutor) fetchModels(ctx context.Context, auth *cliproxyauth.Aut
 			Type:        "auggie",
 		})
 	}
-	updated := auth.Clone()
-	if updated.Metadata == nil {
-		updated.Metadata = make(map[string]any)
+	return models
+}
+
+func auggieModelInfoSortKey(id string, entry auggieModelInfoRegistryEntry) string {
+	if displayName := strings.TrimSpace(entry.DisplayName); displayName != "" {
+		return strings.ToLower(displayName)
 	}
-	markAuggieAuthActive(updated, time.Now().UTC())
-	if defaultModel := strings.TrimSpace(response.DefaultModel); defaultModel != "" {
-		updated.Metadata["default_model"] = defaultModel
-	}
-	if len(models) == 0 {
-		return nil, updated
-	}
-	return models, updated
+	return strings.ToLower(strings.TrimSpace(id))
 }
 
 func (e *AuggieExecutor) revalidateAuggieModelsAuth(ctx context.Context, auth *cliproxyauth.Auth) ([]*registry.ModelInfo, *cliproxyauth.Auth) {

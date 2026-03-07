@@ -2,12 +2,15 @@ package executor
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -46,6 +49,86 @@ func TestFetchAuggieModelsMapsUpstreamNamesAndDefaultModel(t *testing.T) {
 	}
 	if got := models[0].DisplayName; got != "gpt-5.4" {
 		t.Fatalf("display_name = %q, want gpt-5.4", got)
+	}
+}
+
+func TestFetchAuggieModelsUsesModelInfoRegistryWhenBackendModelNamesAreOpaque(t *testing.T) {
+	modelInfoRegistry := map[string]any{
+		"claude-haiku-4-5": map[string]any{
+			"byokProvider": "anthropic",
+			"description":  "Fast and efficient responses",
+			"disabled":     false,
+			"displayName":  "Haiku 4.5",
+			"shortName":    "haiku4.5",
+		},
+		"claude-opus-4-5": map[string]any{
+			"byokProvider": "anthropic",
+			"description":  "Best for complex tasks",
+			"disabled":     false,
+			"displayName":  "Claude Opus 4.5",
+			"isDefault":    true,
+			"shortName":    "opus4.5",
+		},
+		"disabled-model": map[string]any{
+			"description": "Not available",
+			"disabled":    true,
+			"displayName": "Disabled Model",
+		},
+		"gpt-5-1": map[string]any{
+			"byokProvider": "openai",
+			"description":  "Strong reasoning and planning",
+			"disabled":     false,
+			"displayName":  "GPT-5.1",
+			"shortName":    "gpt5.1",
+		},
+	}
+	body := mustMarshalAuggieJSON(t, map[string]any{
+		"default_model": "9c199f09053b637dd66d9fe1454467b6de40ce10344042674b7f34c9cb69f440",
+		"models": []map[string]any{
+			{"name": "4e68d9be07a644ce975509fa4c7afae84b51ca39986e9c40db4ad6a2cf756948"},
+			{"name": "c96e6a74aee83e1fa8947916ce7aa0c72387f4c170242d2ec30194fd6a63a001"},
+		},
+		"feature_flags": map[string]any{
+			"agent_chat_model":    "claude-sonnet-4-0-200k-v9-c4-p2-agent",
+			"model_info_registry": mustMarshalAuggieJSON(t, modelInfoRegistry),
+		},
+	})
+
+	models, updatedAuth := fetchAuggieModelsForTest(t, http.StatusOK, body)
+
+	if len(models) != 3 {
+		t.Fatalf("models = %d, want 3", len(models))
+	}
+	gotIDs := make([]string, 0, len(models))
+	byID := make(map[string]*registry.ModelInfo, len(models))
+	for _, model := range models {
+		gotIDs = append(gotIDs, model.ID)
+		byID[model.ID] = model
+	}
+	sort.Strings(gotIDs)
+	if want := []string{"claude-haiku-4-5", "claude-opus-4-5", "gpt-5-1"}; !reflect.DeepEqual(gotIDs, want) {
+		t.Fatalf("model ids = %#v, want %#v", gotIDs, want)
+	}
+	if _, ok := byID["4e68d9be07a644ce975509fa4c7afae84b51ca39986e9c40db4ad6a2cf756948"]; ok {
+		t.Fatal("expected opaque backend model id to be ignored")
+	}
+	if _, ok := byID["disabled-model"]; ok {
+		t.Fatal("expected disabled model to be excluded")
+	}
+	if got := byID["claude-opus-4-5"].DisplayName; got != "Claude Opus 4.5" {
+		t.Fatalf("display_name = %q, want Claude Opus 4.5", got)
+	}
+	if got := byID["claude-opus-4-5"].Description; got != "Best for complex tasks" {
+		t.Fatalf("description = %q, want Best for complex tasks", got)
+	}
+	if got := byID["gpt-5-1"].Description; got != "Strong reasoning and planning" {
+		t.Fatalf("gpt-5-1 description = %q, want Strong reasoning and planning", got)
+	}
+	if got := updatedAuth.Metadata["default_model"]; got != "claude-opus-4-5" {
+		t.Fatalf("default_model = %v, want claude-opus-4-5", got)
+	}
+	if got := updatedAuth.Metadata["default_model_raw"]; got != "9c199f09053b637dd66d9fe1454467b6de40ce10344042674b7f34c9cb69f440" {
+		t.Fatalf("default_model_raw = %v, want upstream hash", got)
 	}
 }
 
@@ -509,4 +592,14 @@ type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 	return f(req)
+}
+
+func mustMarshalAuggieJSON(t *testing.T, value any) string {
+	t.Helper()
+
+	body, err := json.Marshal(value)
+	if err != nil {
+		t.Fatalf("marshal json: %v", err)
+	}
+	return string(body)
 }
