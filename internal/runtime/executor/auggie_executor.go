@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -15,9 +16,13 @@ import (
 	sdkauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/auth"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
+	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
+	log "github.com/sirupsen/logrus"
+	"github.com/tidwall/gjson"
 )
 
 const auggieModelsPath = "/get-models"
+const auggieChatStreamPath = "/chat-stream"
 
 // AuggieExecutor handles Auggie-specific revalidation and upstream requests.
 type AuggieExecutor struct {
@@ -59,8 +64,17 @@ func (e *AuggieExecutor) Execute(_ context.Context, _ *cliproxyauth.Auth, _ clip
 	return cliproxyexecutor.Response{}, statusErr{code: http.StatusNotImplemented, msg: "auggie execute not implemented"}
 }
 
-func (e *AuggieExecutor) ExecuteStream(_ context.Context, _ *cliproxyauth.Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
-	return nil, statusErr{code: http.StatusNotImplemented, msg: "auggie stream not implemented"}
+func (e *AuggieExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+	from := opts.SourceFormat
+	if from == "" {
+		from = req.Format
+	}
+	if from == "" {
+		from = sdktranslator.FormatOpenAI
+	}
+
+	translated := sdktranslator.TranslateRequest(from, sdktranslator.FormatAuggie, req.Model, req.Payload, true)
+	return e.executeAuggieStream(ctx, auth, req, opts, translated, from, true)
 }
 
 func (e *AuggieExecutor) CountTokens(_ context.Context, _ *cliproxyauth.Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
@@ -217,6 +231,146 @@ func auggieTenantURL(auth *cliproxyauth.Auth) string {
 		return strings.TrimSpace(tenantURL)
 	}
 	return ""
+}
+
+func (e *AuggieExecutor) executeAuggieStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, translated []byte, from sdktranslator.Format, allowRefresh bool) (*cliproxyexecutor.StreamResult, error) {
+	if auth == nil {
+		return nil, statusErr{code: http.StatusInternalServerError, msg: "auggie executor: auth is nil"}
+	}
+
+	tenantURL, err := sdkauth.NormalizeAuggieTenantURL(auggieTenantURL(auth))
+	if err != nil {
+		if allowRefresh {
+			return e.refreshAndRetryAuggieStream(ctx, auth, req, opts, translated, from)
+		}
+		replaceAuggieAuthState(auth, markAuggieAuthUnauthorized(auth, err.Error()))
+		return nil, statusErr{code: http.StatusUnauthorized, msg: err.Error()}
+	}
+
+	token := auggieAccessToken(auth)
+	if strings.TrimSpace(token) == "" {
+		if allowRefresh {
+			return e.refreshAndRetryAuggieStream(ctx, auth, req, opts, translated, from)
+		}
+		replaceAuggieAuthState(auth, markAuggieAuthUnauthorized(auth, "missing access token"))
+		return nil, statusErr{code: http.StatusUnauthorized, msg: "missing access token"}
+	}
+
+	requestURL := strings.TrimSuffix(tenantURL, "/") + auggieChatStreamPath
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, requestURL, bytes.NewReader(translated))
+	if err != nil {
+		return nil, err
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Accept", "application/x-ndjson, application/json")
+	httpReq.Header.Set("User-Agent", "cli-proxy-auggie")
+	httpReq.Header.Set("Authorization", "Bearer "+token)
+
+	var authID, authLabel, authType, authValue string
+	if auth != nil {
+		authID = auth.ID
+		authLabel = auth.Label
+		authType, authValue = auth.AccountInfo()
+	}
+	recordAPIRequest(ctx, e.cfg, upstreamRequestLog{
+		URL:       requestURL,
+		Method:    http.MethodPost,
+		Headers:   httpReq.Header.Clone(),
+		Body:      translated,
+		Provider:  e.Identifier(),
+		AuthID:    authID,
+		AuthLabel: authLabel,
+		AuthType:  authType,
+		AuthValue: authValue,
+	})
+
+	httpResp, err := newProxyAwareHTTPClient(ctx, e.cfg, auth, 0).Do(httpReq)
+	if err != nil {
+		recordAPIResponseError(ctx, e.cfg, err)
+		return nil, err
+	}
+	recordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
+
+	if httpResp.StatusCode == http.StatusUnauthorized {
+		body, _ := io.ReadAll(httpResp.Body)
+		appendAPIResponseChunk(ctx, e.cfg, body)
+		if errClose := httpResp.Body.Close(); errClose != nil {
+			log.Errorf("auggie executor: close response body error: %v", errClose)
+		}
+		if allowRefresh {
+			return e.refreshAndRetryAuggieStream(ctx, auth, req, opts, translated, from)
+		}
+		replaceAuggieAuthState(auth, markAuggieAuthUnauthorized(auth, "unauthorized"))
+		return nil, statusErr{code: http.StatusUnauthorized, msg: string(body)}
+	}
+
+	if httpResp.StatusCode < http.StatusOK || httpResp.StatusCode >= http.StatusMultipleChoices {
+		body, _ := io.ReadAll(httpResp.Body)
+		appendAPIResponseChunk(ctx, e.cfg, body)
+		if errClose := httpResp.Body.Close(); errClose != nil {
+			log.Errorf("auggie executor: close response body error: %v", errClose)
+		}
+		return nil, statusErr{code: httpResp.StatusCode, msg: string(body)}
+	}
+
+	markAuggieAuthActive(auth, time.Now().UTC())
+
+	out := make(chan cliproxyexecutor.StreamChunk)
+	go func() {
+		defer close(out)
+		defer func() {
+			if errClose := httpResp.Body.Close(); errClose != nil {
+				log.Errorf("auggie executor: close response body error: %v", errClose)
+			}
+		}()
+
+		scanner := bufio.NewScanner(httpResp.Body)
+		scanner.Buffer(nil, streamScannerBuffer)
+		var param any
+		for scanner.Scan() {
+			line := bytes.Clone(scanner.Bytes())
+			appendAPIResponseChunk(ctx, e.cfg, line)
+
+			payload := bytes.TrimSpace(line)
+			if len(payload) == 0 {
+				continue
+			}
+			if !gjson.ValidBytes(payload) {
+				err := statusErr{code: http.StatusBadGateway, msg: "auggie stream returned invalid JSON"}
+				recordAPIResponseError(ctx, e.cfg, err)
+				out <- cliproxyexecutor.StreamChunk{Err: err}
+				return
+			}
+
+			chunks := sdktranslator.TranslateStream(ctx, sdktranslator.FormatAuggie, from, req.Model, opts.OriginalRequest, translated, payload, &param)
+			for i := range chunks {
+				out <- cliproxyexecutor.StreamChunk{Payload: []byte(chunks[i])}
+			}
+		}
+
+		tail := sdktranslator.TranslateStream(ctx, sdktranslator.FormatAuggie, from, req.Model, opts.OriginalRequest, translated, []byte("[DONE]"), &param)
+		for i := range tail {
+			out <- cliproxyexecutor.StreamChunk{Payload: []byte(tail[i])}
+		}
+
+		if errScan := scanner.Err(); errScan != nil {
+			recordAPIResponseError(ctx, e.cfg, errScan)
+			out <- cliproxyexecutor.StreamChunk{Err: errScan}
+		}
+	}()
+
+	return &cliproxyexecutor.StreamResult{Headers: httpResp.Header.Clone(), Chunks: out}, nil
+}
+
+func (e *AuggieExecutor) refreshAndRetryAuggieStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, translated []byte, from sdktranslator.Format) (*cliproxyexecutor.StreamResult, error) {
+	refreshed, err := e.Refresh(ctx, auth)
+	if err != nil {
+		replaceAuggieAuthState(auth, markAuggieAuthUnauthorized(auth, err.Error()))
+		return nil, err
+	}
+
+	replaceAuggieAuthState(auth, refreshed)
+	return e.executeAuggieStream(ctx, auth, req, opts, translated, from, false)
 }
 
 func replaceAuggieAuthState(dst, src *cliproxyauth.Auth) {
