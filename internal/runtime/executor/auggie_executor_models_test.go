@@ -132,6 +132,159 @@ func TestFetchAuggieModelsUsesModelInfoRegistryWhenBackendModelNamesAreOpaque(t 
 	}
 }
 
+func TestFetchAuggieModelsUsesAuggieCLIUserAgentForModelDiscovery(t *testing.T) {
+	const wantUserAgent = "augment.cli/acp/cliproxyapi"
+
+	fullRegistry := map[string]any{
+		"claude-haiku-4-5": map[string]any{
+			"description": "Fast and efficient responses",
+			"displayName": "Haiku 4.5",
+		},
+		"claude-opus-4-5": map[string]any{
+			"description": "Best for complex tasks",
+			"displayName": "Claude Opus 4.5",
+		},
+		"claude-opus-4-6": map[string]any{
+			"description": "Best for complex tasks",
+			"displayName": "Claude Opus 4.6",
+		},
+		"claude-sonnet-4": map[string]any{
+			"description": "Legacy Sonnet model",
+			"displayName": "Sonnet 4",
+		},
+		"claude-sonnet-4-5": map[string]any{
+			"description": "Balanced reasoning",
+			"displayName": "Sonnet 4.5",
+		},
+		"claude-sonnet-4-6": map[string]any{
+			"description": "Latest Sonnet model with improved capabilities",
+			"displayName": "Sonnet 4.6",
+		},
+		"gpt-5": map[string]any{
+			"description": "Strong reasoning and planning",
+			"displayName": "GPT-5",
+		},
+		"gpt-5-1": map[string]any{
+			"description": "Strong reasoning and planning",
+			"displayName": "GPT-5.1",
+		},
+		"gpt-5-2": map[string]any{
+			"description": "Strong reasoning and planning",
+			"displayName": "GPT-5.2",
+		},
+		"gpt-5-4": map[string]any{
+			"description": "Strong reasoning and planning",
+			"displayName": "GPT-5.4",
+			"isDefault":   true,
+		},
+	}
+	reducedRegistry := map[string]any{
+		"claude-haiku-4-5": map[string]any{
+			"description": "Fast and efficient responses",
+			"displayName": "Haiku 4.5",
+		},
+		"claude-opus-4-5": map[string]any{
+			"description": "Best for complex tasks",
+			"displayName": "Claude Opus 4.5",
+		},
+		"claude-sonnet-4": map[string]any{
+			"description": "Legacy Sonnet model",
+			"displayName": "Sonnet 4",
+		},
+		"claude-sonnet-4-5": map[string]any{
+			"description": "Balanced reasoning",
+			"displayName": "Sonnet 4.5",
+		},
+		"gpt-5": map[string]any{
+			"description": "Strong reasoning and planning",
+			"displayName": "GPT-5",
+		},
+		"gpt-5-1": map[string]any{
+			"description": "Strong reasoning and planning",
+			"displayName": "GPT-5.1",
+			"isDefault":   true,
+		},
+	}
+
+	var gotUserAgent string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotUserAgent = r.Header.Get("User-Agent")
+		body := mustMarshalAuggieJSON(t, map[string]any{
+			"default_model": "opaque-default",
+			"models": []map[string]any{
+				{"name": "opaque-model"},
+			},
+			"feature_flags": map[string]any{
+				"model_info_registry": mustMarshalAuggieJSON(t, reducedRegistry),
+			},
+		})
+		if gotUserAgent == wantUserAgent {
+			body = mustMarshalAuggieJSON(t, map[string]any{
+				"default_model": "opaque-default",
+				"models": []map[string]any{
+					{"name": "opaque-model"},
+				},
+				"feature_flags": map[string]any{
+					"model_info_registry": mustMarshalAuggieJSON(t, fullRegistry),
+				},
+			})
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(body))
+	}))
+	defer server.Close()
+
+	entry := &auth.Auth{
+		Provider: "auggie",
+		Label:    "tenant.augmentcode.com",
+		FileName: "auggie-tenant-augmentcode-com.json",
+		Metadata: map[string]any{
+			"type":         "auggie",
+			"label":        "tenant.augmentcode.com",
+			"access_token": "token-1",
+			"tenant_url":   "https://tenant.augmentcode.com/",
+			"client_id":    "auggie-cli",
+			"login_mode":   "localhost",
+		},
+	}
+
+	ctx := context.WithValue(context.Background(), "cliproxy.roundtripper", newAuggieRewriteTransport(t, server.URL))
+	models := FetchAuggieModels(ctx, entry, &config.Config{})
+
+	if gotUserAgent != wantUserAgent {
+		t.Fatalf("user_agent = %q, want %q", gotUserAgent, wantUserAgent)
+	}
+	if len(models) != 10 {
+		t.Fatalf("models = %d, want 10", len(models))
+	}
+	gotIDs := make([]string, 0, len(models))
+	for _, model := range models {
+		gotIDs = append(gotIDs, model.ID)
+	}
+	sort.Strings(gotIDs)
+	if want := []string{
+		"claude-haiku-4-5",
+		"claude-opus-4-5",
+		"claude-opus-4-6",
+		"claude-sonnet-4",
+		"claude-sonnet-4-5",
+		"claude-sonnet-4-6",
+		"gpt-5",
+		"gpt-5-1",
+		"gpt-5-2",
+		"gpt-5-4",
+	}; !reflect.DeepEqual(gotIDs, want) {
+		t.Fatalf("model ids = %#v, want %#v", gotIDs, want)
+	}
+	if got := entry.Metadata["default_model"]; got != "gpt-5-4" {
+		t.Fatalf("default_model = %v, want gpt-5-4", got)
+	}
+	if got := entry.Metadata["default_model_raw"]; got != "opaque-default" {
+		t.Fatalf("default_model_raw = %v, want opaque-default", got)
+	}
+}
+
 func TestFetchAuggieModelsClearsFailureStateAfterDirectSuccess(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(`{"default_model":"gpt-5.4","models":[{"name":"gpt-5.4"}]}`))

@@ -24,6 +24,7 @@ import (
 
 const auggieModelsPath = "/get-models"
 const auggieChatStreamPath = "/chat-stream"
+const auggieModelsUserAgent = "augment.cli/acp/cliproxyapi"
 
 // AuggieExecutor handles Auggie-specific revalidation and upstream requests.
 type AuggieExecutor struct {
@@ -149,6 +150,7 @@ func (e *AuggieExecutor) fetchModels(ctx context.Context, auth *cliproxyauth.Aut
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Accept", "application/json")
+	httpReq.Header.Set("User-Agent", auggieModelsUserAgent)
 	httpReq.Header.Set("Authorization", "Bearer "+token)
 
 	httpResp, err := newProxyAwareHTTPClient(ctx, e.cfg, auth, 0).Do(httpReq)
