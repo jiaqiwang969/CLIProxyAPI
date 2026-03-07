@@ -163,8 +163,18 @@ func createAuthForChannel(channel string) *Auth {
 		return &Auth{Provider: "iflow"}
 	case "kimi":
 		return &Auth{Provider: "kimi"}
+	case "auggie":
+		return &Auth{Provider: "auggie"}
 	default:
 		return &Auth{Provider: channel}
+	}
+}
+
+func TestOAuthModelAliasChannel_Auggie(t *testing.T) {
+	t.Parallel()
+
+	if got := OAuthModelAliasChannel("auggie", "oauth"); got != "auggie" {
+		t.Fatalf("OAuthModelAliasChannel() = %q, want %q", got, "auggie")
 	}
 }
 

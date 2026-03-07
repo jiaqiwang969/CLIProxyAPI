@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -410,6 +411,8 @@ func (s *Service) ensureExecutorsForAuthWithMode(a *coreauth.Auth, forceReplace 
 		return
 	case "antigravity":
 		s.coreManager.RegisterExecutor(executor.NewAntigravityExecutor(s.cfg))
+	case "auggie":
+		s.coreManager.RegisterExecutor(executor.NewAuggieExecutor(s.cfg))
 	case "claude":
 		s.coreManager.RegisterExecutor(executor.NewClaudeExecutor(s.cfg))
 	case "qwen":
@@ -809,6 +812,11 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 		models = executor.FetchAntigravityModels(ctx, a, s.cfg)
 		cancel()
 		models = applyExcludedModels(models, excluded)
+	case "auggie":
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		models = executor.FetchAuggieModels(ctx, a, s.cfg)
+		cancel()
+		models = applyExcludedModels(models, excluded)
 	case "claude":
 		models = registry.GetClaudeModels()
 		if entry := s.resolveConfigClaudeKey(a); entry != nil {
@@ -931,6 +939,9 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 		GlobalModelRegistry().RegisterClient(a.ID, key, applyModelPrefixes(models, a.Prefix, s.cfg != nil && s.cfg.ForceModelPrefix))
 		if provider == "antigravity" {
 			s.backfillAntigravityModels(a, models)
+		}
+		if provider == "auggie" {
+			s.backfillAuggieModels(a, models)
 		}
 		return
 	}
@@ -1124,6 +1135,79 @@ func (s *Service) backfillAntigravityModels(source *coreauth.Auth, primaryModels
 		reg.RegisterClient(candidateID, "antigravity", applyModelPrefixes(models, candidate.Prefix, s.cfg != nil && s.cfg.ForceModelPrefix))
 		log.Debugf("antigravity models backfilled for auth %s using primary model list", candidateID)
 	}
+}
+
+func (s *Service) backfillAuggieModels(source *coreauth.Auth, primaryModels []*ModelInfo) {
+	if s == nil || s.coreManager == nil || len(primaryModels) == 0 {
+		return
+	}
+
+	sourceID := ""
+	if source != nil {
+		sourceID = strings.TrimSpace(source.ID)
+	}
+	sourceTenant := normalizedAuggieTenant(source)
+	if sourceTenant == "" {
+		return
+	}
+
+	reg := registry.GetGlobalRegistry()
+	for _, candidate := range s.coreManager.List() {
+		if candidate == nil || candidate.Disabled {
+			continue
+		}
+		candidateID := strings.TrimSpace(candidate.ID)
+		if candidateID == "" || candidateID == sourceID {
+			continue
+		}
+		if !strings.EqualFold(strings.TrimSpace(candidate.Provider), "auggie") {
+			continue
+		}
+		if normalizedAuggieTenant(candidate) != sourceTenant {
+			continue
+		}
+		if len(reg.GetModelsForClient(candidateID)) > 0 {
+			continue
+		}
+
+		authKind := strings.ToLower(strings.TrimSpace(candidate.Attributes["auth_kind"]))
+		if authKind == "" {
+			if kind, _ := candidate.AccountInfo(); strings.EqualFold(kind, "api_key") {
+				authKind = "apikey"
+			}
+		}
+		excluded := s.oauthExcludedModels("auggie", authKind)
+		if candidate.Attributes != nil {
+			if val, ok := candidate.Attributes["excluded_models"]; ok && strings.TrimSpace(val) != "" {
+				excluded = strings.Split(val, ",")
+			}
+		}
+
+		models := applyExcludedModels(primaryModels, excluded)
+		models = applyOAuthModelAlias(s.cfg, "auggie", authKind, models)
+		if len(models) == 0 {
+			continue
+		}
+
+		reg.RegisterClient(candidateID, "auggie", applyModelPrefixes(models, candidate.Prefix, s.cfg != nil && s.cfg.ForceModelPrefix))
+		log.Debugf("auggie models backfilled for auth %s using same-tenant model list", candidateID)
+	}
+}
+
+func normalizedAuggieTenant(auth *coreauth.Auth) string {
+	if auth == nil || auth.Metadata == nil {
+		return ""
+	}
+	rawTenantURL, _ := auth.Metadata["tenant_url"].(string)
+	normalizedTenantURL, err := sdkAuth.NormalizeAuggieTenantURL(rawTenantURL)
+	if err != nil {
+		return ""
+	}
+	parsed, err := url.Parse(normalizedTenantURL)
+	if err != nil {
+		return ""
+	}
+	return strings.ToLower(strings.TrimSpace(parsed.Host))
 }
 
 func applyExcludedModels(models []*ModelInfo, excluded []string) []*ModelInfo {
