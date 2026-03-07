@@ -84,6 +84,36 @@ func TestAuggieExecuteStream_EmitsTranslatedOpenAISSE(t *testing.T) {
 	}
 }
 
+func TestAuggieExecuteStream_ResolvesShortNameAliasToCanonicalModelID(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read body: %v", err)
+		}
+		if got := gjson.GetBytes(body, "model").String(); got != "gpt-5-4" {
+			t.Fatalf("model = %q, want gpt-5-4", got)
+		}
+
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		flusher, _ := w.(http.Flusher)
+		_, _ = fmt.Fprintln(w, `{"text":"hello","stop_reason":"end_turn"}`)
+		flusher.Flush()
+	}))
+	defer server.Close()
+
+	auth := newAuggieStreamTestAuth("token-1")
+	auth.Metadata["model_short_name_aliases"] = map[string]any{
+		"gpt5.4": "gpt-5-4",
+	}
+	chunks, err := executeAuggieStreamForModelTest(t, context.Background(), auth, server.URL, "gpt5.4")
+	if err != nil {
+		t.Fatalf("ExecuteStream error: %v", err)
+	}
+	if len(chunks) != 1 {
+		t.Fatalf("chunks = %d, want 1", len(chunks))
+	}
+}
+
 func TestAuggieExecuteStream_RetriesUnauthorizedBeforeFirstByte(t *testing.T) {
 	homeDir := t.TempDir()
 	t.Setenv("HOME", homeDir)
@@ -156,11 +186,17 @@ func TestAuggieExecuteStream_DoesNotRetryAfterFirstByte(t *testing.T) {
 func executeAuggieStreamForTest(t *testing.T, ctx context.Context, auth *cliproxyauth.Auth, targetURL string) ([]string, error) {
 	t.Helper()
 
+	return executeAuggieStreamForModelTest(t, ctx, auth, targetURL, "gpt-5.4")
+}
+
+func executeAuggieStreamForModelTest(t *testing.T, ctx context.Context, auth *cliproxyauth.Auth, targetURL, model string) ([]string, error) {
+	t.Helper()
+
 	exec := NewAuggieExecutor(&config.Config{})
 	ctx = context.WithValue(ctx, "cliproxy.roundtripper", newAuggieRewriteTransport(t, targetURL))
 
 	req := cliproxyexecutor.Request{
-		Model: "gpt-5.4",
+		Model: model,
 		Payload: []byte(`{
 			"messages":[
 				{"role":"system","content":"You are terse."},

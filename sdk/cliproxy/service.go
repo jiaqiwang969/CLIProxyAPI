@@ -816,7 +816,7 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		models = executor.FetchAuggieModels(ctx, a, s.cfg)
 		cancel()
-		models = applyExcludedModels(models, excluded)
+		models = applyAuggieExcludedModels(models, excluded)
 	case "claude":
 		models = registry.GetClaudeModels()
 		if entry := s.resolveConfigClaudeKey(a); entry != nil {
@@ -1183,7 +1183,7 @@ func (s *Service) backfillAuggieModels(source *coreauth.Auth, primaryModels []*M
 			}
 		}
 
-		models := applyExcludedModels(primaryModels, excluded)
+		models := applyAuggieExcludedModels(primaryModels, excluded)
 		models = applyOAuthModelAlias(s.cfg, "auggie", authKind, models)
 		if len(models) == 0 {
 			continue
@@ -1243,6 +1243,78 @@ func applyExcludedModels(models []*ModelInfo, excluded []string) []*ModelInfo {
 		}
 	}
 	return filtered
+}
+
+func applyAuggieExcludedModels(models []*ModelInfo, excluded []string) []*ModelInfo {
+	if len(models) == 0 || len(excluded) == 0 {
+		return models
+	}
+
+	patterns := make([]string, 0, len(excluded))
+	for _, item := range excluded {
+		if trimmed := strings.TrimSpace(item); trimmed != "" {
+			patterns = append(patterns, strings.ToLower(trimmed))
+		}
+	}
+	if len(patterns) == 0 {
+		return models
+	}
+
+	groupedIDs := make(map[string]map[string]struct{}, len(models))
+	for _, model := range models {
+		if model == nil {
+			continue
+		}
+		canonicalID := auggieCanonicalModelID(model)
+		modelID := strings.ToLower(strings.TrimSpace(model.ID))
+		if canonicalID == "" || modelID == "" {
+			continue
+		}
+		if groupedIDs[canonicalID] == nil {
+			groupedIDs[canonicalID] = map[string]struct{}{canonicalID: {}}
+		}
+		groupedIDs[canonicalID][modelID] = struct{}{}
+	}
+
+	filtered := make([]*ModelInfo, 0, len(models))
+	for _, model := range models {
+		if model == nil {
+			continue
+		}
+		canonicalID := auggieCanonicalModelID(model)
+		group := groupedIDs[canonicalID]
+		if len(group) == 0 {
+			group = map[string]struct{}{strings.ToLower(strings.TrimSpace(model.ID)): {}}
+		}
+
+		blocked := false
+		for _, pattern := range patterns {
+			for candidateID := range group {
+				if matchWildcard(pattern, candidateID) {
+					blocked = true
+					break
+				}
+			}
+			if blocked {
+				break
+			}
+		}
+		if !blocked {
+			filtered = append(filtered, model)
+		}
+	}
+	return filtered
+}
+
+func auggieCanonicalModelID(model *ModelInfo) string {
+	if model == nil {
+		return ""
+	}
+	canonicalID := strings.ToLower(strings.TrimSpace(model.Version))
+	if canonicalID != "" {
+		return canonicalID
+	}
+	return strings.ToLower(strings.TrimSpace(model.ID))
 }
 
 func applyModelPrefixes(models []*ModelInfo, prefix string, forceModelPrefix bool) []*ModelInfo {

@@ -25,6 +25,7 @@ import (
 const auggieModelsPath = "/get-models"
 const auggieChatStreamPath = "/chat-stream"
 const auggieModelsUserAgent = "augment.cli/acp/cliproxyapi"
+const AuggieShortNameAliasesMetadataKey = "model_short_name_aliases"
 
 // AuggieExecutor handles Auggie-specific revalidation and upstream requests.
 type AuggieExecutor struct {
@@ -45,6 +46,7 @@ type auggieModelInfoRegistryEntry struct {
 	Disabled     bool   `json:"disabled"`
 	DisplayName  string `json:"displayName"`
 	IsDefault    bool   `json:"isDefault"`
+	ShortName    string `json:"shortName"`
 }
 
 func NewAuggieExecutor(cfg *config.Config) *AuggieExecutor { return &AuggieExecutor{cfg: cfg} }
@@ -91,8 +93,11 @@ func (e *AuggieExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		from = sdktranslator.FormatOpenAI
 	}
 
-	translated := sdktranslator.TranslateRequest(from, sdktranslator.FormatAuggie, req.Model, req.Payload, true)
-	return e.executeAuggieStream(ctx, auth, req, opts, translated, from, true)
+	resolvedReq := req
+	resolvedReq.Model = resolveAuggieModelAlias(auth, req.Model)
+
+	translated := sdktranslator.TranslateRequest(from, sdktranslator.FormatAuggie, resolvedReq.Model, req.Payload, true)
+	return e.executeAuggieStream(ctx, auth, resolvedReq, opts, translated, from, true)
 }
 
 func (e *AuggieExecutor) CountTokens(_ context.Context, _ *cliproxyauth.Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
@@ -185,7 +190,7 @@ func (e *AuggieExecutor) fetchModels(ctx context.Context, auth *cliproxyauth.Aut
 	}
 
 	now := time.Now().Unix()
-	models, defaultModel, usedRegistry := buildAuggieModelsFromGetModelsResponse(now, response.DefaultModel, response.Models, response.FeatureFlags.ModelInfoRegistry)
+	models, defaultModel, shortNameAliases, usedRegistry := buildAuggieModelsFromGetModelsResponse(now, response.DefaultModel, response.Models, response.FeatureFlags.ModelInfoRegistry)
 	updated := auth.Clone()
 	if updated.Metadata == nil {
 		updated.Metadata = make(map[string]any)
@@ -209,29 +214,34 @@ func (e *AuggieExecutor) fetchModels(ctx context.Context, auth *cliproxyauth.Aut
 		delete(updated.Metadata, "default_model")
 		delete(updated.Metadata, "default_model_raw")
 	}
+	if len(shortNameAliases) > 0 {
+		updated.Metadata[AuggieShortNameAliasesMetadataKey] = auggieShortNameAliasesMetadata(shortNameAliases)
+	} else {
+		delete(updated.Metadata, AuggieShortNameAliasesMetadataKey)
+	}
 	if len(models) == 0 {
 		return nil, updated
 	}
 	return models, updated
 }
 
-func buildAuggieModelsFromGetModelsResponse(now int64, rawDefaultModel string, upstreamModels []auggieGetModelsUpstreamModel, rawModelInfoRegistry string) ([]*registry.ModelInfo, string, bool) {
-	if models, defaultModel, ok := buildAuggieModelsFromInfoRegistry(now, rawDefaultModel, rawModelInfoRegistry); ok {
-		return models, defaultModel, true
+func buildAuggieModelsFromGetModelsResponse(now int64, rawDefaultModel string, upstreamModels []auggieGetModelsUpstreamModel, rawModelInfoRegistry string) ([]*registry.ModelInfo, string, map[string]string, bool) {
+	if models, defaultModel, shortNameAliases, ok := buildAuggieModelsFromInfoRegistry(now, rawDefaultModel, rawModelInfoRegistry); ok {
+		return models, defaultModel, shortNameAliases, true
 	}
-	return buildAuggieModelsFromNames(now, upstreamModels), strings.TrimSpace(rawDefaultModel), false
+	return buildAuggieModelsFromNames(now, upstreamModels), strings.TrimSpace(rawDefaultModel), nil, false
 }
 
-func buildAuggieModelsFromInfoRegistry(now int64, rawDefaultModel, rawModelInfoRegistry string) ([]*registry.ModelInfo, string, bool) {
+func buildAuggieModelsFromInfoRegistry(now int64, rawDefaultModel, rawModelInfoRegistry string) ([]*registry.ModelInfo, string, map[string]string, bool) {
 	rawModelInfoRegistry = strings.TrimSpace(rawModelInfoRegistry)
 	if rawModelInfoRegistry == "" {
-		return nil, "", false
+		return nil, "", nil, false
 	}
 
 	var entries map[string]auggieModelInfoRegistryEntry
 	if err := json.Unmarshal([]byte(rawModelInfoRegistry), &entries); err != nil {
 		log.Debugf("auggie get-models: failed to parse model_info_registry: %v", err)
-		return nil, "", false
+		return nil, "", nil, false
 	}
 
 	ids := make([]string, 0, len(entries))
@@ -266,7 +276,8 @@ func buildAuggieModelsFromInfoRegistry(now int64, rawDefaultModel, rawModelInfoR
 		}
 	}
 
-	models := make([]*registry.ModelInfo, 0, len(ids))
+	models := make([]*registry.ModelInfo, 0, len(ids)*2)
+	shortNameAliases := make(map[string]string, len(ids))
 	for _, id := range ids {
 		entry := entries[id]
 		displayName := strings.TrimSpace(entry.DisplayName)
@@ -288,8 +299,32 @@ func buildAuggieModelsFromInfoRegistry(now int64, rawDefaultModel, rawModelInfoR
 			OwnedBy:     "auggie",
 			Type:        "auggie",
 		})
+
+		shortName := strings.TrimSpace(entry.ShortName)
+		if shortName == "" || strings.EqualFold(shortName, id) {
+			continue
+		}
+		shortNameKey := strings.ToLower(shortName)
+		if _, exists := shortNameAliases[shortNameKey]; exists {
+			continue
+		}
+		shortNameAliases[shortNameKey] = id
+		models = append(models, &registry.ModelInfo{
+			ID:          shortName,
+			Name:        shortName,
+			DisplayName: shortName,
+			Description: description,
+			Version:     id,
+			Object:      "model",
+			Created:     now,
+			OwnedBy:     "auggie",
+			Type:        "auggie",
+		})
 	}
-	return models, defaultModel, true
+	if len(shortNameAliases) == 0 {
+		shortNameAliases = nil
+	}
+	return models, defaultModel, shortNameAliases, true
 }
 
 func buildAuggieModelsFromNames(now int64, upstreamModels []auggieGetModelsUpstreamModel) []*registry.ModelInfo {
@@ -312,6 +347,97 @@ func buildAuggieModelsFromNames(now int64, upstreamModels []auggieGetModelsUpstr
 		})
 	}
 	return models
+}
+
+func auggieShortNameAliasesMetadata(aliases map[string]string) map[string]any {
+	if len(aliases) == 0 {
+		return nil
+	}
+
+	out := make(map[string]any, len(aliases))
+	for shortName, canonicalID := range aliases {
+		shortName = strings.ToLower(strings.TrimSpace(shortName))
+		canonicalID = strings.TrimSpace(canonicalID)
+		if shortName == "" || canonicalID == "" {
+			continue
+		}
+		out[shortName] = canonicalID
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func auggieShortNameAliases(auth *cliproxyauth.Auth) map[string]string {
+	if auth == nil || len(auth.Metadata) == 0 {
+		return nil
+	}
+
+	raw, ok := auth.Metadata[AuggieShortNameAliasesMetadataKey]
+	if !ok || raw == nil {
+		return nil
+	}
+
+	switch typed := raw.(type) {
+	case map[string]string:
+		out := make(map[string]string, len(typed))
+		for shortName, canonicalID := range typed {
+			shortName = strings.ToLower(strings.TrimSpace(shortName))
+			canonicalID = strings.TrimSpace(canonicalID)
+			if shortName == "" || canonicalID == "" {
+				continue
+			}
+			out[shortName] = canonicalID
+		}
+		if len(out) == 0 {
+			return nil
+		}
+		return out
+	case map[string]any:
+		out := make(map[string]string, len(typed))
+		for rawShortName, rawCanonicalID := range typed {
+			shortName := strings.ToLower(strings.TrimSpace(rawShortName))
+			if shortName == "" {
+				continue
+			}
+			canonicalID, _ := rawCanonicalID.(string)
+			canonicalID = strings.TrimSpace(canonicalID)
+			if canonicalID == "" {
+				continue
+			}
+			out[shortName] = canonicalID
+		}
+		if len(out) == 0 {
+			return nil
+		}
+		return out
+	default:
+		return nil
+	}
+}
+
+func resolveAuggieModelAlias(auth *cliproxyauth.Auth, requestedModel string) string {
+	requestedModel = strings.TrimSpace(requestedModel)
+	if requestedModel == "" {
+		return ""
+	}
+
+	if aliases := auggieShortNameAliases(auth); len(aliases) > 0 {
+		if canonicalID := strings.TrimSpace(aliases[strings.ToLower(requestedModel)]); canonicalID != "" {
+			return canonicalID
+		}
+	}
+
+	info := registry.LookupModelInfo(requestedModel, "auggie")
+	if info == nil {
+		return requestedModel
+	}
+	canonicalID := strings.TrimSpace(info.Version)
+	if canonicalID == "" || strings.EqualFold(canonicalID, requestedModel) {
+		return requestedModel
+	}
+	return canonicalID
 }
 
 func auggieModelInfoSortKey(id string, entry auggieModelInfoRegistryEntry) string {
@@ -435,6 +561,7 @@ func (e *AuggieExecutor) executeAuggieStream(ctx context.Context, auth *cliproxy
 	}
 
 	markAuggieAuthActive(auth, time.Now().UTC())
+	responseModel := payloadRequestedModel(opts, req.Model)
 
 	out := make(chan cliproxyexecutor.StreamChunk)
 	go func() {
@@ -463,13 +590,13 @@ func (e *AuggieExecutor) executeAuggieStream(ctx context.Context, auth *cliproxy
 				return
 			}
 
-			chunks := sdktranslator.TranslateStream(ctx, sdktranslator.FormatAuggie, from, req.Model, opts.OriginalRequest, translated, payload, &param)
+			chunks := sdktranslator.TranslateStream(ctx, sdktranslator.FormatAuggie, from, responseModel, opts.OriginalRequest, translated, payload, &param)
 			for i := range chunks {
 				out <- cliproxyexecutor.StreamChunk{Payload: []byte(chunks[i])}
 			}
 		}
 
-		tail := sdktranslator.TranslateStream(ctx, sdktranslator.FormatAuggie, from, req.Model, opts.OriginalRequest, translated, []byte("[DONE]"), &param)
+		tail := sdktranslator.TranslateStream(ctx, sdktranslator.FormatAuggie, from, responseModel, opts.OriginalRequest, translated, []byte("[DONE]"), &param)
 		for i := range tail {
 			out <- cliproxyexecutor.StreamChunk{Payload: []byte(tail[i])}
 		}
