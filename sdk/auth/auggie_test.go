@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 )
 
 func TestAuggieManualPayloadRejectsInvalidTenantHost(t *testing.T) {
@@ -211,6 +212,80 @@ func TestAuggieAuthRecordRoundTripPreservesLabel(t *testing.T) {
 	}
 	if got := entries[0].Label; got != "tenant.augmentcode.com" {
 		t.Fatalf("label after reload = %q, want tenant.augmentcode.com", got)
+	}
+}
+
+func TestAuggieApplySessionPreservesCustomLabel(t *testing.T) {
+	updated, err := ApplyAuggieSession(&coreauth.Auth{
+		Provider: "auggie",
+		Label:    "Team Alpha",
+		FileName: "auggie-tenant-augmentcode-com.json",
+		Metadata: map[string]any{
+			"type":         "auggie",
+			"label":        "Team Alpha",
+			"access_token": "stale-token",
+			"tenant_url":   "https://tenant.augmentcode.com/",
+		},
+	}, &AuggieSession{
+		AccessToken: "session-token",
+		TenantURL:   "https://tenant.augmentcode.com",
+		Scopes:      []string{"email"},
+	})
+	if err != nil {
+		t.Fatalf("apply session failed: %v", err)
+	}
+	if got := updated.Label; got != "Team Alpha" {
+		t.Fatalf("label = %q, want Team Alpha", got)
+	}
+	if got := updated.Metadata["label"]; got != "Team Alpha" {
+		t.Fatalf("metadata label = %v, want Team Alpha", got)
+	}
+}
+
+func TestAuggieApplySessionClearsFailureState(t *testing.T) {
+	restore := stubAuggieLoginTestHooks(t, fixedAuggieTestTime(), http.DefaultClient)
+	defer restore()
+
+	updated, err := ApplyAuggieSession(&coreauth.Auth{
+		Provider:       "auggie",
+		Label:          "tenant.augmentcode.com",
+		FileName:       "auggie-tenant-augmentcode-com.json",
+		Status:         coreauth.StatusError,
+		StatusMessage:  "unauthorized",
+		Unavailable:    true,
+		LastError:      &coreauth.Error{Code: "unauthorized", Message: "unauthorized", HTTPStatus: http.StatusUnauthorized},
+		NextRetryAfter: fixedAuggieTestTime().Add(time.Hour),
+		Metadata: map[string]any{
+			"type":         "auggie",
+			"label":        "tenant.augmentcode.com",
+			"access_token": "stale-token",
+			"tenant_url":   "https://tenant.augmentcode.com/",
+		},
+	}, &AuggieSession{
+		AccessToken: "session-token",
+		TenantURL:   "https://tenant.augmentcode.com",
+		Scopes:      []string{"email"},
+	})
+	if err != nil {
+		t.Fatalf("apply session failed: %v", err)
+	}
+	if got := updated.Status; got != coreauth.StatusActive {
+		t.Fatalf("status = %q, want %q", got, coreauth.StatusActive)
+	}
+	if updated.Unavailable {
+		t.Fatal("expected auth to become available again")
+	}
+	if updated.StatusMessage != "" {
+		t.Fatalf("status_message = %q, want empty", updated.StatusMessage)
+	}
+	if updated.LastError != nil {
+		t.Fatalf("last_error = %#v, want nil", updated.LastError)
+	}
+	if !updated.NextRetryAfter.IsZero() {
+		t.Fatalf("next_retry_after = %v, want zero", updated.NextRetryAfter)
+	}
+	if got := updated.Metadata["access_token"]; got != "session-token" {
+		t.Fatalf("access_token = %v, want session-token", got)
 	}
 }
 

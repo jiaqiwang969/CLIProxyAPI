@@ -8,6 +8,8 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -146,6 +148,13 @@ type auggieTokenResponse struct {
 	Scopes      []string
 }
 
+// AuggieSession mirrors the session material persisted by the Auggie CLI.
+type AuggieSession struct {
+	AccessToken string   `json:"accessToken"`
+	TenantURL   string   `json:"tenantURL"`
+	Scopes      []string `json:"scopes"`
+}
+
 func parseAuggieManualPayload(raw string) (*auggieCallbackPayload, error) {
 	var payload auggieCallbackPayload
 	if err := json.Unmarshal([]byte(raw), &payload); err != nil {
@@ -179,6 +188,10 @@ func parseAuggieManualPayload(raw string) (*auggieCallbackPayload, error) {
 func validateAuggieTenantURL(raw string) error {
 	_, err := normalizeAuggieTenantURL(raw)
 	return err
+}
+
+func NormalizeAuggieTenantURL(raw string) (string, error) {
+	return normalizeAuggieTenantURL(raw)
 }
 
 func normalizeAuggieTenantURL(raw string) (string, error) {
@@ -419,6 +432,100 @@ func normalizeAuggieScopes(scopes []string, scope string) []string {
 		add(auggieDefaultScope)
 	}
 	return ordered
+}
+
+func LoadAuggieSessionFile() (*AuggieSession, error) {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return nil, fmt.Errorf("auggie: resolve home directory: %w", err)
+	}
+
+	sessionPath := filepath.Join(homeDir, ".augment", "session.json")
+	body, err := os.ReadFile(sessionPath)
+	if err != nil {
+		return nil, fmt.Errorf("auggie: read session file: %w", err)
+	}
+
+	var session AuggieSession
+	if err := json.Unmarshal(body, &session); err != nil {
+		return nil, fmt.Errorf("auggie: parse session file: %w", err)
+	}
+
+	session.AccessToken = strings.TrimSpace(session.AccessToken)
+	if session.AccessToken == "" {
+		return nil, fmt.Errorf("auggie: session file missing access token")
+	}
+
+	normalizedTenantURL, err := normalizeAuggieTenantURL(session.TenantURL)
+	if err != nil {
+		return nil, err
+	}
+	session.TenantURL = normalizedTenantURL
+	session.Scopes = normalizeAuggieScopes(session.Scopes, "")
+	return &session, nil
+}
+
+func ApplyAuggieSession(auth *coreauth.Auth, session *AuggieSession) (*coreauth.Auth, error) {
+	if session == nil {
+		return nil, fmt.Errorf("auggie: session is required")
+	}
+
+	if strings.TrimSpace(session.AccessToken) == "" {
+		return nil, fmt.Errorf("auggie: session file missing access token")
+	}
+
+	normalizedTenantURL, err := normalizeAuggieTenantURL(session.TenantURL)
+	if err != nil {
+		return nil, err
+	}
+
+	var updated *coreauth.Auth
+	if auth != nil {
+		updated = auth.Clone()
+	} else {
+		updated = &coreauth.Auth{}
+	}
+	if updated.Metadata == nil {
+		updated.Metadata = make(map[string]any)
+	}
+
+	label := strings.TrimSpace(updated.Label)
+	if label == "" {
+		if existing, ok := updated.Metadata["label"].(string); ok {
+			label = strings.TrimSpace(existing)
+		}
+	}
+	if label == "" {
+		label = auggieTenantHost(normalizedTenantURL)
+	}
+	if label == "" {
+		label = "auggie"
+	}
+	defaultFileName := auggieCredentialFileName(normalizedTenantURL)
+	if strings.TrimSpace(updated.FileName) == "" {
+		updated.FileName = defaultFileName
+	}
+	if strings.TrimSpace(updated.ID) == "" {
+		updated.ID = updated.FileName
+	}
+
+	updated.Provider = "auggie"
+	updated.Label = label
+	updated.Metadata["type"] = "auggie"
+	updated.Metadata["label"] = label
+	updated.Metadata["access_token"] = strings.TrimSpace(session.AccessToken)
+	updated.Metadata["tenant_url"] = normalizedTenantURL
+	updated.Metadata["scopes"] = append([]string(nil), normalizeAuggieScopes(session.Scopes, "")...)
+	now := auggieNow()
+	updated.Metadata["last_refresh"] = now.Format(time.RFC3339)
+	updated.Unavailable = false
+	updated.Status = coreauth.StatusActive
+	updated.StatusMessage = ""
+	updated.LastError = nil
+	updated.NextRetryAfter = time.Time{}
+	updated.UpdatedAt = now
+	updated.LastRefreshedAt = now
+	return updated, nil
 }
 
 func newAuggieAuthRecord(tenantURL, clientID, loginMode string, token *auggieTokenResponse) *coreauth.Auth {
