@@ -24,4 +24,7 @@ const (
 
 	// Antigravity represents the Antigravity response format identifier.
 	Antigravity = "antigravity"
+
+	// Auggie represents the Auggie provider identifier.
+	Auggie = "auggie"
 )
