@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"sync"
 
 	"github.com/gin-gonic/gin"
@@ -55,12 +56,63 @@ func (h *OpenAIAPIHandler) Models() []map[string]any {
 	return modelRegistry.GetAvailableModels("openai")
 }
 
+func collapseAuggieCanonicalModels(models []map[string]any) []map[string]any {
+	if len(models) == 0 {
+		return nil
+	}
+
+	result := make([]map[string]any, 0, len(models))
+	auggieByVersion := make(map[string]int)
+
+	for _, model := range models {
+		if !strings.EqualFold(openAIModelStringField(model, "owned_by"), "auggie") {
+			result = append(result, model)
+			continue
+		}
+
+		canonicalID := openAIModelStringField(model, "version")
+		if canonicalID == "" {
+			result = append(result, model)
+			continue
+		}
+
+		if idx, exists := auggieByVersion[canonicalID]; exists {
+			if strings.EqualFold(openAIModelStringField(model, "id"), canonicalID) {
+				result[idx] = model
+			}
+			continue
+		}
+
+		auggieByVersion[canonicalID] = len(result)
+		result = append(result, model)
+	}
+
+	return result
+}
+
+func openAIModelStringField(model map[string]any, key string) string {
+	if model == nil {
+		return ""
+	}
+
+	value, exists := model[key]
+	if !exists || value == nil {
+		return ""
+	}
+
+	if text, ok := value.(string); ok {
+		return strings.TrimSpace(text)
+	}
+
+	return strings.TrimSpace(fmt.Sprint(value))
+}
+
 // OpenAIModels handles the /v1/models endpoint.
 // It returns a list of available AI models with their capabilities
 // and specifications in OpenAI-compatible format.
 func (h *OpenAIAPIHandler) OpenAIModels(c *gin.Context) {
 	// Get all available models
-	allModels := h.Models()
+	allModels := collapseAuggieCanonicalModels(h.Models())
 
 	// Filter to only include the 4 required fields: id, object, created, owned_by
 	filteredModels := make([]map[string]any, len(allModels))

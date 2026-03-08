@@ -12,7 +12,7 @@ import (
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
 )
 
-func TestOpenAIModelsIncludesAuggieDisplayAliases(t *testing.T) {
+func TestOpenAIModelsCollapsesAuggieAliasesToCanonicalIDs(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
 	clientID := "auggie-openai-models-display-aliases"
@@ -73,7 +73,7 @@ func TestOpenAIModelsIncludesAuggieDisplayAliases(t *testing.T) {
 		}
 	}
 
-	for _, modelID := range []string{"gpt-5.4", "claude-opus-4.5"} {
+	for _, modelID := range []string{"gpt-5-4", "claude-opus-4-5"} {
 		model, ok := modelByID[modelID]
 		if !ok {
 			t.Fatalf("expected %q in /v1/models payload, ids=%v", modelID, modelByID)
@@ -83,6 +83,12 @@ func TestOpenAIModelsIncludesAuggieDisplayAliases(t *testing.T) {
 		}
 		if model.OwnedBy != "auggie" {
 			t.Fatalf("%s owned_by = %q, want %q", modelID, model.OwnedBy, "auggie")
+		}
+	}
+
+	for _, aliasID := range []string{"gpt5.4", "gpt-5.4", "claude-opus-4.5"} {
+		if _, exists := modelByID[aliasID]; exists {
+			t.Fatalf("did not expect Auggie alias %q in /v1/models payload, ids=%v", aliasID, modelByID)
 		}
 	}
 }
