@@ -64,7 +64,8 @@ func collapseAuggieCanonicalModels(models []map[string]any) []map[string]any {
 	result := make([]map[string]any, 0, len(models))
 	auggieByVersion := make(map[string]int)
 
-	for _, model := range models {
+	for _, original := range models {
+		model := cloneOpenAIModelMap(original)
 		if !strings.EqualFold(openAIModelStringField(model, "owned_by"), "auggie") {
 			result = append(result, model)
 			continue
@@ -75,11 +76,9 @@ func collapseAuggieCanonicalModels(models []map[string]any) []map[string]any {
 			result = append(result, model)
 			continue
 		}
+		model["id"] = canonicalID
 
-		if idx, exists := auggieByVersion[canonicalID]; exists {
-			if strings.EqualFold(openAIModelStringField(model, "id"), canonicalID) {
-				result[idx] = model
-			}
+		if _, exists := auggieByVersion[canonicalID]; exists {
 			continue
 		}
 
@@ -107,6 +106,18 @@ func openAIModelStringField(model map[string]any, key string) string {
 	return strings.TrimSpace(fmt.Sprint(value))
 }
 
+func cloneOpenAIModelMap(model map[string]any) map[string]any {
+	if model == nil {
+		return nil
+	}
+
+	cloned := make(map[string]any, len(model))
+	for key, value := range model {
+		cloned[key] = value
+	}
+	return cloned
+}
+
 // OpenAIModels handles the /v1/models endpoint.
 // It returns a list of available AI models with their capabilities
 // and specifications in OpenAI-compatible format.
@@ -115,10 +126,30 @@ func (h *OpenAIAPIHandler) OpenAIModels(c *gin.Context) {
 	allModels := collapseAuggieCanonicalModels(h.Models())
 
 	// Filter to only include the 4 required fields: id, object, created, owned_by
-	filteredModels := make([]map[string]any, len(allModels))
-	for i, model := range allModels {
+	filteredModels := make([]map[string]any, 0, len(allModels))
+	seenIDs := make(map[string]struct{}, len(allModels))
+	for _, model := range allModels {
+		caps := handlers.ResolvePublicModelSurface(openAIModelStringField(model, "id"))
+		if !caps.Available || !caps.SupportsOpenAI {
+			continue
+		}
+		modelID := strings.TrimSpace(caps.CanonicalID)
+		if modelID == "" {
+			modelID = openAIModelStringField(model, "id")
+		}
+		if modelID == "" {
+			continue
+		}
+		if !handlers.ModelVisibleForRequest(c, modelID) {
+			continue
+		}
+		if _, exists := seenIDs[modelID]; exists {
+			continue
+		}
+		seenIDs[modelID] = struct{}{}
+
 		filteredModel := map[string]any{
-			"id":     model["id"],
+			"id":     modelID,
 			"object": model["object"],
 		}
 
@@ -132,7 +163,7 @@ func (h *OpenAIAPIHandler) OpenAIModels(c *gin.Context) {
 			filteredModel["owned_by"] = ownedBy
 		}
 
-		filteredModels[i] = filteredModel
+		filteredModels = append(filteredModels, filteredModel)
 	}
 
 	c.JSON(http.StatusOK, gin.H{
@@ -170,6 +201,11 @@ func (h *OpenAIAPIHandler) ChatCompletions(c *gin.Context) {
 		modelName := gjson.GetBytes(rawJSON, "model").String()
 		rawJSON = responsesconverter.ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName, rawJSON, stream)
 		stream = gjson.GetBytes(rawJSON, "stream").Bool()
+	}
+
+	if errMsg := validateOpenAISurfaceModel(gjson.GetBytes(rawJSON, "model").String()); errMsg != nil {
+		h.WriteErrorResponse(c, errMsg)
+		return
 	}
 
 	if stream {
@@ -217,6 +253,10 @@ func (h *OpenAIAPIHandler) Completions(c *gin.Context) {
 
 	// Check if the client requested a streaming response.
 	streamResult := gjson.GetBytes(rawJSON, "stream")
+	if errMsg := validateOpenAISurfaceModel(gjson.GetBytes(rawJSON, "model").String()); errMsg != nil {
+		h.WriteErrorResponse(c, errMsg)
+		return
+	}
 	if streamResult.Type == gjson.True {
 		h.handleCompletionsStreamingResponse(c, rawJSON)
 	} else {

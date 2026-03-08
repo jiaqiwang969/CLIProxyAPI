@@ -2,6 +2,40 @@ import Foundation
 import UserNotifications
 import AppKit
 
+private struct UsageAccountAccumulator {
+    let id: String
+    let provider: String
+    let authID: String?
+    let title: String
+    let subtitle: String?
+    var keys: [UsageKeyGroup]
+    var totalRequests: Int64
+    var totalTokens: Int64
+}
+
+protocol ClipboardWriting {
+    func clearContents()
+    @discardableResult
+    func setString(_ string: String, forType type: NSPasteboard.PasteboardType) -> Bool
+}
+
+final class SystemClipboard: ClipboardWriting {
+    private let pasteboard: NSPasteboard
+
+    init(pasteboard: NSPasteboard = .general) {
+        self.pasteboard = pasteboard
+    }
+
+    func clearContents() {
+        pasteboard.clearContents()
+    }
+
+    @discardableResult
+    func setString(_ string: String, forType type: NSPasteboard.PasteboardType) -> Bool {
+        pasteboard.setString(string, forType: type)
+    }
+}
+
 @MainActor
 final class UsageMonitorViewModel: ObservableObject {
     @Published var summary: UsageSummary?
@@ -9,6 +43,10 @@ final class UsageMonitorViewModel: ObservableObject {
     @Published var errorMessage: String?
     @Published var serviceStatus: LocalServiceStatus = .unknown
     @Published var apiKeys: [APIKeyEntry] = []
+    @Published var authTargets: [AuthTarget] = []
+    @Published var clientKeyManagementAvailable = true
+    @Published var selectedProvider = ""
+    @Published var selectedAuthID = ""
     @Published var newKeyInput = ""
     @Published var newKeyNoteInput = ""
     @Published var actionMessage: String?
@@ -30,13 +68,28 @@ final class UsageMonitorViewModel: ObservableObject {
     }
 
     private var monitorTask: Task<Void, Never>?
-    private let client: CLIProxyAPIClient
+    private let client: any CLIProxyAPIManaging
+    private let clipboard: ClipboardWriting
+    private let runtimeConfigProvider: @Sendable () -> RuntimeConfig
+    private let serviceStatusProvider: @Sendable (RuntimeConfig) async -> LocalServiceStatus
+    private var managedClientKeys: [ManagedClientAPIKey] = []
 
     private static let pollingIntervalSeconds: Double = 10
     private static let monitorEnabledKey = "menubar.monitorEnabled"
 
-    init(client: CLIProxyAPIClient = CLIProxyAPIClient()) {
+    init(
+        client: any CLIProxyAPIManaging = CLIProxyAPIClient(),
+        clipboard: ClipboardWriting = SystemClipboard(),
+        autoRefresh: Bool = true,
+        runtimeConfigProvider: @escaping @Sendable () -> RuntimeConfig = { RuntimeConfigLoader.load() },
+        serviceStatusProvider: @escaping @Sendable (RuntimeConfig) async -> LocalServiceStatus = {
+            await LocalServiceController.queryStatus(config: $0)
+        }
+    ) {
         self.client = client
+        self.clipboard = clipboard
+        self.runtimeConfigProvider = runtimeConfigProvider
+        self.serviceStatusProvider = serviceStatusProvider
 
         let defaults = UserDefaults.standard
         if defaults.object(forKey: Self.monitorEnabledKey) == nil {
@@ -47,8 +100,10 @@ final class UsageMonitorViewModel: ObservableObject {
 
         setupNotifications()
 
-        Task { await refreshNow() }
-        reconfigureMonitorLoop()
+        if autoRefresh {
+            Task { await refreshNow() }
+            reconfigureMonitorLoop()
+        }
     }
 
     deinit {
@@ -71,8 +126,223 @@ final class UsageMonitorViewModel: ObservableObject {
         summary?.keyUsages ?? []
     }
 
+    var usageProviderGroups: [UsageProviderGroup] {
+        guard !keyUsages.isEmpty else {
+            return []
+        }
+
+        let authByID = Dictionary(uniqueKeysWithValues: authTargets.map { ($0.id, $0) })
+        let apiKeyByID = Dictionary(uniqueKeysWithValues: apiKeys.map { ($0.id, $0) })
+        var accountBuckets: [String: UsageAccountAccumulator] = [:]
+
+        for keyUsage in keyUsages {
+            let entry = apiKeyByID[keyUsage.id]
+            let normalizedAuthID = Self.normalizedIdentifier(entry?.authID)
+            let boundTarget = normalizedAuthID.flatMap { authByID[$0] }
+            let provider = Self.displayProviderName(entry?.provider ?? boundTarget?.provider)
+            let title: String
+            let subtitle: String?
+
+            if let boundTarget {
+                title = boundTarget.displayName
+                subtitle = boundTarget.secondaryLabel
+            } else if let entry {
+                let fallbackTitle = entry.accountLabel.trimmingCharacters(in: .whitespacesAndNewlines)
+                if let normalizedAuthID, fallbackTitle == "未绑定" {
+                    title = normalizedAuthID
+                } else if fallbackTitle.isEmpty {
+                    title = normalizedAuthID == nil ? "未绑定 Key" : "未同步账号"
+                } else {
+                    title = fallbackTitle
+                }
+                subtitle = entry.accountDetail
+            } else {
+                title = "未同步 Key"
+                subtitle = nil
+            }
+
+            let groupID = normalizedAuthID.map { "\(provider)::\($0)" } ?? "\(provider)::unbound"
+            let usageKey = UsageKeyGroup(
+                id: keyUsage.id,
+                label: entry?.masked ?? keyUsage.label,
+                totalRequests: keyUsage.totalRequests,
+                totalTokens: keyUsage.totalTokens,
+                modelCalls: keyUsage.modelCalls
+            )
+
+            if var bucket = accountBuckets[groupID] {
+                bucket.keys.append(usageKey)
+                bucket.totalRequests += keyUsage.totalRequests
+                bucket.totalTokens += keyUsage.totalTokens
+                accountBuckets[groupID] = bucket
+            } else {
+                accountBuckets[groupID] = UsageAccountAccumulator(
+                    id: groupID,
+                    provider: provider,
+                    authID: normalizedAuthID,
+                    title: title,
+                    subtitle: subtitle,
+                    keys: [usageKey],
+                    totalRequests: keyUsage.totalRequests,
+                    totalTokens: keyUsage.totalTokens
+                )
+            }
+        }
+
+        let accounts = accountBuckets.values.map { bucket in
+            UsageAccountGroup(
+                id: bucket.id,
+                provider: bucket.provider,
+                authID: bucket.authID,
+                title: bucket.title,
+                subtitle: bucket.subtitle,
+                totalRequests: bucket.totalRequests,
+                totalTokens: bucket.totalTokens,
+                keys: bucket.keys.sorted(by: Self.compareUsageKeyGroups)
+            )
+        }
+
+        let providers = Dictionary(grouping: accounts) { account in
+            account.provider
+        }
+
+        return providers
+            .map { provider, accounts in
+                UsageProviderGroup(
+                    provider: provider,
+                    accounts: accounts.sorted(by: Self.compareUsageAccountGroups)
+                )
+            }
+            .sorted(by: Self.compareUsageProviderGroups)
+    }
+
     var hasConfigFile: Bool {
-        RuntimeConfigLoader.load().configPath != nil
+        runtimeConfigProvider().configPath != nil
+    }
+
+    var availableProviders: [String] {
+        let providers = selectableAuthTargets.map(\.provider).filter { !$0.isEmpty }
+        return Array(Set(providers)).sorted()
+    }
+
+    var filteredAuthTargets: [AuthTarget] {
+        let candidates = selectableAuthTargets
+        guard !selectedProvider.isEmpty else {
+            return candidates
+        }
+        return candidates.filter { $0.provider == selectedProvider }
+    }
+
+    var selectedAuthTarget: AuthTarget? {
+        filteredAuthTargets.first { $0.id == selectedAuthID }
+    }
+
+    var providerKeyGroups: [ProviderKeyGroup] {
+        var accountGroups = authTargets.map { target in
+            AccountKeyGroup(
+                id: target.id,
+                provider: Self.displayProviderName(target.provider),
+                authID: target.id,
+                title: target.displayName,
+                subtitle: target.secondaryLabel,
+                statusText: target.status ?? (target.disabled ? "disabled" : "active"),
+                disabled: target.disabled,
+                unavailable: target.unavailable,
+                modelCount: target.models.count,
+                keys: apiKeys
+                    .filter { $0.authID == target.id }
+                    .sorted(by: Self.compareAPIKeys)
+            )
+        }
+
+        let knownAuthIDs = Set(authTargets.map(\.id))
+        let orphanKeys = apiKeys.filter { entry in
+            guard let authID = entry.authID, !authID.isEmpty else {
+                return true
+            }
+            return !knownAuthIDs.contains(authID)
+        }
+
+        let orphanGroups = Dictionary(grouping: orphanKeys, by: Self.orphanAccountGroupKey)
+        accountGroups.append(contentsOf: orphanGroups.map { _, entries in
+            let sortedEntries = entries.sorted(by: Self.compareAPIKeys)
+            let sample = sortedEntries[0]
+            let hasScopedAuthID = !((sample.authID ?? "").trimmingCharacters(in: .whitespacesAndNewlines)).isEmpty
+            let title = hasScopedAuthID
+                ? (sample.accountLabel == "未绑定" ? (sample.authID ?? "未同步账号") : sample.accountLabel)
+                : "未绑定 Key"
+            let subtitle = sample.authID == nil ? nil : sample.accountDetail
+            let statusText = sample.authID == nil ? "legacy" : "未同步"
+            return AccountKeyGroup(
+                id: Self.orphanAccountGroupKey(for: sample),
+                provider: Self.displayProviderName(sample.provider),
+                authID: sample.authID,
+                title: title,
+                subtitle: subtitle,
+                statusText: statusText,
+                disabled: false,
+                unavailable: false,
+                modelCount: sortedEntries.reduce(0) { partial, entry in
+                    max(partial, entry.modelIDs.count)
+                },
+                keys: sortedEntries
+            )
+        })
+
+        let groups = Dictionary(grouping: accountGroups) { account in
+            Self.displayProviderName(account.provider)
+        }
+
+        return groups
+            .map { provider, accounts in
+                ProviderKeyGroup(
+                    provider: provider,
+                    accounts: accounts.sorted(by: Self.compareAccountGroups)
+                )
+            }
+            .sorted(by: Self.compareProviderGroups)
+    }
+
+    var serviceProviderGroups: [ServiceProviderGroup] {
+        let boundKeyCountByAuthID = managedClientKeys.reduce(into: [String: Int]()) { partial, entry in
+            let authID = entry.scope?.authID.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            guard !authID.isEmpty else {
+                return
+            }
+            partial[authID, default: 0] += 1
+        }
+
+        let accountGroups = authTargets.map { target in
+            ServiceAccountGroup(
+                id: target.id,
+                provider: Self.displayProviderName(target.provider),
+                authID: target.id,
+                title: target.displayName,
+                subtitle: target.secondaryLabel,
+                statusText: target.status ?? (target.disabled ? "disabled" : "active"),
+                disabled: target.disabled,
+                unavailable: target.unavailable,
+                modelCount: target.models.count,
+                boundKeyCount: boundKeyCountByAuthID[target.id] ?? 0
+            )
+        }
+
+        let groups = Dictionary(grouping: accountGroups) { account in
+            Self.displayProviderName(account.provider)
+        }
+
+        return groups
+            .map { provider, accounts in
+                ServiceProviderGroup(
+                    provider: provider,
+                    accounts: accounts.sorted(by: Self.compareServiceAccountGroups)
+                )
+            }
+            .sorted(by: Self.compareServiceProviderGroups)
+    }
+
+    var canManageScopedKeys: Bool {
+        selectedAuthTarget != nil && clientKeyManagementAvailable
     }
 
     var serviceStatusText: String {
@@ -109,8 +379,12 @@ final class UsageMonitorViewModel: ObservableObject {
         return serviceLogs
     }
 
+    private var selectableAuthTargets: [AuthTarget] {
+        authTargets.filter(\.isSelectable)
+    }
+
     func openConfigFile() {
-        if let configPath = RuntimeConfigLoader.load().configPath {
+        if let configPath = runtimeConfigProvider().configPath {
             NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: configPath)
         }
     }
@@ -183,7 +457,7 @@ final class UsageMonitorViewModel: ObservableObject {
     }
 
     func refreshNow() async {
-        let runtimeConfig = RuntimeConfigLoader.load()
+        let runtimeConfig = runtimeConfigProvider()
 
         isRefreshing = true
         defer { isRefreshing = false }
@@ -234,9 +508,18 @@ final class UsageMonitorViewModel: ObservableObject {
         }
     }
 
+    func copyKey(_ key: String) {
+        clipboard.clearContents()
+        if clipboard.setString(key, forType: .string) {
+            actionMessage = "已复制 Key"
+        } else {
+            actionMessage = "复制 Key 失败"
+        }
+    }
+
     func startLocalService() {
         Task {
-            let runtimeConfig = RuntimeConfigLoader.load()
+            let runtimeConfig = runtimeConfigProvider()
             do {
                 try await LocalServiceController.start(config: runtimeConfig)
                 wasRunningPreviously = true
@@ -250,7 +533,7 @@ final class UsageMonitorViewModel: ObservableObject {
 
     func stopLocalService() {
         Task {
-            let runtimeConfig = RuntimeConfigLoader.load()
+            let runtimeConfig = runtimeConfigProvider()
             wasRunningPreviously = false // Prevent crash alert when intentionally stopping
             await LocalServiceController.stop(config: runtimeConfig)
             actionMessage = "本地服务已停止"
@@ -258,14 +541,49 @@ final class UsageMonitorViewModel: ObservableObject {
         }
     }
 
+    func setSelectedProvider(_ provider: String) {
+        selectedProvider = provider
+        normalizeSelectedAuth()
+    }
+
+    func setSelectedAuthID(_ authID: String) {
+        selectedAuthID = authID
+    }
+
     func addManualKey() {
         Task {
-            let runtimeConfig = RuntimeConfigLoader.load()
+            let runtimeConfig = runtimeConfigProvider()
+            let trimmedKey = newKeyInput.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmedKey.isEmpty else {
+                actionMessage = APIKeyStoreError.emptyKey.localizedDescription
+                return
+            }
+            guard let target = selectedAuthTarget else {
+                actionMessage = "请先选择要绑定的账号"
+                return
+            }
             do {
-                try APIKeyStore.addKey(configPath: runtimeConfig.configPath, rawKey: newKeyInput)
+                guard !managedClientKeys.contains(where: { $0.key == trimmedKey }) else {
+                    actionMessage = APIKeyStoreError.keyAlreadyExists.localizedDescription
+                    return
+                }
+                var updated = managedClientKeys
+                updated.append(
+                    ManagedClientAPIKey(
+                        key: trimmedKey,
+                        enabled: true,
+                        note: newKeyNoteInput.trimmingCharacters(in: .whitespacesAndNewlines),
+                        scope: ClientAPIKeyScope(
+                            provider: target.provider,
+                            authID: target.id,
+                            models: []
+                        )
+                    )
+                )
+                try await saveManagedKeys(updated, runtimeConfig: runtimeConfig)
                 newKeyInput = ""
                 newKeyNoteInput = ""
-                actionMessage = "Key 已添加 (配置将自动热重载)"
+                actionMessage = "Key 已添加并绑定到账号"
             } catch {
                 actionMessage = error.localizedDescription
             }
@@ -275,11 +593,30 @@ final class UsageMonitorViewModel: ObservableObject {
 
     func generateAndAddKey() {
         Task {
-            let runtimeConfig = RuntimeConfigLoader.load()
+            let runtimeConfig = runtimeConfigProvider()
+            guard let target = selectedAuthTarget else {
+                actionMessage = "请先选择要绑定的账号"
+                return
+            }
             do {
                 let key = APIKeyStore.generateKey()
-                try APIKeyStore.addKey(configPath: runtimeConfig.configPath, rawKey: key)
-                actionMessage = "已生成新 Key (配置将自动热重载)"
+                var updated = managedClientKeys
+                updated.append(
+                    ManagedClientAPIKey(
+                        key: key,
+                        enabled: true,
+                        note: newKeyNoteInput.trimmingCharacters(in: .whitespacesAndNewlines),
+                        scope: ClientAPIKeyScope(
+                            provider: target.provider,
+                            authID: target.id,
+                            models: []
+                        )
+                    )
+                )
+                try await saveManagedKeys(updated, runtimeConfig: runtimeConfig)
+                newKeyInput = ""
+                newKeyNoteInput = ""
+                actionMessage = "已生成新 Key 并绑定到账号"
             } catch {
                 actionMessage = error.localizedDescription
             }
@@ -289,10 +626,11 @@ final class UsageMonitorViewModel: ObservableObject {
 
     func removeKey(_ key: String) {
         Task {
-            let runtimeConfig = RuntimeConfigLoader.load()
+            let runtimeConfig = runtimeConfigProvider()
             do {
-                try APIKeyStore.removeKey(configPath: runtimeConfig.configPath, keyToRemove: key)
-                actionMessage = "Key 已删除 (配置将自动热重载)"
+                let updated = managedClientKeys.filter { $0.key != key }
+                try await saveManagedKeys(updated, runtimeConfig: runtimeConfig)
+                actionMessage = "Key 已删除"
             } catch {
                 actionMessage = error.localizedDescription
             }
@@ -302,10 +640,14 @@ final class UsageMonitorViewModel: ObservableObject {
 
     func updateKeyNote(_ key: String, note: String) {
         Task {
-            let runtimeConfig = RuntimeConfigLoader.load()
+            let runtimeConfig = runtimeConfigProvider()
             do {
-                try APIKeyStore.updateKeyNote(configPath: runtimeConfig.configPath, keyId: key, note: note)
-                actionMessage = "备注已更新" // config update triggers reload
+                var updated = managedClientKeys
+                if let index = updated.firstIndex(where: { $0.key == key }) {
+                    updated[index].note = note.trimmingCharacters(in: .whitespacesAndNewlines)
+                    try await saveManagedKeys(updated, runtimeConfig: runtimeConfig)
+                }
+                actionMessage = "备注已更新"
             } catch {
                 actionMessage = error.localizedDescription
             }
@@ -315,10 +657,14 @@ final class UsageMonitorViewModel: ObservableObject {
 
     func setKeyEnabled(_ key: String, enabled: Bool) {
         Task {
-            let runtimeConfig = RuntimeConfigLoader.load()
+            let runtimeConfig = runtimeConfigProvider()
             do {
-                try APIKeyStore.setKeyEnabled(configPath: runtimeConfig.configPath, keyId: key, enabled: enabled)
-                actionMessage = "状态已更新 (配置将自动热重载)"
+                var updated = managedClientKeys
+                if let index = updated.firstIndex(where: { $0.key == key }) {
+                    updated[index].enabled = enabled
+                    try await saveManagedKeys(updated, runtimeConfig: runtimeConfig)
+                }
+                actionMessage = "状态已更新"
             } catch {
                 actionMessage = error.localizedDescription
             }
@@ -412,14 +758,208 @@ final class UsageMonitorViewModel: ObservableObject {
         UNUserNotificationCenter.current().add(request)
     }
 
+    private func saveManagedKeys(_ keys: [ManagedClientAPIKey], runtimeConfig: RuntimeConfig) async throws {
+        try await client.saveClientAPIKeys(
+            baseURL: runtimeConfig.baseURL,
+            managementKey: runtimeConfig.managementKey,
+            keys: keys
+        )
+    }
+
     private func refreshServiceAndKeys(runtimeConfig: RuntimeConfig) async {
-        serviceStatus = await LocalServiceController.queryStatus(config: runtimeConfig)
+        serviceStatus = await serviceStatusProvider(runtimeConfig)
 
         do {
-            apiKeys = try APIKeyStore.loadEntries(configPath: runtimeConfig.configPath)
+            authTargets = try await client.fetchAuthTargets(
+                baseURL: runtimeConfig.baseURL,
+                managementKey: runtimeConfig.managementKey
+            )
+            normalizeSelectionAfterRefresh()
         } catch {
-            apiKeys = []
+            authTargets = []
+            selectedProvider = ""
+            selectedAuthID = ""
         }
+
+        do {
+            managedClientKeys = try await client.fetchClientAPIKeys(
+                baseURL: runtimeConfig.baseURL,
+                managementKey: runtimeConfig.managementKey
+            )
+            clientKeyManagementAvailable = true
+            rebuildAPIKeyEntries()
+        } catch {
+            managedClientKeys = []
+            clientKeyManagementAvailable = !Self.isMissingClientKeyManagementEndpoint(error)
+            apiKeys = []
+            if let legacyEntries = try? APIKeyStore.loadEntries(configPath: runtimeConfig.configPath) {
+                apiKeys = legacyEntries
+            }
+        }
+    }
+
+    private func normalizeSelectionAfterRefresh() {
+        let providers = availableProviders
+        if providers.isEmpty {
+            selectedProvider = ""
+            selectedAuthID = ""
+            return
+        }
+
+        if !providers.contains(selectedProvider) {
+            selectedProvider = providers[0]
+        }
+        normalizeSelectedAuth()
+    }
+
+    private func normalizeSelectedAuth() {
+        let authIDs = filteredAuthTargets.map(\.id)
+        if authIDs.contains(selectedAuthID) {
+            return
+        }
+        selectedAuthID = authIDs.first ?? ""
+    }
+
+    private func rebuildAPIKeyEntries() {
+        let authByID = Dictionary(uniqueKeysWithValues: authTargets.map { ($0.id, $0) })
+        apiKeys = managedClientKeys.map { entry in
+            let boundTarget = entry.scope.map { authByID[$0.authID] } ?? nil
+            let provider = entry.scope?.provider ?? boundTarget?.provider
+            let accountLabel = boundTarget?.displayName ?? Self.fallbackAccountLabel(for: entry.scope)
+            let accountDetail = boundTarget?.secondaryLabel ?? Self.fallbackAccountDetail(for: entry.scope)
+            let modelIDs = boundTarget?.modelIDs ?? entry.scope?.models ?? []
+
+            return APIKeyEntry(
+                id: entry.key,
+                masked: APIKeyStore.mask(entry.key),
+                note: entry.note,
+                enabled: entry.enabled,
+                createdAt: nil,
+                provider: provider,
+                authID: entry.scope?.authID,
+                accountLabel: accountLabel,
+                accountDetail: accountDetail,
+                modelIDs: modelIDs
+            )
+        }
+    }
+
+    private static func displayProviderName(_ provider: String?) -> String {
+        let trimmed = provider?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return trimmed.isEmpty ? "未绑定" : trimmed
+    }
+
+    private static func fallbackAccountLabel(for scope: ClientAPIKeyScope?) -> String {
+        guard let scope else {
+            return "未绑定"
+        }
+        let authID = scope.authID.trimmingCharacters(in: .whitespacesAndNewlines)
+        return authID.isEmpty ? "未绑定" : authID
+    }
+
+    private static func fallbackAccountDetail(for scope: ClientAPIKeyScope?) -> String? {
+        guard let scope else {
+            return nil
+        }
+        let authID = scope.authID.trimmingCharacters(in: .whitespacesAndNewlines)
+        return authID.isEmpty ? nil : authID
+    }
+
+    private static func normalizedIdentifier(_ value: String?) -> String? {
+        let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    private static func orphanAccountGroupKey(for entry: APIKeyEntry) -> String {
+        let provider = displayProviderName(entry.provider)
+        let authID = entry.authID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if authID.isEmpty {
+            return "\(provider)::unbound"
+        }
+        return "\(provider)::\(authID)"
+    }
+
+    private static func compareAPIKeys(lhs: APIKeyEntry, rhs: APIKeyEntry) -> Bool {
+        if lhs.enabled != rhs.enabled {
+            return lhs.enabled && !rhs.enabled
+        }
+        return lhs.id < rhs.id
+    }
+
+    private static func compareAccountGroups(lhs: AccountKeyGroup, rhs: AccountKeyGroup) -> Bool {
+        if lhs.authID == nil && rhs.authID != nil {
+            return false
+        }
+        if lhs.authID != nil && rhs.authID == nil {
+            return true
+        }
+        if lhs.totalKeys == rhs.totalKeys {
+            return lhs.title.localizedCaseInsensitiveCompare(rhs.title) == .orderedAscending
+        }
+        return lhs.totalKeys > rhs.totalKeys
+    }
+
+    private static func compareProviderGroups(lhs: ProviderKeyGroup, rhs: ProviderKeyGroup) -> Bool {
+        if lhs.provider == "未绑定" {
+            return false
+        }
+        if rhs.provider == "未绑定" {
+            return true
+        }
+        return lhs.provider.localizedCaseInsensitiveCompare(rhs.provider) == .orderedAscending
+    }
+
+    private static func compareServiceAccountGroups(lhs: ServiceAccountGroup, rhs: ServiceAccountGroup) -> Bool {
+        if lhs.boundKeyCount == rhs.boundKeyCount {
+            return lhs.title.localizedCaseInsensitiveCompare(rhs.title) == .orderedAscending
+        }
+        return lhs.boundKeyCount > rhs.boundKeyCount
+    }
+
+    private static func compareServiceProviderGroups(lhs: ServiceProviderGroup, rhs: ServiceProviderGroup) -> Bool {
+        if lhs.provider == "未绑定" {
+            return false
+        }
+        if rhs.provider == "未绑定" {
+            return true
+        }
+        return lhs.provider.localizedCaseInsensitiveCompare(rhs.provider) == .orderedAscending
+    }
+
+    private static func compareUsageKeyGroups(lhs: UsageKeyGroup, rhs: UsageKeyGroup) -> Bool {
+        if lhs.totalTokens == rhs.totalTokens {
+            if lhs.totalRequests == rhs.totalRequests {
+                return lhs.id < rhs.id
+            }
+            return lhs.totalRequests > rhs.totalRequests
+        }
+        return lhs.totalTokens > rhs.totalTokens
+    }
+
+    private static func compareUsageAccountGroups(lhs: UsageAccountGroup, rhs: UsageAccountGroup) -> Bool {
+        if lhs.authID == nil && rhs.authID != nil {
+            return false
+        }
+        if lhs.authID != nil && rhs.authID == nil {
+            return true
+        }
+        if lhs.totalTokens == rhs.totalTokens {
+            if lhs.totalRequests == rhs.totalRequests {
+                return lhs.title.localizedCaseInsensitiveCompare(rhs.title) == .orderedAscending
+            }
+            return lhs.totalRequests > rhs.totalRequests
+        }
+        return lhs.totalTokens > rhs.totalTokens
+    }
+
+    private static func compareUsageProviderGroups(lhs: UsageProviderGroup, rhs: UsageProviderGroup) -> Bool {
+        if lhs.provider == "未绑定" {
+            return false
+        }
+        if rhs.provider == "未绑定" {
+            return true
+        }
+        return lhs.provider.localizedCaseInsensitiveCompare(rhs.provider) == .orderedAscending
     }
 
     private static func makeFriendlyError(_ error: Error, config: RuntimeConfig) -> String {
@@ -442,6 +982,13 @@ final class UsageMonitorViewModel: ObservableObject {
         }
 
         return "暂时无法读取统计"
+    }
+
+    private static func isMissingClientKeyManagementEndpoint(_ error: Error) -> Bool {
+        guard case let APIClientError.httpError(statusCode, _) = error else {
+            return false
+        }
+        return statusCode == 404
     }
 
     static func compactNumber(_ value: Int64) -> String {

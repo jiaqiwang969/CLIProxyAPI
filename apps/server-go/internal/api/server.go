@@ -318,7 +318,7 @@ func (s *Server) setupRoutes() {
 	v1 := s.engine.Group("/v1")
 	v1.Use(AuthMiddleware(s.accessManager))
 	{
-		v1.GET("/models", s.unifiedModelsHandler(openaiHandlers, claudeCodeHandlers))
+		v1.GET("/models", s.unifiedModelsHandler(openaiHandlers))
 		v1.POST("/chat/completions", openaiHandlers.ChatCompletions)
 		v1.POST("/completions", openaiHandlers.Completions)
 		v1.POST("/messages", claudeCodeHandlers.ClaudeMessages)
@@ -467,6 +467,8 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.PUT("/api-keys", s.mgmt.PutAPIKeys)
 		mgmt.PATCH("/api-keys", s.mgmt.PatchAPIKeys)
 		mgmt.DELETE("/api-keys", s.mgmt.DeleteAPIKeys)
+		mgmt.GET("/client-api-keys", s.mgmt.GetClientAPIKeys)
+		mgmt.PUT("/client-api-keys", s.mgmt.PutClientAPIKeys)
 
 		mgmt.GET("/logs", s.mgmt.GetLogs)
 		mgmt.DELETE("/logs", s.mgmt.DeleteLogs)
@@ -632,22 +634,11 @@ func (s *Server) watchKeepAlive() {
 	}
 }
 
-// unifiedModelsHandler creates a unified handler for the /v1/models endpoint
-// that routes to different handlers based on the User-Agent header.
-// If User-Agent starts with "claude-cli", it routes to Claude handler,
-// otherwise it routes to OpenAI handler.
-func (s *Server) unifiedModelsHandler(openaiHandler *openai.OpenAIAPIHandler, claudeHandler *claude.ClaudeCodeAPIHandler) gin.HandlerFunc {
+// unifiedModelsHandler creates a unified handler for the /v1/models endpoint.
+// The public /v1 catalog is always OpenAI-compatible, regardless of User-Agent.
+func (s *Server) unifiedModelsHandler(openaiHandler *openai.OpenAIAPIHandler) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		userAgent := c.GetHeader("User-Agent")
-
-		// Route to Claude handler if User-Agent starts with "claude-cli"
-		if strings.HasPrefix(userAgent, "claude-cli") {
-			// log.Debugf("Routing /v1/models to Claude handler for User-Agent: %s", userAgent)
-			claudeHandler.ClaudeModels(c)
-		} else {
-			// log.Debugf("Routing /v1/models to OpenAI handler for User-Agent: %s", userAgent)
-			openaiHandler.OpenAIModels(c)
-		}
+		openaiHandler.OpenAIModels(c)
 	}
 }
 
@@ -909,6 +900,18 @@ func AuthMiddleware(manager *sdkaccess.Manager) gin.HandlerFunc {
 				c.Set("accessProvider", result.Provider)
 				if len(result.Metadata) > 0 {
 					c.Set("accessMetadata", result.Metadata)
+					if scopeProvider := strings.TrimSpace(result.Metadata["scope_provider"]); scopeProvider != "" {
+						c.Set(handlers.AccessScopeProviderContextKey, scopeProvider)
+					}
+					if scopeAuthID := strings.TrimSpace(result.Metadata["scope_auth_id"]); scopeAuthID != "" {
+						c.Set(handlers.AccessScopeAuthIDContextKey, scopeAuthID)
+					}
+					if scopeModels := strings.TrimSpace(result.Metadata["scope_models"]); scopeModels != "" {
+						c.Set(handlers.AccessScopeModelsContextKey, scopeModels)
+					}
+					if note := strings.TrimSpace(result.Metadata["note"]); note != "" {
+						c.Set(handlers.AccessKeyNoteContextKey, note)
+					}
 				}
 			}
 			c.Next()

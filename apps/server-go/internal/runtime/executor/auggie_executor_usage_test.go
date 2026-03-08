@@ -23,6 +23,8 @@ func TestAuggieExecute_RecordsUsageRequestForCanonicalModel(t *testing.T) {
 		flusher.Flush()
 		_, _ = fmt.Fprintln(w, `{"text":" world","stop_reason":"end_turn"}`)
 		flusher.Flush()
+		_, _ = fmt.Fprintln(w, `{"text":"","nodes":[{"id":0,"type":10,"content":"","tool_use":null,"thinking":null,"billing_metadata":null,"metadata":null,"token_usage":{"input_tokens":310,"output_tokens":31,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}],"stop_reason":1}`)
+		flusher.Flush()
 	}))
 	defer server.Close()
 
@@ -39,10 +41,14 @@ func TestAuggieExecute_RecordsUsageRequestForCanonicalModel(t *testing.T) {
 	}
 
 	after := waitForUsageSnapshot(t, func(snapshot internalusage.StatisticsSnapshot) bool {
-		return usageModelRequests(snapshot, apiKey, "gpt-5-4")-usageModelRequests(before, apiKey, "gpt-5-4") == 1
+		return usageModelRequests(snapshot, apiKey, "gpt-5-4")-usageModelRequests(before, apiKey, "gpt-5-4") == 1 &&
+			usageModelTokens(snapshot, apiKey, "gpt-5-4")-usageModelTokens(before, apiKey, "gpt-5-4") > 0
 	})
 	if got := usageModelRequests(after, apiKey, "gpt-5-4") - usageModelRequests(before, apiKey, "gpt-5-4"); got != 1 {
 		t.Fatalf("canonical model request delta = %d, want 1; before=%+v after=%+v", got, before.APIs[apiKey], after.APIs[apiKey])
+	}
+	if got := usageModelTokens(after, apiKey, "gpt-5-4") - usageModelTokens(before, apiKey, "gpt-5-4"); got != 341 {
+		t.Fatalf("canonical model token delta = %d, want 341; before=%+v after=%+v", got, before.APIs[apiKey], after.APIs[apiKey])
 	}
 }
 
@@ -63,6 +69,18 @@ func usageModelRequests(snapshot internalusage.StatisticsSnapshot, apiKey, model
 		return 0
 	}
 	return modelStats.TotalRequests
+}
+
+func usageModelTokens(snapshot internalusage.StatisticsSnapshot, apiKey, model string) int64 {
+	apiStats, ok := snapshot.APIs[apiKey]
+	if !ok {
+		return 0
+	}
+	modelStats, ok := apiStats.Models[model]
+	if !ok {
+		return 0
+	}
+	return modelStats.TotalTokens
 }
 
 func waitForUsageSnapshot(t *testing.T, ready func(internalusage.StatisticsSnapshot) bool) internalusage.StatisticsSnapshot {

@@ -82,6 +82,11 @@ func (h *OpenAIResponsesAPIHandler) Responses(c *gin.Context) {
 		return
 	}
 
+	if errMsg := validateOpenAISurfaceModel(gjson.GetBytes(rawJSON, "model").String()); errMsg != nil {
+		h.WriteErrorResponse(c, errMsg)
+		return
+	}
+
 	// Check if the client requested a streaming response.
 	streamResult := gjson.GetBytes(rawJSON, "stream")
 	if streamResult.Type == gjson.True {
@@ -101,6 +106,11 @@ func (h *OpenAIResponsesAPIHandler) Compact(c *gin.Context) {
 				Type:    "invalid_request_error",
 			},
 		})
+		return
+	}
+
+	if errMsg := validateOpenAISurfaceModel(gjson.GetBytes(rawJSON, "model").String()); errMsg != nil {
+		h.WriteErrorResponse(c, errMsg)
 		return
 	}
 

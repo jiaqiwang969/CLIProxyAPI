@@ -417,40 +417,8 @@ func buildAuggieModelsFromInfoRegistry(now int64, rawDefaultModel, rawModelInfoR
 		}
 	}
 
-	models := make([]*registry.ModelInfo, 0, len(ids)*3)
-	modelIDs := make(map[string]struct{}, len(ids)*3)
+	models := make([]*registry.ModelInfo, 0, len(ids))
 	shortNameAliases := make(map[string]string, len(ids))
-	appendModel := func(modelID, modelDisplayName, description, canonicalID string) {
-		modelID = strings.TrimSpace(modelID)
-		modelDisplayName = strings.TrimSpace(modelDisplayName)
-		description = strings.TrimSpace(description)
-		canonicalID = strings.TrimSpace(canonicalID)
-		if modelID == "" || canonicalID == "" {
-			return
-		}
-		key := strings.ToLower(modelID)
-		if _, exists := modelIDs[key]; exists {
-			return
-		}
-		modelIDs[key] = struct{}{}
-		if modelDisplayName == "" {
-			modelDisplayName = modelID
-		}
-		if description == "" {
-			description = modelDisplayName
-		}
-		models = append(models, &registry.ModelInfo{
-			ID:          modelID,
-			Name:        modelID,
-			DisplayName: modelDisplayName,
-			Description: description,
-			Version:     canonicalID,
-			Object:      "model",
-			Created:     now,
-			OwnedBy:     "auggie",
-			Type:        "auggie",
-		})
-	}
 	for _, id := range ids {
 		entry := entries[id]
 		displayName := strings.TrimSpace(entry.DisplayName)
@@ -461,25 +429,26 @@ func buildAuggieModelsFromInfoRegistry(now int64, rawDefaultModel, rawModelInfoR
 		if description == "" {
 			description = displayName
 		}
-		appendModel(id, displayName, description, id)
-
 		shortName := strings.TrimSpace(entry.ShortName)
-		displayAliasID := auggieDisplayNameModelID(displayName)
-		if shortName == "" || strings.EqualFold(shortName, id) {
-			appendModel(displayAliasID, displayName, description, id)
-			for _, alias := range auggieDisplayNameAliases(displayName) {
-				addAuggieAlias(shortNameAliases, alias, id)
-			}
-			continue
-		}
-		addAuggieAlias(shortNameAliases, shortName, id)
-		appendModel(shortName, shortName, description, id)
-		if !strings.EqualFold(displayAliasID, shortName) {
-			appendModel(displayAliasID, displayName, description, id)
+		requestAlias := ""
+		if shortName != "" && !strings.EqualFold(shortName, id) {
+			addAuggieAlias(shortNameAliases, shortName, id)
+			requestAlias = shortName
 		}
 		for _, alias := range auggieDisplayNameAliases(displayName) {
 			addAuggieAlias(shortNameAliases, alias, id)
 		}
+		models = append(models, &registry.ModelInfo{
+			ID:          id,
+			Name:        requestAlias,
+			DisplayName: displayName,
+			Description: description,
+			Version:     id,
+			Object:      "model",
+			Created:     now,
+			OwnedBy:     "auggie",
+			Type:        "auggie",
+		})
 	}
 	if len(shortNameAliases) == 0 {
 		shortNameAliases = nil

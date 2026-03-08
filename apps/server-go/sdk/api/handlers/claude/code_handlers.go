@@ -10,10 +10,10 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 	. "github.com/router-for-me/CLIProxyAPI/v6/internal/constant"
@@ -76,6 +76,11 @@ func (h *ClaudeCodeAPIHandler) ClaudeMessages(c *gin.Context) {
 		return
 	}
 
+	if errMsg := validateClaudeNativeModel(gjson.GetBytes(rawJSON, "model").String()); errMsg != nil {
+		h.writeClaudeErrorResponse(c, errMsg)
+		return
+	}
+
 	// Check if the client requested a streaming response.
 	streamResult := gjson.GetBytes(rawJSON, "stream")
 	if !streamResult.Exists() || streamResult.Type == gjson.False {
@@ -105,6 +110,11 @@ func (h *ClaudeCodeAPIHandler) ClaudeCountTokens(c *gin.Context) {
 		return
 	}
 
+	if errMsg := validateClaudeNativeModel(gjson.GetBytes(rawJSON, "model").String()); errMsg != nil {
+		h.writeClaudeErrorResponse(c, errMsg)
+		return
+	}
+
 	c.Header("Content-Type", "application/json")
 
 	alt := h.GetAlt(c)
@@ -114,7 +124,7 @@ func (h *ClaudeCodeAPIHandler) ClaudeCountTokens(c *gin.Context) {
 
 	resp, upstreamHeaders, errMsg := h.ExecuteCountWithAuthManager(cliCtx, h.HandlerType(), modelName, rawJSON, alt)
 	if errMsg != nil {
-		h.WriteErrorResponse(c, errMsg)
+		h.writeClaudeErrorResponse(c, errMsg)
 		cliCancel(errMsg.Error)
 		return
 	}
@@ -129,7 +139,18 @@ func (h *ClaudeCodeAPIHandler) ClaudeCountTokens(c *gin.Context) {
 // Parameters:
 //   - c: The Gin context for the request.
 func (h *ClaudeCodeAPIHandler) ClaudeModels(c *gin.Context) {
-	models := h.Models()
+	allModels := h.Models()
+	models := make([]map[string]any, 0, len(allModels))
+	for _, model := range allModels {
+		modelID, _ := model["id"].(string)
+		if strings.TrimSpace(modelID) == "" {
+			continue
+		}
+		if !handlers.ModelVisibleForRequest(c, modelID) {
+			continue
+		}
+		models = append(models, model)
+	}
 	firstID := ""
 	lastID := ""
 	if len(models) > 0 {
@@ -169,7 +190,7 @@ func (h *ClaudeCodeAPIHandler) handleNonStreamingResponse(c *gin.Context, rawJSO
 	resp, upstreamHeaders, errMsg := h.ExecuteWithAuthManager(cliCtx, h.HandlerType(), modelName, rawJSON, alt)
 	stopKeepAlive()
 	if errMsg != nil {
-		h.WriteErrorResponse(c, errMsg)
+		h.writeClaudeErrorResponse(c, errMsg)
 		cliCancel(errMsg.Error)
 		return
 	}
@@ -248,7 +269,7 @@ func (h *ClaudeCodeAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON [
 				continue
 			}
 			// Upstream failed immediately. Return proper error status and JSON.
-			h.WriteErrorResponse(c, errMsg)
+			h.writeClaudeErrorResponse(c, errMsg)
 			if errMsg != nil {
 				cliCancel(errMsg.Error)
 			} else {
@@ -300,7 +321,7 @@ func (h *ClaudeCodeAPIHandler) forwardClaudeStream(c *gin.Context, flusher http.
 			}
 			c.Status(status)
 
-			errorBytes, _ := json.Marshal(h.toClaudeError(errMsg))
+			errorBytes := h.marshalClaudeError(errMsg)
 			_, _ = fmt.Fprintf(c.Writer, "event: error\ndata: %s\n\n", errorBytes)
 		},
 	})
@@ -316,12 +337,24 @@ type claudeErrorResponse struct {
 	Error claudeErrorDetail `json:"error"`
 }
 
-func (h *ClaudeCodeAPIHandler) toClaudeError(msg *interfaces.ErrorMessage) claudeErrorResponse {
+func (h *ClaudeCodeAPIHandler) toClaudeError(status int, message string) claudeErrorResponse {
+	errType := "api_error"
+	switch status {
+	case http.StatusBadRequest:
+		errType = "invalid_request_error"
+	case http.StatusUnauthorized:
+		errType = "authentication_error"
+	case http.StatusForbidden:
+		errType = "permission_error"
+	case http.StatusTooManyRequests:
+		errType = "rate_limit_error"
+	}
+
 	return claudeErrorResponse{
 		Type: "error",
 		Error: claudeErrorDetail{
-			Type:    "api_error",
-			Message: msg.Error.Error(),
+			Type:    errType,
+			Message: message,
 		},
 	}
 }

@@ -257,6 +257,9 @@ func parseAuggieUsage(data []byte) (usage.Detail, bool) {
 	if usageNode := root.Get("usage"); usageNode.Exists() {
 		return parseOpenAIUsage(data), true
 	}
+	if detail, ok := parseAuggieNodeUsage(root.Get("nodes")); ok {
+		return detail, true
+	}
 
 	detail := usage.Detail{}
 	var found bool
@@ -296,6 +299,67 @@ func parseAuggieUsage(data []byte) (usage.Detail, bool) {
 	}
 
 	return detail, found
+}
+
+func parseAuggieNodeUsage(nodes gjson.Result) (usage.Detail, bool) {
+	if !nodes.Exists() || !nodes.IsArray() {
+		return usage.Detail{}, false
+	}
+
+	detail := usage.Detail{}
+	var found bool
+
+	for _, node := range nodes.Array() {
+		tokenUsage := node.Get("token_usage")
+		if !tokenUsage.Exists() {
+			continue
+		}
+
+		var nodeFound bool
+
+		if input := tokenUsage.Get("input_tokens"); input.Exists() {
+			detail.InputTokens = maxUsageField(detail.InputTokens, input.Int())
+			nodeFound = true
+		}
+		if output := tokenUsage.Get("output_tokens"); output.Exists() {
+			detail.OutputTokens = maxUsageField(detail.OutputTokens, output.Int())
+			nodeFound = true
+		} else if output := tokenUsage.Get("assistant_response_tokens"); output.Exists() {
+			detail.OutputTokens = maxUsageField(detail.OutputTokens, output.Int())
+			nodeFound = true
+		}
+		if total := tokenUsage.Get("total_tokens"); total.Exists() {
+			detail.TotalTokens = maxUsageField(detail.TotalTokens, total.Int())
+			nodeFound = true
+		}
+		if reasoning := tokenUsage.Get("reasoning_tokens"); reasoning.Exists() {
+			detail.ReasoningTokens = maxUsageField(detail.ReasoningTokens, reasoning.Int())
+			nodeFound = true
+		} else if reasoning := tokenUsage.Get("thinking_tokens"); reasoning.Exists() {
+			detail.ReasoningTokens = maxUsageField(detail.ReasoningTokens, reasoning.Int())
+			nodeFound = true
+		}
+
+		cacheRead := tokenUsage.Get("cache_read_input_tokens")
+		cacheCreation := tokenUsage.Get("cache_creation_input_tokens")
+		if cacheRead.Exists() || cacheCreation.Exists() {
+			detail.CachedTokens = maxUsageField(detail.CachedTokens, maxUsageField(cacheRead.Int(), cacheCreation.Int()))
+			nodeFound = true
+		}
+
+		if nodeFound {
+			found = true
+		}
+	}
+
+	return detail, found
+}
+
+func maxUsageField(current, next int64) int64 {
+	if next > current {
+		return next
+	}
+	return current
 }
 
 func parseClaudeUsage(data []byte) usage.Detail {
@@ -643,6 +707,12 @@ func SanityCheckResponse(data []byte) error {
 		if len(res.Get("content").Array()) == 0 {
 			return statusErr{code: 502, msg: "upstream response has empty content"}
 		}
+		return nil
+	}
+
+	// Structured upstream error payloads are valid JSON responses and should
+	// flow to the caller's status/error handling instead of being masked as 502s.
+	if res.Get("error").Exists() {
 		return nil
 	}
 

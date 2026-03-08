@@ -22,6 +22,8 @@ type compactCaptureExecutor struct {
 	calls        int
 }
 
+const compactTestModelID = "gpt-5.4"
+
 func (e *compactCaptureExecutor) Identifier() string { return "test-provider" }
 
 func (e *compactCaptureExecutor) Execute(ctx context.Context, auth *coreauth.Auth, req coreexecutor.Request, opts coreexecutor.Options) (coreexecutor.Response, error) {
@@ -57,7 +59,7 @@ func TestOpenAIResponsesCompactRejectsStream(t *testing.T) {
 	if _, err := manager.Register(context.Background(), auth); err != nil {
 		t.Fatalf("Register auth: %v", err)
 	}
-	registry.GetGlobalRegistry().RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: "test-model"}})
+	registry.GetGlobalRegistry().RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: compactTestModelID, Version: "gpt-5-4", OwnedBy: "auggie", Type: "auggie"}})
 	t.Cleanup(func() {
 		registry.GetGlobalRegistry().UnregisterClient(auth.ID)
 	})
@@ -67,7 +69,7 @@ func TestOpenAIResponsesCompactRejectsStream(t *testing.T) {
 	router := gin.New()
 	router.POST("/v1/responses/compact", h.Compact)
 
-	req := httptest.NewRequest(http.MethodPost, "/v1/responses/compact", strings.NewReader(`{"model":"test-model","stream":true}`))
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses/compact", strings.NewReader(`{"model":"gpt-5.4","stream":true}`))
 	req.Header.Set("Content-Type", "application/json")
 	resp := httptest.NewRecorder()
 	router.ServeHTTP(resp, req)
@@ -90,7 +92,7 @@ func TestOpenAIResponsesCompactExecute(t *testing.T) {
 	if _, err := manager.Register(context.Background(), auth); err != nil {
 		t.Fatalf("Register auth: %v", err)
 	}
-	registry.GetGlobalRegistry().RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: "test-model"}})
+	registry.GetGlobalRegistry().RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: compactTestModelID, Version: "gpt-5-4", OwnedBy: "auggie", Type: "auggie"}})
 	t.Cleanup(func() {
 		registry.GetGlobalRegistry().UnregisterClient(auth.ID)
 	})
@@ -100,7 +102,7 @@ func TestOpenAIResponsesCompactExecute(t *testing.T) {
 	router := gin.New()
 	router.POST("/v1/responses/compact", h.Compact)
 
-	req := httptest.NewRequest(http.MethodPost, "/v1/responses/compact", strings.NewReader(`{"model":"test-model","input":"hello"}`))
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses/compact", strings.NewReader(`{"model":"gpt-5.4","input":"hello"}`))
 	req.Header.Set("Content-Type", "application/json")
 	resp := httptest.NewRecorder()
 	router.ServeHTTP(resp, req)

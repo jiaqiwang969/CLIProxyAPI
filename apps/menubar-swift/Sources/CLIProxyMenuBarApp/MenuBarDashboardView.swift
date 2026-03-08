@@ -16,6 +16,20 @@ struct MenuBarDashboardView: View {
     @State private var noteDrafts: [String: String] = [:]
     @AppStorage("launchAtLogin") private var launchAtLogin = false
 
+    private var keyBindingGroups: [ProviderKeyGroup] {
+        viewModel.providerKeyGroups.compactMap { group in
+            let accounts = group.accounts.filter { !$0.keys.isEmpty }
+            guard !accounts.isEmpty else {
+                return nil
+            }
+            return ProviderKeyGroup(provider: group.provider, accounts: accounts)
+        }
+    }
+
+    private var usageGroups: [UsageProviderGroup] {
+        viewModel.usageProviderGroups
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack {
@@ -81,7 +95,8 @@ struct MenuBarDashboardView: View {
             }
         }
         .padding(12)
-        .frame(width: 400)
+        .frame(width: MenuBarLayout.panelWidth)
+        .fixedSize(horizontal: false, vertical: true)
     }
 
     private var settingsPanel: some View {
@@ -135,7 +150,6 @@ struct MenuBarDashboardView: View {
             .buttonStyle(.link)
             .font(.caption)
         }
-        .frame(maxHeight: 220)
     }
 
     private var servicePanel: some View {
@@ -194,6 +208,93 @@ struct MenuBarDashboardView: View {
             Divider()
 
             HStack(spacing: 8) {
+                Text("账号状态")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Text("\(viewModel.serviceProviderGroups.count) 个 Provider / \(viewModel.authTargets.count) 个账号 / \(viewModel.apiKeys.count) 个 Key")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+
+            if viewModel.serviceProviderGroups.isEmpty {
+                Text("暂无服务账号，请先登录 Auggie 或 Antigravity。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .padding(.vertical, 6)
+            } else {
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 12) {
+                        ForEach(viewModel.serviceProviderGroups) { providerGroup in
+                            VStack(alignment: .leading, spacing: 8) {
+                                HStack(spacing: 8) {
+                                    Text(providerGroup.provider)
+                                        .font(.caption)
+                                        .padding(.horizontal, 8)
+                                        .padding(.vertical, 3)
+                                        .background(Color.secondary.opacity(0.12))
+                                        .clipShape(Capsule())
+
+                                    Spacer()
+
+                                    Text("\(providerGroup.accounts.count) 个账号 / \(providerGroup.totalKeys) 个 Key")
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                }
+
+                                ForEach(providerGroup.accounts) { account in
+                                    VStack(alignment: .leading, spacing: 8) {
+                                        HStack(spacing: 8) {
+                                            Circle()
+                                                .fill(authStatusColor(for: account))
+                                                .frame(width: 8, height: 8)
+
+                                            Text(account.title)
+                                                .font(.callout)
+                                                .lineLimit(1)
+                                                .truncationMode(.middle)
+
+                                            Spacer()
+
+                                            Text(account.statusText)
+                                                .font(.caption2)
+                                                .foregroundStyle(.secondary)
+                                        }
+
+                                        HStack(spacing: 6) {
+                                            if let subtitle = account.subtitle, !subtitle.isEmpty {
+                                                Text(subtitle)
+                                                    .font(.caption)
+                                                    .foregroundStyle(.secondary)
+                                                    .lineLimit(1)
+                                                    .truncationMode(.middle)
+                                            }
+
+                                            Spacer()
+
+                                            Text("\(account.modelCount) 个模型")
+                                                .font(.caption2)
+                                                .foregroundStyle(.secondary)
+                                            Text("\(account.boundKeyCount) 个 Key")
+                                                .font(.caption2)
+                                                .foregroundStyle(.secondary)
+                                        }
+                                    }
+                                    .padding(10)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .background(Color.secondary.opacity(0.06))
+                                    .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                                }
+                            }
+                        }
+                    }
+                }
+                .frame(height: MenuBarLayout.serviceAccountGroupsHeight(for: viewModel.serviceProviderGroups))
+            }
+
+            Divider()
+
+            HStack(spacing: 8) {
                 Text("运行日志")
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -234,157 +335,363 @@ struct MenuBarDashboardView: View {
                         }
                     }
                 }
-                .frame(maxHeight: 140)
+                .frame(height: MenuBarLayout.serviceLogHeight(for: viewModel.filteredServiceLogs.count))
             }
         }
     }
 
     private var keysPanel: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            if !viewModel.hasConfigFile {
-                Text("未找到本地 config.yaml，无法管理 Key")
+        VStack(alignment: .leading, spacing: 10) {
+            if !viewModel.clientKeyManagementAvailable {
+                Text("当前后端未提供 client-api-keys 接口，先只显示账号状态；升级后端后才可按账号绑定 Key。")
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                
-                Button("生成默认配置") {
-                    viewModel.createDefaultConfig()
-                }
-                .buttonStyle(.borderedProminent)
-                .controlSize(.small)
-            } else {
-                HStack(spacing: 6) {
-                    TextField("粘贴 sk-key", text: $viewModel.newKeyInput)
-                        .textFieldStyle(.roundedBorder)
-                    TextField("备注（可选）", text: $viewModel.newKeyNoteInput)
-                        .textFieldStyle(.roundedBorder)
-                    Button("添加") {
-                        viewModel.addManualKey()
-                    }
-                }
+            }
 
-                HStack(spacing: 6) {
-                    Button("生成并添加") {
-                        viewModel.generateAndAddKey()
-                    }
-                    Spacer()
-                    Text("共 \(viewModel.apiKeys.count) 个")
-                        .font(.caption2)
+            HStack(spacing: 8) {
+                Text("Key 管理")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Text("\(viewModel.apiKeys.count) 个 Key")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+
+            if viewModel.availableProviders.isEmpty {
+                Text("暂无可绑定账号，请先在控制台登录 Auggie 或 Antigravity。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else if viewModel.clientKeyManagementAvailable {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("新增 Key")
+                        .font(.caption)
                         .foregroundStyle(.secondary)
+
+                    HStack(spacing: 6) {
+                        Picker(
+                            "Provider",
+                            selection: Binding(
+                                get: { viewModel.selectedProvider },
+                                set: { viewModel.setSelectedProvider($0) }
+                            )
+                        ) {
+                            ForEach(viewModel.availableProviders, id: \.self) { provider in
+                                Text(provider).tag(provider)
+                            }
+                        }
+                        .labelsHidden()
+                        .frame(maxWidth: 130)
+
+                        Picker(
+                            "Account",
+                            selection: Binding(
+                                get: { viewModel.selectedAuthID },
+                                set: { viewModel.setSelectedAuthID($0) }
+                            )
+                        ) {
+                            ForEach(viewModel.filteredAuthTargets) { target in
+                                Text(target.displayName).tag(target.id)
+                            }
+                        }
+                        .labelsHidden()
+                    }
+
+                    if let target = viewModel.selectedAuthTarget {
+                        HStack(spacing: 6) {
+                            Text("当前绑定：\(target.provider) / \(target.displayName)")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            Spacer()
+                            Text("\(target.models.count) 个模型")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+
+                    HStack(spacing: 6) {
+                        TextField("粘贴 sk-key", text: $viewModel.newKeyInput)
+                            .textFieldStyle(.roundedBorder)
+                        TextField("备注（可选）", text: $viewModel.newKeyNoteInput)
+                            .textFieldStyle(.roundedBorder)
+                        Button("添加") {
+                            viewModel.addManualKey()
+                        }
+                        .disabled(!viewModel.canManageScopedKeys)
+                    }
+
+                    HStack(spacing: 6) {
+                        Button("生成并添加") {
+                            viewModel.generateAndAddKey()
+                        }
+                        .disabled(!viewModel.canManageScopedKeys)
+                        Spacer()
+                    }
                 }
             }
 
-            if viewModel.apiKeys.isEmpty {
-                Text("暂无 sk-key")
+            if keyBindingGroups.isEmpty {
+                Text("暂无 Key 或账号绑定信息")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             } else {
                 ScrollView {
-                    LazyVStack(spacing: 6) {
-                        ForEach(Array(viewModel.apiKeys.enumerated()), id: \.element.id) { index, entry in
-                            VStack(alignment: .leading, spacing: 4) {
+                    LazyVStack(alignment: .leading, spacing: 12) {
+                        ForEach(keyBindingGroups) { providerGroup in
+                            VStack(alignment: .leading, spacing: 8) {
                                 HStack(spacing: 8) {
-                                    Text(entry.masked)
-                                        .font(.callout)
-                                        .lineLimit(1)
-                                        .truncationMode(.middle)
-                                        .foregroundStyle(entry.enabled ? .primary : .secondary)
-                                    Spacer()
-                                    Text("\(viewModel.requestsForKey(entry.id))")
+                                    Text(providerGroup.provider)
                                         .font(.caption)
-                                        .monospacedDigit()
-                                        .foregroundStyle(.secondary)
-                                    Toggle(
-                                        "",
-                                        isOn: Binding(
-                                            get: { entry.enabled },
-                                            set: { newValue in
-                                                viewModel.setKeyEnabled(entry.id, enabled: newValue)
-                                            }
-                                        )
-                                    )
-                                    .toggleStyle(.switch)
-                                    .labelsHidden()
-                                    .controlSize(.small)
+                                        .padding(.horizontal, 8)
+                                        .padding(.vertical, 3)
+                                        .background(Color.secondary.opacity(0.12))
+                                        .clipShape(Capsule())
 
-                                    Button("删除") {
-                                        viewModel.removeKey(entry.id)
-                                    }
-                                    .buttonStyle(.borderless)
+                                    Spacer()
+
+                                    Text("\(providerGroup.accounts.count) 个账号 / \(providerGroup.totalKeys) 个 Key")
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
                                 }
 
-                                HStack(spacing: 6) {
-                                    TextField(
-                                        "备注",
-                                        text: Binding(
-                                            get: { noteDrafts[entry.id] ?? entry.note },
-                                            set: { noteDrafts[entry.id] = $0 }
-                                        )
-                                    )
-                                    .textFieldStyle(.roundedBorder)
-                                    .font(.caption)
+                                ForEach(providerGroup.accounts) { account in
+                                    VStack(alignment: .leading, spacing: 8) {
+                                        HStack(spacing: 8) {
+                                            Text(account.title)
+                                                .font(.callout)
+                                                .lineLimit(1)
+                                                .truncationMode(.middle)
 
-                                    Button("保存") {
-                                        let note = noteDrafts[entry.id] ?? entry.note
-                                        viewModel.updateKeyNote(entry.id, note: note)
+                                            Spacer()
+
+                                            Text("\(account.totalKeys) 个 Key")
+                                                .font(.caption2)
+                                                .foregroundStyle(.secondary)
+                                        }
+
+                                        if account.keys.isEmpty {
+                                            Text("暂无绑定 Key")
+                                                .font(.caption)
+                                                .foregroundStyle(.secondary)
+                                        } else {
+                                            VStack(alignment: .leading, spacing: 8) {
+                                                ForEach(account.keys) { entry in
+                                                    keyEntryView(entry)
+                                                }
+                                            }
+                                        }
                                     }
-                                    .buttonStyle(.borderless)
-                                    .font(.caption)
+                                    .padding(10)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .background(Color.secondary.opacity(0.06))
+                                    .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
                                 }
                             }
-                            .padding(.vertical, 4)
-                            Divider()
                         }
                     }
                 }
-                .frame(maxHeight: 240)
+                .frame(height: MenuBarLayout.keysGroupHeight(for: keyBindingGroups))
             }
         }
     }
 
+    private func keyEntryView(_ entry: APIKeyEntry) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                Text(entry.masked)
+                    .font(.callout)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .foregroundStyle(entry.enabled ? .primary : .secondary)
+
+                Spacer()
+
+                Text("\(viewModel.requestsForKey(entry.id))")
+                    .font(.caption)
+                    .monospacedDigit()
+                    .foregroundStyle(.secondary)
+
+                Toggle(
+                    "",
+                    isOn: Binding(
+                        get: { entry.enabled },
+                        set: { newValue in
+                            viewModel.setKeyEnabled(entry.id, enabled: newValue)
+                        }
+                    )
+                )
+                .toggleStyle(.switch)
+                .labelsHidden()
+                .controlSize(.small)
+
+                Button("复制") {
+                    viewModel.copyKey(entry.id)
+                }
+                .buttonStyle(.borderless)
+
+                Button("删除") {
+                    viewModel.removeKey(entry.id)
+                }
+                .buttonStyle(.borderless)
+            }
+
+            HStack(spacing: 6) {
+                TextField(
+                    "备注",
+                    text: Binding(
+                        get: { noteDrafts[entry.id] ?? entry.note },
+                        set: { noteDrafts[entry.id] = $0 }
+                    )
+                )
+                .textFieldStyle(.roundedBorder)
+                .font(.caption)
+
+                Button("保存") {
+                    let note = noteDrafts[entry.id] ?? entry.note
+                    viewModel.updateKeyNote(entry.id, note: note)
+                }
+                .buttonStyle(.borderless)
+                .font(.caption)
+            }
+        }
+        .padding(8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color(NSColor.controlBackgroundColor))
+        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+    }
+
+    private func authStatusColor(for account: ServiceAccountGroup) -> Color {
+        if account.unavailable {
+            return .red
+        }
+        if account.disabled {
+            return .orange
+        }
+        if account.statusText.lowercased().contains("active") {
+            return .green
+        }
+        if account.statusText == "未同步" {
+            return .orange
+        }
+        return .secondary
+    }
+
     private var usagePanel: some View {
-        return Group {
-            if viewModel.keyUsages.isEmpty {
+        Group {
+            if usageGroups.isEmpty {
                 Text("暂无贡献数据")
                     .font(.callout)
                     .foregroundStyle(.secondary)
                     .padding(.vertical, 10)
             } else {
-                ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 10) {
-                        ForEach(viewModel.keyUsages) { keyUsage in
-                            VStack(alignment: .leading, spacing: 6) {
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack(spacing: 8) {
+                        Text("Provider / 账号 / Key / 模型")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                        Text("\(usageGroups.count) 个 Provider / \(viewModel.keyUsages.count) 个 Key")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+
+                    ScrollView {
+                        LazyVStack(alignment: .leading, spacing: 12) {
+                            ForEach(usageGroups) { providerGroup in
                                 HStack(spacing: 8) {
-                                    Text(keyUsage.label)
+                                    Text(providerGroup.provider)
                                         .font(.caption)
-                                        .foregroundStyle(.secondary)
-                                        .lineLimit(1)
-                                        .truncationMode(.middle)
+                                        .padding(.horizontal, 8)
+                                        .padding(.vertical, 3)
+                                        .background(Color.secondary.opacity(0.12))
+                                        .clipShape(Capsule())
                                     Spacer()
-                                    Text("\(keyUsage.totalRequests)")
-                                        .font(.caption)
-                                        .monospacedDigit()
-                                    Text("\(UsageMonitorViewModel.compactNumber(keyUsage.totalTokens)) 词")
+                                    Text("\(providerGroup.totalRequests) 次")
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                    Text("\(UsageMonitorViewModel.compactNumber(providerGroup.totalTokens)) 词")
                                         .font(.caption2)
                                         .foregroundStyle(.secondary)
                                 }
 
-                                ForEach(keyUsage.modelCalls) { item in
-                                    HStack(spacing: 8) {
-                                        Text(item.id)
-                                            .lineLimit(1)
-                                            .truncationMode(.middle)
-                                        Spacer()
-                                        Text("\(item.requests)")
-                                            .monospacedDigit()
-                                            .foregroundStyle(.secondary)
+                                VStack(alignment: .leading, spacing: 10) {
+                                    ForEach(providerGroup.accounts) { account in
+                                        VStack(alignment: .leading, spacing: 8) {
+                                            HStack(spacing: 8) {
+                                                Text(account.title)
+                                                    .font(.callout)
+                                                    .lineLimit(1)
+                                                    .truncationMode(.middle)
+                                                Spacer()
+                                                Text("\(account.totalRequests) 次")
+                                                    .font(.caption2)
+                                                    .foregroundStyle(.secondary)
+                                                Text("\(UsageMonitorViewModel.compactNumber(account.totalTokens)) 词")
+                                                    .font(.caption2)
+                                                    .foregroundStyle(.secondary)
+                                            }
+
+                                            if let subtitle = account.subtitle, !subtitle.isEmpty {
+                                                Text(subtitle)
+                                                    .font(.caption)
+                                                    .foregroundStyle(.secondary)
+                                                    .lineLimit(1)
+                                                    .truncationMode(.middle)
+                                            }
+
+                                            VStack(alignment: .leading, spacing: 8) {
+                                                ForEach(account.keys) { key in
+                                                    VStack(alignment: .leading, spacing: 6) {
+                                                        HStack(spacing: 8) {
+                                                            Text(key.label)
+                                                                .font(.caption)
+                                                                .foregroundStyle(.secondary)
+                                                                .lineLimit(1)
+                                                                .truncationMode(.middle)
+                                                            Spacer()
+                                                            Text("\(key.totalRequests)")
+                                                                .font(.caption)
+                                                                .monospacedDigit()
+                                                            Text("\(UsageMonitorViewModel.compactNumber(key.totalTokens)) 词")
+                                                                .font(.caption2)
+                                                                .foregroundStyle(.secondary)
+                                                        }
+
+                                                        ForEach(key.modelCalls) { item in
+                                                            HStack(spacing: 8) {
+                                                                Text(item.id)
+                                                                    .font(.callout)
+                                                                    .lineLimit(1)
+                                                                    .truncationMode(.middle)
+                                                                Spacer()
+                                                                Text("\(item.requests)")
+                                                                    .font(.caption)
+                                                                    .monospacedDigit()
+                                                                    .foregroundStyle(.secondary)
+                                                                Text("\(UsageMonitorViewModel.compactNumber(item.totalTokens))")
+                                                                    .font(.caption2)
+                                                                    .foregroundStyle(.secondary)
+                                                            }
+                                                        }
+                                                    }
+                                                    .padding(8)
+                                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                                    .background(Color(NSColor.controlBackgroundColor))
+                                                    .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                                                }
+                                            }
+                                        }
+                                        .padding(10)
+                                        .frame(maxWidth: .infinity, alignment: .leading)
+                                        .background(Color.secondary.opacity(0.06))
+                                        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
                                     }
-                                    .font(.callout)
                                 }
                             }
                         }
                     }
+                    .frame(height: MenuBarLayout.usageListHeight(for: usageGroups))
                 }
-                .frame(maxHeight: 220)
             }
         }
     }

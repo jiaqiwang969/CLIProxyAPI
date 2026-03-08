@@ -118,6 +118,92 @@ func (h *Handler) DeleteAPIKeys(c *gin.Context) {
 	h.deleteFromStringList(c, &h.cfg.APIKeys, func() {})
 }
 
+// client-api-keys
+func (h *Handler) GetClientAPIKeys(c *gin.Context) {
+	managed := managementClientAPIKeys(h.cfg)
+	if len(managed) == 0 {
+		c.JSON(200, gin.H{"client-api-keys": []config.ClientAPIKey{}})
+		return
+	}
+	c.JSON(200, gin.H{"client-api-keys": managed})
+}
+
+func (h *Handler) PutClientAPIKeys(c *gin.Context) {
+	data, err := c.GetRawData()
+	if err != nil {
+		c.JSON(400, gin.H{"error": "failed to read body"})
+		return
+	}
+
+	var arr []config.ClientAPIKey
+	if err = json.Unmarshal(data, &arr); err != nil {
+		var obj struct {
+			Value         []config.ClientAPIKey `json:"value"`
+			Items         []config.ClientAPIKey `json:"items"`
+			ClientAPIKeys []config.ClientAPIKey `json:"client-api-keys"`
+		}
+		if err2 := json.Unmarshal(data, &obj); err2 != nil {
+			c.JSON(400, gin.H{"error": "invalid body"})
+			return
+		}
+		switch {
+		case obj.ClientAPIKeys != nil:
+			arr = obj.ClientAPIKeys
+		case obj.Value != nil:
+			arr = obj.Value
+		case obj.Items != nil:
+			arr = obj.Items
+		default:
+			arr = []config.ClientAPIKey{}
+		}
+	}
+
+	h.cfg.ClientAPIKeys = append([]config.ClientAPIKey(nil), arr...)
+	h.cfg.APIKeys = nil
+	h.cfg.SanitizeClientAPIKeys()
+	h.persist(c)
+}
+
+func managementClientAPIKeys(cfg *config.Config) []config.ClientAPIKey {
+	if cfg == nil {
+		return nil
+	}
+
+	cfgCopy := *cfg
+	cfgCopy.SanitizeClientAPIKeys()
+	if len(cfgCopy.APIKeys) == 0 && len(cfgCopy.ClientAPIKeys) == 0 {
+		return nil
+	}
+
+	result := make([]config.ClientAPIKey, 0, len(cfgCopy.APIKeys)+len(cfgCopy.ClientAPIKeys))
+	indexByKey := make(map[string]int, len(cfgCopy.APIKeys)+len(cfgCopy.ClientAPIKeys))
+	for _, key := range cfgCopy.APIKeys {
+		trimmed := strings.TrimSpace(key)
+		if trimmed == "" {
+			continue
+		}
+		indexByKey[trimmed] = len(result)
+		result = append(result, config.ClientAPIKey{Key: trimmed})
+	}
+	for _, entry := range cfgCopy.ClientAPIKeys {
+		trimmed := strings.TrimSpace(entry.Key)
+		if trimmed == "" {
+			continue
+		}
+		entry.Key = trimmed
+		if idx, exists := indexByKey[trimmed]; exists {
+			result[idx] = entry
+			continue
+		}
+		indexByKey[trimmed] = len(result)
+		result = append(result, entry)
+	}
+	if len(result) == 0 {
+		return nil
+	}
+	return result
+}
+
 // gemini-api-key: []GeminiKey
 func (h *Handler) GetGeminiKeys(c *gin.Context) {
 	c.JSON(200, gin.H{"gemini-api-key": h.cfg.GeminiKey})

@@ -1,12 +1,17 @@
 import Foundation
 import Security
 
-struct APIKeyEntry: Identifiable, Equatable {
+struct APIKeyEntry: Identifiable, Equatable, Sendable {
     let id: String
     let masked: String
     var note: String
     var enabled: Bool
     var createdAt: Date?
+    var provider: String?
+    var authID: String?
+    var accountLabel: String
+    var accountDetail: String?
+    var modelIDs: [String]
 }
 
 enum APIKeyStoreError: LocalizedError {
@@ -30,7 +35,18 @@ enum APIKeyStore {
     static func loadEntries(configPath: String?) throws -> [APIKeyEntry] {
         let keyTuples = try loadKeys(configPath: configPath)
         return keyTuples.map { tuple in
-            APIKeyEntry(id: tuple.key, masked: mask(tuple.key), note: tuple.note, enabled: tuple.enabled, createdAt: nil)
+            APIKeyEntry(
+                id: tuple.key,
+                masked: mask(tuple.key),
+                note: tuple.note,
+                enabled: tuple.enabled,
+                createdAt: nil,
+                provider: nil,
+                authID: nil,
+                accountLabel: "未绑定",
+                accountDetail: nil,
+                modelIDs: []
+            )
         }
     }
 
@@ -140,7 +156,7 @@ enum APIKeyStore {
             let trimmed = line.trimmingCharacters(in: .whitespaces)
 
             if start == nil {
-                if trimmed == "api-keys:" {
+                if trimmed == "api-keys:" || trimmed.hasPrefix("api-keys: ") {
                     start = index
                 }
                 continue
@@ -182,7 +198,7 @@ enum APIKeyStore {
         return unquoted.isEmpty ? nil : (key: unquoted, note: note, enabled: !explicitDisabled)
     }
 
-    private static func mask(_ value: String) -> String {
+    static func mask(_ value: String) -> String {
         if value.count <= 14 {
             return value
         }

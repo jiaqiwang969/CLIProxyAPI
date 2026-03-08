@@ -43,11 +43,11 @@ import (
 var lastRefreshKeys = []string{"last_refresh", "lastRefresh", "last_refreshed_at", "lastRefreshedAt"}
 
 const (
-	anthropicCallbackPort   = 54545
-	geminiCallbackPort      = 8085
-	codexCallbackPort       = 1455
-	geminiCLIEndpoint       = "https://cloudcode-pa.googleapis.com"
-	geminiCLIVersion        = "v1internal"
+	anthropicCallbackPort = 54545
+	geminiCallbackPort    = 8085
+	codexCallbackPort     = 1455
+	geminiCLIEndpoint     = "https://cloudcode-pa.googleapis.com"
+	geminiCLIVersion      = "v1internal"
 )
 
 func getGeminiCLIUserAgent() string {
@@ -258,10 +258,11 @@ func (h *Handler) ListAuthFiles(c *gin.Context) {
 		h.listAuthFilesFromDisk(c)
 		return
 	}
+	includeModels := truthyQuery(c.Query("include_models"))
 	auths := h.authManager.List()
 	files := make([]gin.H, 0, len(auths))
 	for _, auth := range auths {
-		if entry := h.buildAuthFileEntry(auth); entry != nil {
+		if entry := h.buildAuthFileEntry(auth, includeModels); entry != nil {
 			files = append(files, entry)
 		}
 	}
@@ -298,27 +299,7 @@ func (h *Handler) GetAuthFileModels(c *gin.Context) {
 	}
 
 	// Get models from registry
-	reg := registry.GetGlobalRegistry()
-	models := reg.GetModelsForClient(authID)
-
-	result := make([]gin.H, 0, len(models))
-	for _, m := range models {
-		entry := gin.H{
-			"id": m.ID,
-		}
-		if m.DisplayName != "" {
-			entry["display_name"] = m.DisplayName
-		}
-		if m.Type != "" {
-			entry["type"] = m.Type
-		}
-		if m.OwnedBy != "" {
-			entry["owned_by"] = m.OwnedBy
-		}
-		result = append(result, entry)
-	}
-
-	c.JSON(200, gin.H{"models": result})
+	c.JSON(200, gin.H{"models": h.modelsForAuthID(authID)})
 }
 
 // List auth files from disk when the auth manager is unavailable.
@@ -355,7 +336,7 @@ func (h *Handler) listAuthFilesFromDisk(c *gin.Context) {
 	c.JSON(200, gin.H{"files": files})
 }
 
-func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
+func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth, includeModels bool) gin.H {
 	if auth == nil {
 		return nil
 	}
@@ -430,7 +411,49 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 	if claims := extractCodexIDTokenClaims(auth); claims != nil {
 		entry["id_token"] = claims
 	}
+	if includeModels {
+		entry["models"] = h.modelsForAuthID(auth.ID)
+	}
 	return entry
+}
+
+func (h *Handler) modelsForAuthID(authID string) []gin.H {
+	authID = strings.TrimSpace(authID)
+	if authID == "" {
+		return []gin.H{}
+	}
+
+	reg := registry.GetGlobalRegistry()
+	models := reg.GetModelsForClient(authID)
+	result := make([]gin.H, 0, len(models))
+	for _, m := range models {
+		if m == nil || strings.TrimSpace(m.ID) == "" {
+			continue
+		}
+		entry := gin.H{
+			"id": m.ID,
+		}
+		if m.DisplayName != "" {
+			entry["display_name"] = m.DisplayName
+		}
+		if m.Type != "" {
+			entry["type"] = m.Type
+		}
+		if m.OwnedBy != "" {
+			entry["owned_by"] = m.OwnedBy
+		}
+		result = append(result, entry)
+	}
+	return result
+}
+
+func truthyQuery(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
 }
 
 func extractCodexIDTokenClaims(auth *coreauth.Auth) gin.H {

@@ -96,8 +96,8 @@ func TestFetchAuggieModelsUsesModelInfoRegistryWhenBackendModelNamesAreOpaque(t 
 
 	models, updatedAuth := fetchAuggieModelsForTest(t, http.StatusOK, body)
 
-	if len(models) != 9 {
-		t.Fatalf("models = %d, want 9", len(models))
+	if len(models) != 3 {
+		t.Fatalf("models = %d, want 3", len(models))
 	}
 	gotIDs := make([]string, 0, len(models))
 	byID := make(map[string]*registry.ModelInfo, len(models))
@@ -106,7 +106,7 @@ func TestFetchAuggieModelsUsesModelInfoRegistryWhenBackendModelNamesAreOpaque(t 
 		byID[model.ID] = model
 	}
 	sort.Strings(gotIDs)
-	if want := []string{"claude-haiku-4-5", "claude-opus-4-5", "claude-opus-4.5", "gpt-5-1", "gpt-5.1", "gpt5.1", "haiku-4.5", "haiku4.5", "opus4.5"}; !reflect.DeepEqual(gotIDs, want) {
+	if want := []string{"claude-haiku-4-5", "claude-opus-4-5", "gpt-5-1"}; !reflect.DeepEqual(gotIDs, want) {
 		t.Fatalf("model ids = %#v, want %#v", gotIDs, want)
 	}
 	if _, ok := byID["4e68d9be07a644ce975509fa4c7afae84b51ca39986e9c40db4ad6a2cf756948"]; ok {
@@ -124,17 +124,14 @@ func TestFetchAuggieModelsUsesModelInfoRegistryWhenBackendModelNamesAreOpaque(t 
 	if got := byID["gpt-5-1"].Description; got != "Strong reasoning and planning" {
 		t.Fatalf("gpt-5-1 description = %q, want Strong reasoning and planning", got)
 	}
-	if got := byID["gpt5.1"].DisplayName; got != "gpt5.1" {
-		t.Fatalf("gpt5.1 display_name = %q, want gpt5.1", got)
+	if got := byID["gpt-5-1"].Name; got != "gpt5.1" {
+		t.Fatalf("gpt-5-1 name = %q, want gpt5.1", got)
 	}
-	if got := byID["gpt-5.1"].DisplayName; got != "GPT-5.1" {
-		t.Fatalf("gpt-5.1 display_name = %q, want GPT-5.1", got)
+	if got := byID["gpt-5-1"].DisplayName; got != "GPT-5.1" {
+		t.Fatalf("gpt-5-1 display_name = %q, want GPT-5.1", got)
 	}
-	if got := byID["gpt5.1"].Description; got != "Strong reasoning and planning" {
-		t.Fatalf("gpt5.1 description = %q, want Strong reasoning and planning", got)
-	}
-	if got := byID["claude-opus-4.5"].Description; got != "Best for complex tasks" {
-		t.Fatalf("claude-opus-4.5 description = %q, want Best for complex tasks", got)
+	if got := byID["claude-opus-4-5"].Name; got != "opus4.5" {
+		t.Fatalf("claude-opus-4-5 name = %q, want opus4.5", got)
 	}
 	if got := updatedAuth.Metadata["default_model"]; got != "claude-opus-4-5" {
 		t.Fatalf("default_model = %v, want claude-opus-4-5", got)
@@ -160,6 +157,15 @@ func TestFetchAuggieModelsUsesModelInfoRegistryWhenBackendModelNamesAreOpaque(t 
 	}
 	if got := aliases["claude-opus-4.5"]; got != "claude-opus-4-5" {
 		t.Fatalf("claude-opus-4.5 alias = %v, want claude-opus-4-5", got)
+	}
+	if _, ok := byID["gpt-5.1"]; ok {
+		t.Fatal("expected display alias gpt-5.1 to stay in alias metadata, not model inventory")
+	}
+	if _, ok := byID["gpt5.1"]; ok {
+		t.Fatal("expected short alias gpt5.1 to stay in alias metadata, not model inventory")
+	}
+	if _, ok := byID["claude-opus-4.5"]; ok {
+		t.Fatal("expected display alias claude-opus-4.5 to stay in alias metadata, not model inventory")
 	}
 }
 
@@ -286,8 +292,8 @@ func TestFetchAuggieModelsUsesAuggieCLIUserAgentForModelDiscovery(t *testing.T) 
 	if gotUserAgent != wantUserAgent {
 		t.Fatalf("user_agent = %q, want %q", gotUserAgent, wantUserAgent)
 	}
-	if len(models) != 19 {
-		t.Fatalf("models = %d, want 19", len(models))
+	if len(models) != 10 {
+		t.Fatalf("models = %d, want 10", len(models))
 	}
 	gotIDs := make([]string, 0, len(models))
 	for _, model := range models {
@@ -298,8 +304,6 @@ func TestFetchAuggieModelsUsesAuggieCLIUserAgentForModelDiscovery(t *testing.T) 
 		"claude-haiku-4-5",
 		"claude-opus-4-5",
 		"claude-opus-4-6",
-		"claude-opus-4.5",
-		"claude-opus-4.6",
 		"claude-sonnet-4",
 		"claude-sonnet-4-5",
 		"claude-sonnet-4-6",
@@ -307,13 +311,6 @@ func TestFetchAuggieModelsUsesAuggieCLIUserAgentForModelDiscovery(t *testing.T) 
 		"gpt-5-1",
 		"gpt-5-2",
 		"gpt-5-4",
-		"gpt-5.1",
-		"gpt-5.2",
-		"gpt-5.4",
-		"haiku-4.5",
-		"sonnet-4",
-		"sonnet-4.5",
-		"sonnet-4.6",
 	}; !reflect.DeepEqual(gotIDs, want) {
 		t.Fatalf("model ids = %#v, want %#v", gotIDs, want)
 	}
@@ -322,6 +319,16 @@ func TestFetchAuggieModelsUsesAuggieCLIUserAgentForModelDiscovery(t *testing.T) 
 	}
 	if got := entry.Metadata["default_model_raw"]; got != "opaque-default" {
 		t.Fatalf("default_model_raw = %v, want opaque-default", got)
+	}
+	aliases, ok := entry.Metadata[AuggieShortNameAliasesMetadataKey].(map[string]any)
+	if !ok {
+		t.Fatalf("model_short_name_aliases type = %T, want map[string]any", entry.Metadata[AuggieShortNameAliasesMetadataKey])
+	}
+	if got := aliases["gpt-5.4"]; got != "gpt-5-4" {
+		t.Fatalf("gpt-5.4 alias = %v, want gpt-5-4", got)
+	}
+	if got := aliases["claude-opus-4.6"]; got != "claude-opus-4-6" {
+		t.Fatalf("claude-opus-4.6 alias = %v, want claude-opus-4-6", got)
 	}
 }
 

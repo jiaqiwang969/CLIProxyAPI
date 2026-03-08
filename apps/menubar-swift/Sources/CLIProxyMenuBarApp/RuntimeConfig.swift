@@ -1,6 +1,6 @@
 import Foundation
 
-struct RuntimeConfig {
+struct RuntimeConfig: Sendable {
     let baseURL: String
     let managementKey: String
     let configPath: String?
@@ -53,6 +53,8 @@ struct RuntimeConfig {
 }
 
 enum RuntimeConfigLoader {
+    private static let defaultManagedManagementKey = "cliproxy-menubar-dev"
+
     static func load() -> RuntimeConfig {
         let env = ProcessInfo.processInfo.environment
 
@@ -68,7 +70,7 @@ enum RuntimeConfigLoader {
         }
 
         for path in candidateConfigPaths(env: env) {
-            if let parsed = parseConfigFile(at: path) {
+            if let parsed = parseConfigFile(at: path, envManagementKey: envKey) {
                 return parsed
             }
         }
@@ -87,17 +89,20 @@ enum RuntimeConfigLoader {
             paths.append(explicit)
         }
 
+        // Prefer the deployed runtime config so the app controls the nix-darwin
+        // managed backend instead of a repo-local development server.
+        let home = NSHomeDirectory()
+        paths.append((home as NSString).appendingPathComponent(".cliproxyapi/config.yaml"))
+
         let cwd = FileManager.default.currentDirectoryPath
         paths.append((cwd as NSString).appendingPathComponent("config.yaml"))
         paths.append((cwd as NSString).appendingPathComponent("apps/server-go/config.yaml"))
         paths.append((cwd as NSString).appendingPathComponent("../CLIProxyAPI-wjq/apps/server-go/config.yaml"))
 
-        let home = NSHomeDirectory()
         paths.append((home as NSString).appendingPathComponent("05-api-代理/CLIProxyAPI-wjq/config.yaml"))
         paths.append((home as NSString).appendingPathComponent("05-api-代理/CLIProxyAPI-wjq/apps/server-go/config.yaml"))
         paths.append((home as NSString).appendingPathComponent("CLIProxyAPI-wjq/config.yaml"))
         paths.append((home as NSString).appendingPathComponent("CLIProxyAPI-wjq/apps/server-go/config.yaml"))
-        paths.append((home as NSString).appendingPathComponent(".cliproxyapi/config.yaml"))
 
         var deduped: [String] = []
         var seen = Set<String>()
@@ -109,7 +114,7 @@ enum RuntimeConfigLoader {
         return deduped
     }
 
-    private static func parseConfigFile(at path: String) -> RuntimeConfig? {
+    private static func parseConfigFile(at path: String, envManagementKey: String?) -> RuntimeConfig? {
         guard FileManager.default.fileExists(atPath: path) else {
             return nil
         }
@@ -119,7 +124,12 @@ enum RuntimeConfigLoader {
         }
 
         let port = parsePort(from: raw) ?? 8317
-        let key = parseRemoteManagementKey(from: raw) ?? ""
+        let parsedKey = parseRemoteManagementKey(from: raw) ?? ""
+        let key = resolveManagementKey(
+            parsedKey: parsedKey,
+            envManagementKey: envManagementKey,
+            configPath: path
+        )
 
         return RuntimeConfig(
             baseURL: "http://localhost:\(port)",
@@ -167,5 +177,30 @@ enum RuntimeConfigLoader {
         }
 
         return nil
+    }
+
+    private static func resolveManagementKey(
+        parsedKey: String,
+        envManagementKey: String?,
+        configPath: String
+    ) -> String {
+        if let envManagementKey, !envManagementKey.isEmpty {
+            return envManagementKey
+        }
+
+        if looksLikeBcryptHash(parsedKey), isManagedRuntimeConfigPath(configPath) {
+            return defaultManagedManagementKey
+        }
+
+        return parsedKey
+    }
+
+    private static func isManagedRuntimeConfigPath(_ path: String) -> Bool {
+        let managedPath = (NSHomeDirectory() as NSString).appendingPathComponent(".cliproxyapi/config.yaml")
+        return path == managedPath
+    }
+
+    private static func looksLikeBcryptHash(_ value: String) -> Bool {
+        value.hasPrefix("$2a$") || value.hasPrefix("$2b$") || value.hasPrefix("$2y$")
     }
 }

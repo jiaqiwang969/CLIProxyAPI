@@ -52,6 +52,17 @@ type ModelInfo struct {
 	SupportedInputModalities []string `json:"supportedInputModalities,omitempty"`
 	// SupportedOutputModalities lists supported output modalities (e.g., TEXT, IMAGE)
 	SupportedOutputModalities []string `json:"supportedOutputModalities,omitempty"`
+	// GeminiTemperature stores Google-style public temperature metadata for Gemini-compatible model endpoints.
+	// It is intentionally not serialized by generic model APIs.
+	GeminiTemperature *float64 `json:"-"`
+	// GeminiTopP stores Google-style public topP metadata for Gemini-compatible model endpoints.
+	GeminiTopP *float64 `json:"-"`
+	// GeminiTopK stores Google-style public topK metadata for Gemini-compatible model endpoints.
+	GeminiTopK *int `json:"-"`
+	// GeminiMaxTemperature stores Google-style public maxTemperature metadata for Gemini-compatible model endpoints.
+	GeminiMaxTemperature *float64 `json:"-"`
+	// GeminiPublicThinking stores Google-style public boolean thinking support metadata.
+	GeminiPublicThinking *bool `json:"-"`
 
 	// Thinking holds provider-specific reasoning/thinking budget capabilities.
 	// This is optional and currently used for Gemini thinking budget normalization.

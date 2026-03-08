@@ -7,6 +7,8 @@ package gemini
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -17,6 +19,8 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/api/handlers"
+	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
 )
 
 // GeminiAPIHandler contains the handlers for Gemini API endpoints.
@@ -24,6 +28,11 @@ import (
 type GeminiAPIHandler struct {
 	*handlers.BaseAPIHandler
 }
+
+const (
+	geminiThoughtSignatureSkipSentinel = "skip_thought_signature_validator"
+	geminiThoughtSignatureDocsURL      = "https://ai.google.dev/gemini-api/docs/thought-signatures"
+)
 
 // NewGeminiAPIHandler creates a new Gemini API handlers instance.
 // It takes an BaseAPIHandler instance as input and returns a GeminiAPIHandler.
@@ -40,40 +49,34 @@ func (h *GeminiAPIHandler) HandlerType() string {
 
 // Models returns the Gemini-compatible model metadata supported by this handler.
 func (h *GeminiAPIHandler) Models() []map[string]any {
-	// Get dynamic models from the global registry
-	modelRegistry := registry.GetGlobalRegistry()
-	return modelRegistry.GetAvailableModels("gemini")
+	publicModels := registry.GetPublicGeminiModels()
+	normalizedModels := make([]map[string]any, 0, len(publicModels))
+	for _, model := range publicModels {
+		if normalizedModel := normalizeGeminiPublicModel(model); normalizedModel != nil {
+			normalizedModels = append(normalizedModels, normalizedModel)
+		}
+	}
+	return normalizedModels
 }
 
 // GeminiModels handles the Gemini models listing endpoint.
 // It returns a JSON response containing available Gemini models and their specifications.
 func (h *GeminiAPIHandler) GeminiModels(c *gin.Context) {
-	rawModels := h.Models()
-	normalizedModels := make([]map[string]any, 0, len(rawModels))
-	defaultMethods := []string{"generateContent"}
-	for _, model := range rawModels {
-		normalizedModel := make(map[string]any, len(model))
-		for k, v := range model {
-			normalizedModel[k] = v
+	allModels := h.Models()
+	filteredModels := make([]map[string]any, 0, len(allModels))
+	for _, model := range allModels {
+		name := strings.TrimSpace(fmt.Sprint(model["name"]))
+		modelID := strings.TrimPrefix(name, "models/")
+		if modelID == "" {
+			continue
 		}
-		if name, ok := normalizedModel["name"].(string); ok && name != "" {
-			if !strings.HasPrefix(name, "models/") {
-				normalizedModel["name"] = "models/" + name
-			}
-			if displayName, _ := normalizedModel["displayName"].(string); displayName == "" {
-				normalizedModel["displayName"] = name
-			}
-			if description, _ := normalizedModel["description"].(string); description == "" {
-				normalizedModel["description"] = name
-			}
+		if !handlers.ModelVisibleForRequest(c, modelID) {
+			continue
 		}
-		if _, ok := normalizedModel["supportedGenerationMethods"]; !ok {
-			normalizedModel["supportedGenerationMethods"] = defaultMethods
-		}
-		normalizedModels = append(normalizedModels, normalizedModel)
+		filteredModels = append(filteredModels, model)
 	}
 	c.JSON(http.StatusOK, gin.H{
-		"models": normalizedModels,
+		"models": filteredModels,
 	})
 }
 
@@ -84,44 +87,22 @@ func (h *GeminiAPIHandler) GeminiGetHandler(c *gin.Context) {
 		Action string `uri:"action" binding:"required"`
 	}
 	if err := c.ShouldBindUri(&request); err != nil {
-		c.JSON(http.StatusBadRequest, handlers.ErrorResponse{
-			Error: handlers.ErrorDetail{
-				Message: fmt.Sprintf("Invalid request: %v", err),
-				Type:    "invalid_request_error",
-			},
-		})
+		h.writeGeminiError(c, http.StatusBadRequest, fmt.Sprintf("Invalid request: %v", err), nil)
 		return
 	}
 	action := strings.TrimPrefix(request.Action, "/")
 
-	// Get dynamic models from the global registry and find the matching one
-	availableModels := h.Models()
-	var targetModel map[string]any
-
-	for _, model := range availableModels {
-		name, _ := model["name"].(string)
-		// Match name with or without 'models/' prefix
-		if name == action || name == "models/"+action {
-			targetModel = model
-			break
+	targetModel, ok := findPublicGeminiModel(action)
+	if ok {
+		if !handlers.ModelVisibleForRequest(c, targetModel.ID) {
+			h.writeGeminiError(c, http.StatusNotFound, geminiGetModelNotFoundMessage(action), nil)
+			return
 		}
-	}
-
-	if targetModel != nil {
-		// Ensure the name has 'models/' prefix in the output if it's a Gemini model
-		if name, ok := targetModel["name"].(string); ok && name != "" && !strings.HasPrefix(name, "models/") {
-			targetModel["name"] = "models/" + name
-		}
-		c.JSON(http.StatusOK, targetModel)
+		c.JSON(http.StatusOK, normalizeGeminiPublicModel(targetModel))
 		return
 	}
 
-	c.JSON(http.StatusNotFound, handlers.ErrorResponse{
-		Error: handlers.ErrorDetail{
-			Message: "Not Found",
-			Type:    "not_found",
-		},
-	})
+	h.writeGeminiError(c, http.StatusNotFound, geminiGetModelNotFoundMessage(action), nil)
 }
 
 // GeminiHandler handles POST requests for Gemini API operations.
@@ -131,36 +112,133 @@ func (h *GeminiAPIHandler) GeminiHandler(c *gin.Context) {
 		Action string `uri:"action" binding:"required"`
 	}
 	if err := c.ShouldBindUri(&request); err != nil {
-		c.JSON(http.StatusBadRequest, handlers.ErrorResponse{
-			Error: handlers.ErrorDetail{
-				Message: fmt.Sprintf("Invalid request: %v", err),
-				Type:    "invalid_request_error",
-			},
-		})
+		h.writeGeminiError(c, http.StatusBadRequest, fmt.Sprintf("Invalid request: %v", err), nil)
 		return
 	}
 	action := strings.Split(strings.TrimPrefix(request.Action, "/"), ":")
 	if len(action) != 2 {
-		c.JSON(http.StatusNotFound, handlers.ErrorResponse{
-			Error: handlers.ErrorDetail{
-				Message: fmt.Sprintf("%s not found.", c.Request.URL.Path),
-				Type:    "invalid_request_error",
-			},
-		})
+		h.writeGeminiError(c, http.StatusNotFound, fmt.Sprintf("%s not found.", c.Request.URL.Path), nil)
+		return
+	}
+
+	modelName, ok := normalizePublicGeminiModelID(action[0])
+	if !ok {
+		h.writeGeminiError(c, http.StatusNotFound, geminiModelMethodNotFoundMessage(action[0], action[1]), nil)
 		return
 	}
 
 	method := action[1]
 	rawJSON, _ := c.GetRawData()
+	if (method == "generateContent" || method == "streamGenerateContent") && len(rawJSON) > 0 {
+		if message, ok := validateGeminiToolCallThoughtSignatures(rawJSON); ok {
+			h.writeGeminiErrorWithoutDefaultDetails(c, http.StatusBadRequest, message, nil)
+			return
+		}
+	}
 
 	switch method {
 	case "generateContent":
-		h.handleGenerateContent(c, action[0], rawJSON)
+		h.handleGenerateContent(c, modelName, rawJSON)
 	case "streamGenerateContent":
-		h.handleStreamGenerateContent(c, action[0], rawJSON)
+		h.handleStreamGenerateContent(c, modelName, rawJSON)
 	case "countTokens":
-		h.handleCountTokens(c, action[0], rawJSON)
+		h.handleCountTokens(c, modelName, rawJSON)
 	}
+}
+
+func findPublicGeminiModel(action string) (*registry.ModelInfo, bool) {
+	modelID, ok := normalizePublicGeminiModelID(action)
+	if !ok {
+		return nil, false
+	}
+
+	for _, model := range registry.GetPublicGeminiModels() {
+		if model == nil || strings.TrimSpace(model.ID) == "" {
+			continue
+		}
+		if model.ID == modelID {
+			return model, true
+		}
+	}
+	return nil, false
+}
+
+func normalizePublicGeminiModelID(name string) (string, bool) {
+	name = strings.TrimSpace(strings.TrimPrefix(name, "/"))
+	name = strings.TrimPrefix(name, "models/")
+	if name == "" {
+		return "", false
+	}
+
+	for _, model := range registry.GetPublicGeminiModels() {
+		if model == nil || strings.TrimSpace(model.ID) == "" {
+			continue
+		}
+		if model.ID == name {
+			return model.ID, true
+		}
+	}
+	return "", false
+}
+
+func normalizeGeminiPublicModel(model *registry.ModelInfo) map[string]any {
+	if model == nil {
+		return nil
+	}
+
+	name := strings.TrimSpace(model.Name)
+	if name == "" {
+		name = "models/" + strings.TrimSpace(model.ID)
+	}
+	if name == "models/" {
+		return nil
+	}
+
+	displayName := strings.TrimSpace(model.DisplayName)
+	description := strings.TrimSpace(model.Description)
+	normalizedModel := map[string]any{
+		"name": name,
+	}
+	if displayName != "" {
+		normalizedModel["displayName"] = displayName
+	}
+	if len(model.SupportedGenerationMethods) > 0 {
+		normalizedModel["supportedGenerationMethods"] = model.SupportedGenerationMethods
+	}
+	if model.Version != "" {
+		normalizedModel["version"] = model.Version
+	}
+	if description != "" {
+		normalizedModel["description"] = description
+	}
+	if model.InputTokenLimit > 0 {
+		normalizedModel["inputTokenLimit"] = model.InputTokenLimit
+	}
+	if model.OutputTokenLimit > 0 {
+		normalizedModel["outputTokenLimit"] = model.OutputTokenLimit
+	}
+	if len(model.SupportedInputModalities) > 0 {
+		normalizedModel["supportedInputModalities"] = model.SupportedInputModalities
+	}
+	if len(model.SupportedOutputModalities) > 0 {
+		normalizedModel["supportedOutputModalities"] = model.SupportedOutputModalities
+	}
+	if model.GeminiTemperature != nil {
+		normalizedModel["temperature"] = *model.GeminiTemperature
+	}
+	if model.GeminiTopP != nil {
+		normalizedModel["topP"] = *model.GeminiTopP
+	}
+	if model.GeminiTopK != nil {
+		normalizedModel["topK"] = *model.GeminiTopK
+	}
+	if model.GeminiMaxTemperature != nil {
+		normalizedModel["maxTemperature"] = *model.GeminiMaxTemperature
+	}
+	if model.GeminiPublicThinking != nil {
+		normalizedModel["thinking"] = *model.GeminiPublicThinking
+	}
+	return normalizedModel
 }
 
 // handleStreamGenerateContent handles streaming content generation requests for Gemini models.
@@ -178,12 +256,7 @@ func (h *GeminiAPIHandler) handleStreamGenerateContent(c *gin.Context, modelName
 	// Get the http.Flusher interface to manually flush the response.
 	flusher, ok := c.Writer.(http.Flusher)
 	if !ok {
-		c.JSON(http.StatusInternalServerError, handlers.ErrorResponse{
-			Error: handlers.ErrorDetail{
-				Message: "Streaming not supported",
-				Type:    "server_error",
-			},
-		})
+		h.writeGeminiError(c, http.StatusInternalServerError, "Streaming not supported", nil)
 		return
 	}
 
@@ -210,7 +283,7 @@ func (h *GeminiAPIHandler) handleStreamGenerateContent(c *gin.Context, modelName
 				continue
 			}
 			// Upstream failed immediately. Return proper error status and JSON.
-			h.WriteErrorResponse(c, errMsg)
+			h.writeGeminiErrorMessage(c, errMsg)
 			if errMsg != nil {
 				cliCancel(errMsg.Error)
 			} else {
@@ -236,6 +309,8 @@ func (h *GeminiAPIHandler) handleStreamGenerateContent(c *gin.Context, modelName
 			handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
 
 			// Write first chunk
+			chunk = rewriteGeminiResponseModelVersion(chunk, modelName)
+
 			if alt == "" {
 				_, _ = c.Writer.Write([]byte("data: "))
 				_, _ = c.Writer.Write(chunk)
@@ -246,7 +321,7 @@ func (h *GeminiAPIHandler) handleStreamGenerateContent(c *gin.Context, modelName
 			flusher.Flush()
 
 			// Continue
-			h.forwardGeminiStream(c, flusher, alt, func(err error) { cliCancel(err) }, dataChan, errChan)
+			h.forwardGeminiStream(c, flusher, alt, modelName, func(err error) { cliCancel(err) }, dataChan, errChan)
 			return
 		}
 	}
@@ -266,7 +341,7 @@ func (h *GeminiAPIHandler) handleCountTokens(c *gin.Context, modelName string, r
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
 	resp, upstreamHeaders, errMsg := h.ExecuteCountWithAuthManager(cliCtx, h.HandlerType(), modelName, rawJSON, alt)
 	if errMsg != nil {
-		h.WriteErrorResponse(c, errMsg)
+		h.writeGeminiErrorMessage(c, errMsg)
 		cliCancel(errMsg.Error)
 		return
 	}
@@ -292,16 +367,16 @@ func (h *GeminiAPIHandler) handleGenerateContent(c *gin.Context, modelName strin
 	resp, upstreamHeaders, errMsg := h.ExecuteWithAuthManager(cliCtx, h.HandlerType(), modelName, rawJSON, alt)
 	stopKeepAlive()
 	if errMsg != nil {
-		h.WriteErrorResponse(c, errMsg)
+		h.writeGeminiErrorMessage(c, errMsg)
 		cliCancel(errMsg.Error)
 		return
 	}
 	handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
-	_, _ = c.Writer.Write(resp)
+	_, _ = c.Writer.Write(rewriteGeminiResponseModelVersion(resp, modelName))
 	cliCancel()
 }
 
-func (h *GeminiAPIHandler) forwardGeminiStream(c *gin.Context, flusher http.Flusher, alt string, cancel func(error), data <-chan []byte, errs <-chan *interfaces.ErrorMessage) {
+func (h *GeminiAPIHandler) forwardGeminiStream(c *gin.Context, flusher http.Flusher, alt, modelName string, cancel func(error), data <-chan []byte, errs <-chan *interfaces.ErrorMessage) {
 	var keepAliveInterval *time.Duration
 	if alt != "" {
 		keepAliveInterval = new(time.Duration(0))
@@ -310,6 +385,7 @@ func (h *GeminiAPIHandler) forwardGeminiStream(c *gin.Context, flusher http.Flus
 	h.ForwardStream(c, flusher, cancel, data, errs, handlers.StreamForwardOptions{
 		KeepAliveInterval: keepAliveInterval,
 		WriteChunk: func(chunk []byte) {
+			chunk = rewriteGeminiResponseModelVersion(chunk, modelName)
 			if alt == "" {
 				_, _ = c.Writer.Write([]byte("data: "))
 				_, _ = c.Writer.Write(chunk)
@@ -330,7 +406,7 @@ func (h *GeminiAPIHandler) forwardGeminiStream(c *gin.Context, flusher http.Flus
 			if errMsg.Error != nil && errMsg.Error.Error() != "" {
 				errText = errMsg.Error.Error()
 			}
-			body := handlers.BuildErrorResponseBody(status, errText)
+			body := buildGeminiErrorResponseBody(status, errText, nil)
 			if alt == "" {
 				_, _ = fmt.Fprintf(c.Writer, "event: error\ndata: %s\n\n", string(body))
 			} else {
@@ -338,4 +414,280 @@ func (h *GeminiAPIHandler) forwardGeminiStream(c *gin.Context, flusher http.Flus
 			}
 		},
 	})
+}
+
+func (h *GeminiAPIHandler) writeGeminiError(c *gin.Context, status int, message string, details []any) {
+	body := buildGeminiErrorResponseBody(status, message, details)
+	h.WriteErrorResponse(c, &interfaces.ErrorMessage{
+		StatusCode: status,
+		Error:      errors.New(string(body)),
+	})
+}
+
+func (h *GeminiAPIHandler) writeGeminiErrorWithoutDefaultDetails(c *gin.Context, status int, message string, details []any) {
+	body := buildGeminiErrorResponseBodyExact(status, message, details)
+	h.WriteErrorResponse(c, &interfaces.ErrorMessage{
+		StatusCode: status,
+		Error:      errors.New(string(body)),
+	})
+}
+
+func (h *GeminiAPIHandler) writeGeminiErrorMessage(c *gin.Context, msg *interfaces.ErrorMessage) {
+	status := http.StatusInternalServerError
+	if msg != nil && msg.StatusCode > 0 {
+		status = msg.StatusCode
+	}
+
+	errText := http.StatusText(status)
+	if msg != nil && msg.Error != nil {
+		if text := strings.TrimSpace(msg.Error.Error()); text != "" {
+			errText = text
+		}
+	}
+
+	body := []byte(errText)
+	if json.Valid(body) {
+		body = normalizeGeminiStructuredErrorBody(body)
+	} else {
+		body = buildGeminiErrorResponseBody(status, errText, nil)
+	}
+
+	h.WriteErrorResponse(c, &interfaces.ErrorMessage{
+		StatusCode: status,
+		Error:      errors.New(string(body)),
+		Addon:      msg.Addon,
+	})
+}
+
+func buildGeminiErrorResponseBody(status int, message string, details []any) []byte {
+	return buildGeminiErrorResponseBodyInternal(status, message, details, true)
+}
+
+func buildGeminiErrorResponseBodyExact(status int, message string, details []any) []byte {
+	return buildGeminiErrorResponseBodyInternal(status, message, details, false)
+}
+
+func buildGeminiErrorResponseBodyInternal(status int, message string, details []any, addDefaultBadRequestDetails bool) []byte {
+	if status <= 0 {
+		status = http.StatusInternalServerError
+	}
+	message = strings.TrimSpace(message)
+	if message == "" {
+		message = http.StatusText(status)
+	}
+	if addDefaultBadRequestDetails && status == http.StatusBadRequest && len(details) == 0 {
+		details = geminiBadRequestDetails(message)
+	}
+
+	payload := map[string]any{
+		"error": map[string]any{
+			"code":    status,
+			"message": message,
+			"status":  geminiErrorStatus(status),
+		},
+	}
+	if len(details) > 0 {
+		payload["error"].(map[string]any)["details"] = details
+	}
+
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return []byte(fmt.Sprintf(`{"error":{"code":%d,"message":%q,"status":%q}}`, status, message, geminiErrorStatus(status)))
+	}
+	return body
+}
+
+func geminiBadRequestDetails(message string) []any {
+	return []any{
+		map[string]any{
+			"@type": "type.googleapis.com/google.rpc.BadRequest",
+			"fieldViolations": []map[string]any{
+				{
+					"description": message,
+				},
+			},
+		},
+	}
+}
+
+func geminiErrorStatus(status int) string {
+	switch status {
+	case http.StatusBadRequest:
+		return "INVALID_ARGUMENT"
+	case http.StatusUnauthorized:
+		return "UNAUTHENTICATED"
+	case http.StatusForbidden:
+		return "PERMISSION_DENIED"
+	case http.StatusNotFound:
+		return "NOT_FOUND"
+	case http.StatusConflict:
+		return "ABORTED"
+	case http.StatusTooManyRequests:
+		return "RESOURCE_EXHAUSTED"
+	case http.StatusRequestTimeout:
+		return "DEADLINE_EXCEEDED"
+	case http.StatusNotImplemented:
+		return "UNIMPLEMENTED"
+	case http.StatusServiceUnavailable:
+		return "UNAVAILABLE"
+	case http.StatusGatewayTimeout:
+		return "DEADLINE_EXCEEDED"
+	case http.StatusInternalServerError, http.StatusBadGateway:
+		return "INTERNAL"
+	default:
+		if status >= http.StatusInternalServerError {
+			return "INTERNAL"
+		}
+		return "UNKNOWN"
+	}
+}
+
+func geminiGetModelNotFoundMessage(modelName string) string {
+	return fmt.Sprintf("Model is not found: models/%s for api version v1beta", strings.TrimPrefix(strings.TrimSpace(modelName), "models/"))
+}
+
+func geminiModelMethodNotFoundMessage(modelName, method string) string {
+	modelName = strings.TrimPrefix(strings.TrimSpace(modelName), "models/")
+	method = strings.TrimSpace(method)
+	return fmt.Sprintf("models/%s is not found for API version v1beta, or is not supported for %s. Call ListModels to see the list of available models and their supported methods.", modelName, method)
+}
+
+func validateGeminiToolCallThoughtSignatures(rawJSON []byte) (string, bool) {
+	if len(rawJSON) == 0 || !gjson.ValidBytes(rawJSON) {
+		return "", false
+	}
+
+	contents := gjson.GetBytes(rawJSON, "contents")
+	if !contents.Exists() || !contents.IsArray() {
+		return "", false
+	}
+
+	for contentIndex, content := range contents.Array() {
+		parts := content.Get("parts")
+		if !parts.Exists() || !parts.IsArray() {
+			continue
+		}
+
+		for _, part := range parts.Array() {
+			functionCall := part.Get("functionCall")
+			if !functionCall.Exists() {
+				continue
+			}
+
+			thoughtSignature := strings.TrimSpace(part.Get("thoughtSignature").String())
+			if thoughtSignature == "" {
+				thoughtSignature = strings.TrimSpace(part.Get("thought_signature").String())
+			}
+			if thoughtSignature != "" && thoughtSignature != geminiThoughtSignatureSkipSentinel {
+				continue
+			}
+
+			return geminiMissingThoughtSignatureMessage(functionCall.Get("name").String(), contentIndex+1), true
+		}
+	}
+
+	return "", false
+}
+
+func geminiMissingThoughtSignatureMessage(functionName string, position int) string {
+	if position <= 0 {
+		position = 1
+	}
+	return fmt.Sprintf(
+		"Function call is missing a thought_signature in functionCall parts. This is required for tools to work correctly, and missing thought_signature may lead to degraded model performance. Additional data, function call `%s` , position %d. Please refer to %s for more details.",
+		geminiQualifiedFunctionCallName(functionName),
+		position,
+		geminiThoughtSignatureDocsURL,
+	)
+}
+
+func geminiQualifiedFunctionCallName(functionName string) string {
+	functionName = strings.TrimSpace(functionName)
+	if strings.Contains(functionName, ":") {
+		return functionName
+	}
+	return "default_api:" + functionName
+}
+
+func rewriteGeminiResponseModelVersion(chunk []byte, requestedModel string) []byte {
+	requestedModel = strings.TrimSpace(requestedModel)
+	if requestedModel == "" || len(chunk) == 0 || !gjson.ValidBytes(chunk) {
+		return chunk
+	}
+
+	rewritten := chunk
+	if gjson.GetBytes(rewritten, "modelVersion").Exists() {
+		if updated, err := sjson.SetBytes(rewritten, "modelVersion", requestedModel); err == nil {
+			rewritten = updated
+		}
+	}
+	if gjson.GetBytes(rewritten, "response.modelVersion").Exists() {
+		if updated, err := sjson.SetBytes(rewritten, "response.modelVersion", requestedModel); err == nil {
+			rewritten = updated
+		}
+	}
+	return rewritten
+}
+
+func normalizeGeminiStructuredErrorBody(body []byte) []byte {
+	if len(body) == 0 || !json.Valid(body) {
+		return body
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return body
+	}
+
+	errPayload, _ := payload["error"].(map[string]any)
+	if len(errPayload) == 0 {
+		return body
+	}
+
+	if message, ok := errPayload["message"].(string); ok {
+		errPayload["message"] = normalizeGeminiInvalidJSONMessage(message)
+	}
+
+	if details, ok := errPayload["details"].([]any); ok {
+		for i, rawDetail := range details {
+			detail, ok := rawDetail.(map[string]any)
+			if !ok {
+				continue
+			}
+			fieldViolations, ok := detail["fieldViolations"].([]any)
+			if !ok {
+				continue
+			}
+			for j, rawViolation := range fieldViolations {
+				violation, ok := rawViolation.(map[string]any)
+				if !ok {
+					continue
+				}
+				if description, ok := violation["description"].(string); ok {
+					violation["description"] = normalizeGeminiInvalidJSONMessage(description)
+				}
+				if field, ok := violation["field"].(string); ok && strings.EqualFold(strings.TrimSpace(field), "request") {
+					delete(violation, "field")
+				}
+				fieldViolations[j] = violation
+			}
+			detail["fieldViolations"] = fieldViolations
+			details[i] = detail
+		}
+		errPayload["details"] = details
+	}
+
+	payload["error"] = errPayload
+	normalized, err := json.Marshal(payload)
+	if err != nil {
+		return body
+	}
+	return normalized
+}
+
+func normalizeGeminiInvalidJSONMessage(message string) string {
+	if strings.TrimSpace(message) == "" {
+		return message
+	}
+	return strings.Replace(message, " at 'request':", ":", 1)
 }

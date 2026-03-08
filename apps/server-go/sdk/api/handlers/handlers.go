@@ -16,6 +16,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
@@ -207,8 +208,11 @@ func requestExecutionMetadata(ctx context.Context) map[string]any {
 			}
 		}
 	}
+	scope := AccessScopeFromContext(ctx)
 	if pinnedAuthID := pinnedAuthIDFromContext(ctx); pinnedAuthID != "" {
 		meta[coreexecutor.PinnedAuthMetadataKey] = pinnedAuthID
+	} else if scope.AuthID != "" {
+		meta[coreexecutor.PinnedAuthMetadataKey] = scope.AuthID
 	}
 	if selectedCallback := selectedAuthIDCallbackFromContext(ctx); selectedCallback != nil {
 		meta[coreexecutor.SelectedAuthCallbackMetadataKey] = selectedCallback
@@ -475,7 +479,7 @@ func appendAPIResponse(c *gin.Context, data []byte) {
 // ExecuteWithAuthManager executes a non-streaming request via the core auth manager.
 // This path is the only supported execution route.
 func (h *BaseAPIHandler) ExecuteWithAuthManager(ctx context.Context, handlerType, modelName string, rawJSON []byte, alt string) ([]byte, http.Header, *interfaces.ErrorMessage) {
-	providers, normalizedModel, errMsg := h.getRequestDetails(modelName)
+	providers, normalizedModel, errMsg := h.getRequestDetailsForContext(ctx, modelName)
 	if errMsg != nil {
 		return nil, nil, errMsg
 	}
@@ -521,7 +525,7 @@ func (h *BaseAPIHandler) ExecuteWithAuthManager(ctx context.Context, handlerType
 // ExecuteCountWithAuthManager executes a non-streaming request via the core auth manager.
 // This path is the only supported execution route.
 func (h *BaseAPIHandler) ExecuteCountWithAuthManager(ctx context.Context, handlerType, modelName string, rawJSON []byte, alt string) ([]byte, http.Header, *interfaces.ErrorMessage) {
-	providers, normalizedModel, errMsg := h.getRequestDetails(modelName)
+	providers, normalizedModel, errMsg := h.getRequestDetailsForContext(ctx, modelName)
 	if errMsg != nil {
 		return nil, nil, errMsg
 	}
@@ -568,7 +572,7 @@ func (h *BaseAPIHandler) ExecuteCountWithAuthManager(ctx context.Context, handle
 // This path is the only supported execution route.
 // The returned http.Header carries upstream response headers captured before streaming begins.
 func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handlerType, modelName string, rawJSON []byte, alt string) (<-chan []byte, http.Header, <-chan *interfaces.ErrorMessage) {
-	providers, normalizedModel, errMsg := h.getRequestDetails(modelName)
+	providers, normalizedModel, errMsg := h.getRequestDetailsForContext(ctx, modelName)
 	if errMsg != nil {
 		errChan := make(chan *interfaces.ErrorMessage, 1)
 		errChan <- errMsg
@@ -815,6 +819,69 @@ func (h *BaseAPIHandler) getRequestDetails(modelName string) (providers []string
 	// The thinking suffix is preserved in the model name itself, so no
 	// metadata-based configuration passing is needed.
 	return providers, resolvedModelName, nil
+}
+
+func (h *BaseAPIHandler) getRequestDetailsForContext(ctx context.Context, modelName string) (providers []string, normalizedModel string, err *interfaces.ErrorMessage) {
+	providers, normalizedModel, err = h.getRequestDetails(modelName)
+	if err != nil {
+		return nil, "", err
+	}
+
+	scope := AccessScopeFromContext(ctx)
+	if scope.Provider != "" {
+		filteredProviders := filterProvidersByScope(providers, scope.Provider)
+		if len(filteredProviders) == 0 {
+			return nil, "", &interfaces.ErrorMessage{
+				StatusCode: http.StatusForbidden,
+				Error:      fmt.Errorf("client API key is not allowed to use provider %s for model %s", scope.Provider, modelName),
+			}
+		}
+		providers = filteredProviders
+	}
+
+	baseModel := strings.TrimSpace(thinking.ParseSuffix(normalizedModel).ModelName)
+	if baseModel == "" {
+		baseModel = strings.TrimSpace(normalizedModel)
+	}
+
+	if len(scope.Models) > 0 && !modelAllowedByExplicitScope(baseModel, scope.Models) && !modelAllowedByExplicitScope(normalizedModel, scope.Models) {
+		return nil, "", &interfaces.ErrorMessage{
+			StatusCode: http.StatusForbidden,
+			Error:      fmt.Errorf("client API key is not allowed to access model %s", modelName),
+		}
+	}
+
+	if scope.AuthID != "" {
+		reg := registry.GetGlobalRegistry()
+		if !reg.ClientSupportsModel(scope.AuthID, baseModel) && !reg.ClientSupportsModel(scope.AuthID, normalizedModel) {
+			return nil, "", &interfaces.ErrorMessage{
+				StatusCode: http.StatusForbidden,
+				Error:      fmt.Errorf("client API key is not allowed to access model %s", modelName),
+			}
+		}
+	}
+
+	return providers, normalizedModel, nil
+}
+
+func filterProvidersByScope(providers []string, scopedProvider string) []string {
+	if len(providers) == 0 {
+		return nil
+	}
+	scopedProvider = strings.TrimSpace(scopedProvider)
+	if scopedProvider == "" {
+		return append([]string(nil), providers...)
+	}
+	filtered := make([]string, 0, len(providers))
+	for _, provider := range providers {
+		if strings.EqualFold(strings.TrimSpace(provider), scopedProvider) {
+			filtered = append(filtered, provider)
+		}
+	}
+	if len(filtered) == 0 {
+		return nil
+	}
+	return filtered
 }
 
 func cloneBytes(src []byte) []byte {

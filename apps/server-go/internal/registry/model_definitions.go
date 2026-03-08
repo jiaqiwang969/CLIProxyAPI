@@ -70,6 +70,13 @@ func GetStaticModelDefinitionsByChannel(channel string) []*ModelInfo {
 	}
 }
 
+// GetPublicGeminiModels returns the official Gemini public catalog exposed on the
+// Gemini-compatible API surface. This intentionally reflects the public Google
+// model list rather than the currently available backing-provider subset.
+func GetPublicGeminiModels() []*ModelInfo {
+	return cloneModelInfosUnique(GetGeminiModels())
+}
+
 // LookupStaticModelInfo searches all static model definitions for a model by ID.
 // Returns nil if no matching model is found.
 func LookupStaticModelInfo(modelID string) *ModelInfo {

@@ -216,8 +216,8 @@ func TestRegisterModelsForAuth_AuggieBackfillsModelInfoRegistryModels(t *testing
 	service.registerModelsForAuth(source)
 
 	got := reg.GetModelsForClient(sameTenant.ID)
-	if len(got) != 6 {
-		t.Fatalf("same-tenant models = %d, want 6", len(got))
+	if len(got) != 2 {
+		t.Fatalf("same-tenant models = %d, want 2", len(got))
 	}
 	gotIDs := make([]string, 0, len(got))
 	for _, model := range got {
@@ -227,8 +227,13 @@ func TestRegisterModelsForAuth_AuggieBackfillsModelInfoRegistryModels(t *testing
 		gotIDs = append(gotIDs, model.ID)
 	}
 	sort.Strings(gotIDs)
-	if want := []string{"claude-opus-4-5", "claude-opus-4.5", "gpt-5-1", "gpt-5.1", "gpt5.1", "opus4.5"}; !reflect.DeepEqual(gotIDs, want) {
+	if want := []string{"claude-opus-4-5", "gpt-5-1"}; !reflect.DeepEqual(gotIDs, want) {
 		t.Fatalf("same-tenant model ids = %#v, want %#v", gotIDs, want)
+	}
+	for _, alias := range []string{"claude-opus-4.5", "opus4.5", "gpt-5.1", "gpt5.1"} {
+		if !reg.ClientSupportsModel(sameTenant.ID, alias) {
+			t.Fatalf("expected same-tenant auth to continue supporting alias %q via canonical model metadata", alias)
+		}
 	}
 }
 
@@ -318,8 +323,18 @@ func TestRegisterModelsForAuth_AuggieExcludesShortNameWhenCanonicalModelIsExclud
 		gotIDs = append(gotIDs, model.ID)
 	}
 	sort.Strings(gotIDs)
-	if want := []string{"claude-opus-4-5", "claude-opus-4.5", "opus4.5"}; !reflect.DeepEqual(gotIDs, want) {
+	if want := []string{"claude-opus-4-5"}; !reflect.DeepEqual(gotIDs, want) {
 		t.Fatalf("target model ids = %#v, want %#v", gotIDs, want)
+	}
+	for _, alias := range []string{"gpt-5.1", "gpt5.1"} {
+		if reg.ClientSupportsModel(target.ID, alias) {
+			t.Fatalf("did not expect excluded alias %q to remain routable after canonical exclusion", alias)
+		}
+	}
+	for _, alias := range []string{"claude-opus-4.5", "opus4.5"} {
+		if !reg.ClientSupportsModel(target.ID, alias) {
+			t.Fatalf("expected remaining canonical model to continue supporting alias %q", alias)
+		}
 	}
 }
 

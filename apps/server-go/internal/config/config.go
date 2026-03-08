@@ -612,6 +612,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	// Sanitize Gemini API key configuration and migrate legacy entries.
 	cfg.SanitizeGeminiKeys()
 
+	// Sanitize client-facing API key configuration.
+	cfg.SanitizeClientAPIKeys()
+
 	// Sanitize Vertex-compatible API keys: drop entries without base-url
 	cfg.SanitizeVertexCompatKeys()
 
@@ -626,6 +629,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 
 	// Normalize OAuth provider model exclusion map.
 	cfg.OAuthExcludedModels = NormalizeOAuthExcludedModels(cfg.OAuthExcludedModels)
+
+	// Inject built-in OAuth model aliases at runtime when the key is absent from config.
+	cfg.ApplyRuntimeDefaultOAuthModelAlias()
 
 	// Normalize global OAuth model name aliases.
 	cfg.SanitizeOAuthModelAlias()
@@ -743,6 +749,18 @@ func (cfg *Config) SanitizeOAuthModelAlias() {
 		}
 	}
 	cfg.OAuthModelAlias = out
+}
+
+// ApplyRuntimeDefaultOAuthModelAlias injects built-in OAuth model aliases into the
+// in-memory config only when the oauth-model-alias key is absent from config.yaml.
+// A nil map means the key was omitted; an explicit empty map means the user disabled it.
+func (cfg *Config) ApplyRuntimeDefaultOAuthModelAlias() {
+	if cfg == nil || cfg.OAuthModelAlias != nil {
+		return
+	}
+	cfg.OAuthModelAlias = map[string][]OAuthModelAlias{
+		"antigravity": defaultAntigravityAliases(),
+	}
 }
 
 // SanitizeOpenAICompatibility removes OpenAI-compatibility provider entries that are

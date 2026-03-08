@@ -1,11 +1,12 @@
 import Foundation
 
-struct ModelCallCount: Identifiable, Equatable {
+struct ModelCallCount: Identifiable, Equatable, Sendable {
     let id: String
     let requests: Int64
+    let totalTokens: Int64
 }
 
-struct APIKeyUsage: Identifiable, Equatable {
+struct APIKeyUsage: Identifiable, Equatable, Sendable {
     let id: String
     let label: String
     let totalRequests: Int64
@@ -13,7 +14,7 @@ struct APIKeyUsage: Identifiable, Equatable {
     let modelCalls: [ModelCallCount]
 }
 
-struct UsageSummary: Equatable {
+struct UsageSummary: Equatable, Sendable {
     let totalRequests: Int64
     let totalTokens: Int64
     let keyUsages: [APIKeyUsage]
@@ -33,7 +34,7 @@ struct UsageSummary: Equatable {
     }
 }
 
-actor CLIProxyAPIClient {
+actor CLIProxyAPIClient: CLIProxyAPIManaging {
     private let session: URLSession
 
     init(session: URLSession = .shared) {
@@ -67,29 +68,28 @@ actor CLIProxyAPIClient {
             .compactMap { (entry: Dictionary<String, APIPayload>.Element) -> APIKeyUsage? in
                 let apiID = entry.key
                 let apiPayload = entry.value
-                let modelRequestMap = apiPayload.modelRequestMap
-
-                var selectedModelIDs = modelRequestMap.keys.filter { $0.hasPrefix("antigravity/") }
-                if selectedModelIDs.isEmpty {
-                    // Older payloads may only expose upstream model IDs (no antigravity/ prefix).
-                    selectedModelIDs = Array(modelRequestMap.keys)
-                }
-
-                let modelCalls = selectedModelIDs
-                    .map { modelID in
-                        ModelCallCount(id: modelID, requests: modelRequestMap[modelID] ?? 0)
+                let modelCalls = (apiPayload.models ?? [:])
+                    .map { modelID, modelPayload in
+                        ModelCallCount(
+                            id: modelID,
+                            requests: modelPayload.totalRequests,
+                            totalTokens: modelPayload.totalTokens
+                        )
                     }
-                    .filter { $0.requests > 0 }
+                    .filter { $0.requests > 0 || $0.totalTokens > 0 }
                     .sorted { lhs, rhs in
-                        if lhs.requests == rhs.requests {
-                            return lhs.id < rhs.id
+                        if lhs.totalTokens == rhs.totalTokens {
+                            if lhs.requests == rhs.requests {
+                                return lhs.id < rhs.id
+                            }
+                            return lhs.requests > rhs.requests
                         }
-                        return lhs.requests > rhs.requests
+                        return lhs.totalTokens > rhs.totalTokens
                     }
 
-                let totalRequests = apiPayload.totalRequests ?? modelRequestMap.values.reduce(0, +)
-                let totalTokens = apiPayload.totalTokens ?? 0
-                if totalRequests == 0 && modelCalls.isEmpty {
+                let totalRequests = apiPayload.totalRequests ?? modelCalls.reduce(0) { $0 + $1.requests }
+                let totalTokens = apiPayload.totalTokens ?? modelCalls.reduce(0) { $0 + $1.totalTokens }
+                if totalRequests == 0 && totalTokens == 0 && modelCalls.isEmpty {
                     return nil
                 }
 
@@ -102,10 +102,13 @@ actor CLIProxyAPIClient {
                 )
             }
             .sorted { (lhs: APIKeyUsage, rhs: APIKeyUsage) in
-                if lhs.totalRequests == rhs.totalRequests {
-                    return lhs.id < rhs.id
+                if lhs.totalTokens == rhs.totalTokens {
+                    if lhs.totalRequests == rhs.totalRequests {
+                            return lhs.id < rhs.id
+                        }
+                    return lhs.totalRequests > rhs.totalRequests
                 }
-                return lhs.totalRequests > rhs.totalRequests
+                return lhs.totalTokens > rhs.totalTokens
             }
 
         return UsageSummary(
@@ -113,6 +116,52 @@ actor CLIProxyAPIClient {
             totalTokens: usagePayload.totalTokens,
             keyUsages: keyUsages
         )
+    }
+
+    func fetchClientAPIKeys(baseURL: String, managementKey: String) async throws -> [ManagedClientAPIKey] {
+        let trimmedBaseURL = baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedKey = managementKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        let url = try makeURL(
+            baseURL: trimmedBaseURL,
+            path: "/v0/management/client-api-keys",
+            managementKey: trimmedKey
+        )
+        let response: ClientAPIKeysResponse = try await fetchJSON(at: url, managementKey: trimmedKey)
+        return response.clientAPIKeys
+    }
+
+    func saveClientAPIKeys(
+        baseURL: String,
+        managementKey: String,
+        keys: [ManagedClientAPIKey]
+    ) async throws {
+        let trimmedBaseURL = baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedKey = managementKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        let url = try makeURL(
+            baseURL: trimmedBaseURL,
+            path: "/v0/management/client-api-keys",
+            managementKey: trimmedKey
+        )
+        let payload = ClientAPIKeysResponse(clientAPIKeys: keys)
+        let _: StatusResponse = try await sendJSON(
+            method: "PUT",
+            payload: payload,
+            to: url,
+            managementKey: trimmedKey
+        )
+    }
+
+    func fetchAuthTargets(baseURL: String, managementKey: String) async throws -> [AuthTarget] {
+        let trimmedBaseURL = baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedKey = managementKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        let url = try makeURL(
+            baseURL: trimmedBaseURL,
+            path: "/v0/management/auth-files",
+            queryItems: [URLQueryItem(name: "include_models", value: "true")],
+            managementKey: trimmedKey
+        )
+        let response: AuthFilesResponse = try await fetchJSON(at: url, managementKey: trimmedKey)
+        return response.files
     }
 
     private static func maskedIdentifier(_ value: String) -> String {
@@ -163,12 +212,25 @@ actor CLIProxyAPIClient {
     }
 
     private func fetchJSON<T: Decodable>(at url: URL, managementKey: String) async throws -> T {
+        try await sendJSON(method: "GET", payload: Optional<String>.none, to: url, managementKey: managementKey)
+    }
+
+    private func sendJSON<T: Decodable, Body: Encodable>(
+        method: String,
+        payload: Body?,
+        to url: URL,
+        managementKey: String
+    ) async throws -> T {
         var request = URLRequest(url: url)
-        request.httpMethod = "GET"
+        request.httpMethod = method
         request.timeoutInterval = 8
 
         if !managementKey.isEmpty {
             request.setValue("Bearer \(managementKey)", forHTTPHeaderField: "Authorization")
+        }
+        if let payload {
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.httpBody = try JSONEncoder().encode(payload)
         }
 
         let (data, response) = try await session.data(for: request)
@@ -244,39 +306,65 @@ private struct APIPayload: Decodable {
         case totalTokens = "total_tokens"
         case models
     }
-
-    var modelRequestMap: [String: Int64] {
-        var result: [String: Int64] = [:]
-        for (modelID, modelPayload) in models ?? [:] {
-            result[modelID, default: 0] += modelPayload.totalRequests
-        }
-        return result
-    }
 }
 
 private struct ModelPayload: Decodable {
     let totalRequests: Int64
+    let totalTokens: Int64
 
     enum CodingKeys: String, CodingKey {
         case totalRequests = "total_requests"
         case requests
+        case totalTokens = "total_tokens"
+        case tokens
     }
 
     init(from decoder: Decoder) throws {
         if let singleValue = try? decoder.singleValueContainer(), singleValue.decodeNil() {
             self.totalRequests = 0
+            self.totalTokens = 0
+            return
+        }
+
+        if let singleValue = try? decoder.singleValueContainer(),
+           let requestCount = try? singleValue.decode(Int64.self)
+        {
+            self.totalRequests = requestCount
+            self.totalTokens = 0
             return
         }
 
         let container = try decoder.container(keyedBy: CodingKeys.self)
         if let count = try container.decodeIfPresent(Int64.self, forKey: .totalRequests) {
             self.totalRequests = count
-            return
-        }
-        if let count = try container.decodeIfPresent(Int64.self, forKey: .requests) {
+        } else if let count = try container.decodeIfPresent(Int64.self, forKey: .requests) {
             self.totalRequests = count
-            return
+        } else {
+            self.totalRequests = 0
         }
-        self.totalRequests = 0
+
+        if let count = try container.decodeIfPresent(Int64.self, forKey: .totalTokens) {
+            self.totalTokens = count
+        } else if let count = try container.decodeIfPresent(Int64.self, forKey: .tokens) {
+            self.totalTokens = count
+        } else {
+            self.totalTokens = 0
+        }
     }
+}
+
+private struct ClientAPIKeysResponse: Codable {
+    let clientAPIKeys: [ManagedClientAPIKey]
+
+    enum CodingKeys: String, CodingKey {
+        case clientAPIKeys = "client-api-keys"
+    }
+}
+
+private struct AuthFilesResponse: Decodable {
+    let files: [AuthTarget]
+}
+
+private struct StatusResponse: Decodable {
+    let status: String
 }

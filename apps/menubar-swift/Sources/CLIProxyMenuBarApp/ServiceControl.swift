@@ -1,6 +1,6 @@
 import Foundation
 
-struct LocalServiceStatus: Equatable {
+struct LocalServiceStatus: Equatable, Sendable {
     let isRunning: Bool
     let pid: Int?
     let detail: String?

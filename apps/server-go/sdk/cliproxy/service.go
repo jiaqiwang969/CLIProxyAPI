@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/api"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
@@ -1265,14 +1266,15 @@ func applyAuggieExcludedModels(models []*ModelInfo, excluded []string) []*ModelI
 			continue
 		}
 		canonicalID := auggieCanonicalModelID(model)
-		modelID := strings.ToLower(strings.TrimSpace(model.ID))
-		if canonicalID == "" || modelID == "" {
+		if canonicalID == "" {
 			continue
 		}
 		if groupedIDs[canonicalID] == nil {
 			groupedIDs[canonicalID] = map[string]struct{}{canonicalID: {}}
 		}
-		groupedIDs[canonicalID][modelID] = struct{}{}
+		for _, candidateID := range auggieExcludedModelCandidates(model) {
+			groupedIDs[canonicalID][candidateID] = struct{}{}
+		}
 	}
 
 	filtered := make([]*ModelInfo, 0, len(models))
@@ -1314,6 +1316,75 @@ func auggieCanonicalModelID(model *ModelInfo) string {
 		return canonicalID
 	}
 	return strings.ToLower(strings.TrimSpace(model.ID))
+}
+
+func auggieExcludedModelCandidates(model *ModelInfo) []string {
+	if model == nil {
+		return nil
+	}
+
+	seen := make(map[string]struct{}, 6)
+	candidates := make([]string, 0, 6)
+	add := func(value string) {
+		value = strings.ToLower(strings.TrimSpace(value))
+		if value == "" {
+			return
+		}
+		if _, exists := seen[value]; exists {
+			return
+		}
+		seen[value] = struct{}{}
+		candidates = append(candidates, value)
+	}
+
+	add(model.ID)
+	add(model.Version)
+	add(model.Name)
+	add(model.DisplayName)
+	for _, alias := range auggieDisplayAliasCandidates(model.DisplayName) {
+		add(alias)
+	}
+
+	return candidates
+}
+
+func auggieDisplayAliasCandidates(displayName string) []string {
+	displayName = strings.TrimSpace(displayName)
+	if displayName == "" {
+		return nil
+	}
+
+	raw := strings.ToLower(displayName)
+	slug := auggieDisplayAliasSlug(displayName)
+	if slug == "" || slug == raw {
+		return []string{raw}
+	}
+	return []string{raw, slug}
+}
+
+func auggieDisplayAliasSlug(displayName string) string {
+	displayName = strings.TrimSpace(displayName)
+	if displayName == "" {
+		return ""
+	}
+
+	var builder strings.Builder
+	lastWasDash := false
+	for _, r := range strings.ToLower(displayName) {
+		switch {
+		case unicode.IsLetter(r) || unicode.IsDigit(r) || r == '.':
+			builder.WriteRune(r)
+			lastWasDash = false
+		case unicode.IsSpace(r) || r == '-' || r == '_' || r == '/':
+			if builder.Len() == 0 || lastWasDash {
+				continue
+			}
+			builder.WriteByte('-')
+			lastWasDash = true
+		}
+	}
+
+	return strings.Trim(builder.String(), "-")
 }
 
 func applyModelPrefixes(models []*ModelInfo, prefix string, forceModelPrefix bool) []*ModelInfo {
