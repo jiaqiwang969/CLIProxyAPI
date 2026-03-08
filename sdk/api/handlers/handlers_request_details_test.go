@@ -24,12 +24,17 @@ func TestGetRequestDetails_PreservesSuffix(t *testing.T) {
 	modelRegistry.RegisterClient("test-request-details-claude", "claude", []*registry.ModelInfo{
 		{ID: "claude-sonnet-4-5", Created: now + 5},
 	})
+	modelRegistry.RegisterClient("test-request-details-auggie", "auggie", []*registry.ModelInfo{
+		{ID: "gpt-5-4", DisplayName: "GPT-5.4", Version: "gpt-5-4", Created: now + 4},
+		{ID: "gpt5.4", DisplayName: "gpt5.4", Version: "gpt-5-4", Created: now + 3},
+	})
 
 	// Ensure cleanup of all test registrations.
 	clientIDs := []string{
 		"test-request-details-gemini",
 		"test-request-details-openai",
 		"test-request-details-claude",
+		"test-request-details-auggie",
 	}
 	for _, clientID := range clientIDs {
 		id := clientID
@@ -66,6 +71,13 @@ func TestGetRequestDetails_PreservesSuffix(t *testing.T) {
 			inputModel:    "claude-sonnet-4-5",
 			wantProviders: []string{"claude"},
 			wantModel:     "claude-sonnet-4-5",
+			wantErr:       false,
+		},
+		{
+			name:          "auggie display alias resolved",
+			inputModel:    "gpt-5.4",
+			wantProviders: []string{"auggie"},
+			wantModel:     "gpt-5.4",
 			wantErr:       false,
 		},
 		{

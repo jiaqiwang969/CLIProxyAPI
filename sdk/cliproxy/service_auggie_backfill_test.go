@@ -216,8 +216,8 @@ func TestRegisterModelsForAuth_AuggieBackfillsModelInfoRegistryModels(t *testing
 	service.registerModelsForAuth(source)
 
 	got := reg.GetModelsForClient(sameTenant.ID)
-	if len(got) != 4 {
-		t.Fatalf("same-tenant models = %d, want 4", len(got))
+	if len(got) != 6 {
+		t.Fatalf("same-tenant models = %d, want 6", len(got))
 	}
 	gotIDs := make([]string, 0, len(got))
 	for _, model := range got {
@@ -227,7 +227,7 @@ func TestRegisterModelsForAuth_AuggieBackfillsModelInfoRegistryModels(t *testing
 		gotIDs = append(gotIDs, model.ID)
 	}
 	sort.Strings(gotIDs)
-	if want := []string{"claude-opus-4-5", "gpt-5-1", "gpt5.1", "opus4.5"}; !reflect.DeepEqual(gotIDs, want) {
+	if want := []string{"claude-opus-4-5", "claude-opus-4.5", "gpt-5-1", "gpt-5.1", "gpt5.1", "opus4.5"}; !reflect.DeepEqual(gotIDs, want) {
 		t.Fatalf("same-tenant model ids = %#v, want %#v", gotIDs, want)
 	}
 }
@@ -318,7 +318,7 @@ func TestRegisterModelsForAuth_AuggieExcludesShortNameWhenCanonicalModelIsExclud
 		gotIDs = append(gotIDs, model.ID)
 	}
 	sort.Strings(gotIDs)
-	if want := []string{"claude-opus-4-5", "opus4.5"}; !reflect.DeepEqual(gotIDs, want) {
+	if want := []string{"claude-opus-4-5", "claude-opus-4.5", "opus4.5"}; !reflect.DeepEqual(gotIDs, want) {
 		t.Fatalf("target model ids = %#v, want %#v", gotIDs, want)
 	}
 }

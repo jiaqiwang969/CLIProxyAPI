@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	misc "github.com/router-for-me/CLIProxyAPI/v6/internal/misc"
 	log "github.com/sirupsen/logrus"
@@ -154,6 +155,25 @@ func LookupModelInfo(modelID string, provider ...string) *ModelInfo {
 		return info
 	}
 	return LookupStaticModelInfo(modelID)
+}
+
+// LookupModelInfoByAlias searches the dynamic registry by exact ID first, then by
+// display-name aliases and slugified display names for registered models.
+func LookupModelInfoByAlias(modelID string, provider ...string) *ModelInfo {
+	modelID = strings.TrimSpace(modelID)
+	if modelID == "" {
+		return nil
+	}
+
+	p := ""
+	if len(provider) > 0 {
+		p = strings.ToLower(strings.TrimSpace(provider[0]))
+	}
+
+	if info := LookupModelInfo(modelID, p); info != nil {
+		return info
+	}
+	return GetGlobalRegistry().GetModelInfoByAlias(modelID, p)
 }
 
 // SetHook sets an optional hook for observing model registration changes.
@@ -695,8 +715,20 @@ func (r *ModelRegistry) ClientSupportsModel(clientID, modelID string) bool {
 		return false
 	}
 
+	targetRaw := strings.ToLower(modelID)
+	targetSlug := normalizeModelAliasKey(modelID)
 	for _, id := range models {
-		if strings.EqualFold(strings.TrimSpace(id), modelID) {
+		candidate := strings.TrimSpace(id)
+		if strings.EqualFold(candidate, modelID) {
+			return true
+		}
+		if normalized := normalizeModelAliasKey(candidate); normalized != "" && (normalized == targetRaw || normalized == targetSlug) {
+			return true
+		}
+	}
+
+	for _, info := range r.clientModelInfos[clientID] {
+		if modelInfoMatchesAlias(info, targetRaw, targetSlug) {
 			return true
 		}
 	}
@@ -975,6 +1007,56 @@ func (r *ModelRegistry) GetModelProviders(modelID string) []string {
 	return result
 }
 
+// GetModelProvidersByAlias returns provider identifiers for a model alias matched
+// via display-name comparisons and slugified display names.
+func (r *ModelRegistry) GetModelProvidersByAlias(modelID string) []string {
+	targetRaw := strings.ToLower(strings.TrimSpace(modelID))
+	targetSlug := normalizeModelAliasKey(modelID)
+	if targetRaw == "" && targetSlug == "" {
+		return nil
+	}
+
+	r.mutex.RLock()
+	defer r.mutex.RUnlock()
+
+	type providerCount struct {
+		name  string
+		count int
+	}
+	aggregated := make(map[string]int)
+	for _, registration := range r.models {
+		if registration == nil || !registrationMatchesAlias(registration, targetRaw, targetSlug) {
+			continue
+		}
+		for name, count := range registration.Providers {
+			if strings.TrimSpace(name) == "" || count <= 0 {
+				continue
+			}
+			aggregated[name] += count
+		}
+	}
+	if len(aggregated) == 0 {
+		return nil
+	}
+
+	providers := make([]providerCount, 0, len(aggregated))
+	for name, count := range aggregated {
+		providers = append(providers, providerCount{name: name, count: count})
+	}
+	sort.Slice(providers, func(i, j int) bool {
+		if providers[i].count == providers[j].count {
+			return providers[i].name < providers[j].name
+		}
+		return providers[i].count > providers[j].count
+	})
+
+	result := make([]string, 0, len(providers))
+	for _, item := range providers {
+		result = append(result, item.name)
+	}
+	return result
+}
+
 // GetModelInfo returns ModelInfo, prioritizing provider-specific definition if available.
 func (r *ModelRegistry) GetModelInfo(modelID, provider string) *ModelInfo {
 	r.mutex.RLock()
@@ -994,6 +1076,124 @@ func (r *ModelRegistry) GetModelInfo(modelID, provider string) *ModelInfo {
 		return reg.Info
 	}
 	return nil
+}
+
+// GetModelInfoByAlias resolves a registered model using display-name aliases and
+// slugified display names. Provider-specific definitions are preferred when present.
+func (r *ModelRegistry) GetModelInfoByAlias(modelID, provider string) *ModelInfo {
+	targetRaw := strings.ToLower(strings.TrimSpace(modelID))
+	targetSlug := normalizeModelAliasKey(modelID)
+	if targetRaw == "" && targetSlug == "" {
+		return nil
+	}
+
+	r.mutex.RLock()
+	defer r.mutex.RUnlock()
+
+	var fallback *ModelInfo
+	for _, reg := range r.models {
+		if reg == nil {
+			continue
+		}
+		if provider != "" {
+			if reg.Providers == nil || reg.Providers[provider] <= 0 {
+				continue
+			}
+			if reg.InfoByProvider != nil {
+				if info := reg.InfoByProvider[provider]; modelInfoMatchesAlias(info, targetRaw, targetSlug) {
+					return info
+				}
+			}
+			if fallback == nil && modelInfoMatchesAlias(reg.Info, targetRaw, targetSlug) {
+				fallback = reg.Info
+			}
+			continue
+		}
+
+		if modelInfoMatchesAlias(reg.Info, targetRaw, targetSlug) {
+			return reg.Info
+		}
+		for _, info := range reg.InfoByProvider {
+			if modelInfoMatchesAlias(info, targetRaw, targetSlug) {
+				return info
+			}
+		}
+	}
+
+	return fallback
+}
+
+func registrationMatchesAlias(reg *ModelRegistration, targetRaw, targetSlug string) bool {
+	if reg == nil {
+		return false
+	}
+	if modelInfoMatchesAlias(reg.Info, targetRaw, targetSlug) {
+		return true
+	}
+	for _, info := range reg.InfoByProvider {
+		if modelInfoMatchesAlias(info, targetRaw, targetSlug) {
+			return true
+		}
+	}
+	return false
+}
+
+func modelInfoMatchesAlias(info *ModelInfo, targetRaw, targetSlug string) bool {
+	if info == nil {
+		return false
+	}
+
+	rawCandidates := []string{
+		strings.ToLower(strings.TrimSpace(info.ID)),
+		strings.ToLower(strings.TrimSpace(info.Name)),
+		strings.ToLower(strings.TrimSpace(info.Version)),
+		strings.ToLower(strings.TrimSpace(info.DisplayName)),
+	}
+	for _, candidate := range rawCandidates {
+		if candidate != "" && candidate == targetRaw {
+			return true
+		}
+	}
+
+	slugCandidates := []string{
+		normalizeModelAliasKey(info.ID),
+		normalizeModelAliasKey(info.Name),
+		normalizeModelAliasKey(info.Version),
+		normalizeModelAliasKey(info.DisplayName),
+	}
+	for _, candidate := range slugCandidates {
+		if candidate == "" {
+			continue
+		}
+		if candidate == targetRaw || candidate == targetSlug {
+			return true
+		}
+	}
+	return false
+}
+
+func normalizeModelAliasKey(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	if value == "" {
+		return ""
+	}
+
+	var builder strings.Builder
+	lastWasDash := false
+	for _, r := range value {
+		switch {
+		case unicode.IsLetter(r) || unicode.IsDigit(r) || r == '.':
+			builder.WriteRune(r)
+			lastWasDash = false
+		case r == '-' || unicode.IsSpace(r) || r == '_' || r == '/':
+			if builder.Len() == 0 || lastWasDash {
+				continue
+			}
+			builder.WriteByte('-')
+			lastWasDash = true
+		}
+	}
+	return strings.Trim(builder.String(), "-")
 }
 
 // convertModelToMap converts ModelInfo to the appropriate format for different handler types

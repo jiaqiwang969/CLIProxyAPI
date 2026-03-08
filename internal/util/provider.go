@@ -52,6 +52,9 @@ func GetProviderName(modelName string) []string {
 	for _, provider := range registry.GetGlobalRegistry().GetModelProviders(modelName) {
 		appendProvider(provider)
 	}
+	for _, provider := range registry.GetGlobalRegistry().GetModelProvidersByAlias(modelName) {
+		appendProvider(provider)
+	}
 
 	if len(providers) > 0 {
 		return providers

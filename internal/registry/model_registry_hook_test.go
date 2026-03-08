@@ -202,3 +202,15 @@ func TestModelRegistryHook_PanicDoesNotAffectRegistry(t *testing.T) {
 		t.Fatal("timeout waiting for OnModelsUnregistered hook call")
 	}
 }
+
+func TestClientSupportsModel_MatchesDisplayAlias(t *testing.T) {
+	r := newTestModelRegistry()
+	r.RegisterClient("client-1", "auggie", []*ModelInfo{
+		{ID: "gpt-5-4", DisplayName: "GPT-5.4", Version: "gpt-5-4"},
+		{ID: "gpt5.4", DisplayName: "gpt5.4", Version: "gpt-5-4"},
+	})
+
+	if !r.ClientSupportsModel("client-1", "gpt-5.4") {
+		t.Fatal("expected display alias gpt-5.4 to match registered auggie model")
+	}
+}
