@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 
@@ -22,16 +23,35 @@ import (
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
 )
 
 const auggieModelsPath = "/get-models"
 const auggieChatStreamPath = "/chat-stream"
+const auggieListRemoteToolsPath = "/agents/list-remote-tools"
+const auggieRunRemoteToolPath = "/agents/run-remote-tool"
 const auggieModelsUserAgent = "augment.cli/acp/cliproxyapi"
 const AuggieShortNameAliasesMetadataKey = "model_short_name_aliases"
+const auggieResponsesStateTTL = 30 * time.Minute
+const auggieMaxInternalToolContinuations = 8
 
 // AuggieExecutor handles Auggie-specific revalidation and upstream requests.
 type AuggieExecutor struct {
 	cfg *config.Config
+}
+
+type auggieConversationState struct {
+	ConversationID       string
+	TurnID               string
+	ParentConversationID string
+	RootConversationID   string
+	Model                string
+	UpdatedAt            time.Time
+}
+
+type auggieConversationStateStore struct {
+	mu    sync.Mutex
+	items map[string]auggieConversationState
 }
 
 type auggieGetModelsUpstreamModel struct {
@@ -49,6 +69,48 @@ type auggieModelInfoRegistryEntry struct {
 	DisplayName  string `json:"displayName"`
 	IsDefault    bool   `json:"isDefault"`
 	ShortName    string `json:"shortName"`
+}
+
+var defaultAuggieResponsesStateStore = &auggieConversationStateStore{
+	items: make(map[string]auggieConversationState),
+}
+
+var defaultAuggieToolCallStateStore = &auggieConversationStateStore{
+	items: make(map[string]auggieConversationState),
+}
+
+var defaultAuggieRemoteToolIDs = []int{0, 1, 8, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21}
+
+type auggieRemoteToolDefinition struct {
+	Name string `json:"name"`
+}
+
+type auggieRemoteToolRegistryEntry struct {
+	RemoteToolID   int                        `json:"remote_tool_id"`
+	ToolDefinition auggieRemoteToolDefinition `json:"tool_definition"`
+}
+
+type auggieListRemoteToolsResponse struct {
+	Tools []auggieRemoteToolRegistryEntry `json:"tools"`
+}
+
+type auggieRunRemoteToolResponse struct {
+	ToolOutput        string `json:"tool_output"`
+	ToolResultMessage string `json:"tool_result_message"`
+	IsError           bool   `json:"is_error"`
+	Status            int    `json:"status"`
+}
+
+type auggieToolResultContinuation struct {
+	ToolUseID string
+	Content   string
+	IsError   bool
+}
+
+type auggieBuiltInToolCall struct {
+	ID        string
+	Name      string
+	Arguments string
 }
 
 func NewAuggieExecutor(cfg *config.Config) *AuggieExecutor { return &AuggieExecutor{cfg: cfg} }
@@ -136,10 +198,17 @@ func (e *AuggieExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 
 	switch from {
 	case sdktranslator.FormatOpenAI:
+		if err := validateAuggieOpenAIRequestCapabilities(req.Payload); err != nil {
+			return nil, err
+		}
 		resolvedReq := req
 		resolvedReq.Model = resolveAuggieModelAlias(auth, req.Model)
 
 		translated := sdktranslator.TranslateRequest(from, sdktranslator.FormatAuggie, resolvedReq.Model, req.Payload, true)
+		translated, err := enrichAuggieOpenAIChatCompletionRequest(resolvedReq.Model, req.Payload, translated)
+		if err != nil {
+			return nil, err
+		}
 		return e.executeAuggieStream(ctx, auth, resolvedReq, opts, translated, from, true)
 	case sdktranslator.FormatClaude:
 		return e.executeClaudeStream(ctx, auth, req, opts)
@@ -671,6 +740,41 @@ func auggieTenantURL(auth *cliproxyauth.Auth) string {
 	return ""
 }
 
+func (s *auggieConversationStateStore) Store(key string, state auggieConversationState) {
+	key = strings.TrimSpace(key)
+	if key == "" || strings.TrimSpace(state.ConversationID) == "" || strings.TrimSpace(state.TurnID) == "" {
+		return
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	now := time.Now().UTC()
+	s.cleanupLocked(now)
+	state.UpdatedAt = now
+	s.items[key] = state
+}
+
+func (s *auggieConversationStateStore) Load(key string) (auggieConversationState, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	now := time.Now().UTC()
+	s.cleanupLocked(now)
+
+	state, ok := s.items[strings.TrimSpace(key)]
+	return state, ok
+}
+
+func (s *auggieConversationStateStore) cleanupLocked(now time.Time) {
+	cutoff := now.Add(-auggieResponsesStateTTL)
+	for key, state := range s.items {
+		if state.UpdatedAt.IsZero() || state.UpdatedAt.Before(cutoff) {
+			delete(s.items, key)
+		}
+	}
+}
+
 func (e *AuggieExecutor) executeAuggieStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, translated []byte, from sdktranslator.Format, allowRefresh bool) (result *cliproxyexecutor.StreamResult, err error) {
 	if auth == nil {
 		return nil, statusErr{code: http.StatusInternalServerError, msg: "auggie executor: auth is nil"}
@@ -772,6 +876,9 @@ func (e *AuggieExecutor) executeAuggieStream(ctx context.Context, auth *cliproxy
 		scanner := bufio.NewScanner(httpResp.Body)
 		scanner.Buffer(nil, streamScannerBuffer)
 		var param any
+		var translatedResponseID string
+		var conversationState auggieConversationState
+		var toolCallIDs []string
 		for scanner.Scan() {
 			line := bytes.Clone(scanner.Bytes())
 			appendAPIResponseChunk(ctx, e.cfg, line)
@@ -787,12 +894,21 @@ func (e *AuggieExecutor) executeAuggieStream(ctx context.Context, auth *cliproxy
 				out <- cliproxyexecutor.StreamChunk{Err: err}
 				return
 			}
+			updateAuggieConversationStateFromPayload(&conversationState, payload)
 			if detail, ok := parseAuggieUsage(payload); ok {
 				reporter.publish(ctx, detail)
 			}
 
 			chunks := sdktranslator.TranslateStream(ctx, sdktranslator.FormatAuggie, from, responseModel, opts.OriginalRequest, translated, payload, &param)
 			for i := range chunks {
+				if opts.SourceFormat == sdktranslator.FormatOpenAIResponse && translatedResponseID == "" {
+					if got := strings.TrimSpace(gjson.GetBytes([]byte(chunks[i]), "id").String()); got != "" {
+						translatedResponseID = got
+					}
+				}
+				if opts.SourceFormat == sdktranslator.FormatOpenAI {
+					toolCallIDs = appendUniqueStrings(toolCallIDs, openAIToolCallIDsFromChunk([]byte(chunks[i]))...)
+				}
 				out <- cliproxyexecutor.StreamChunk{Payload: []byte(chunks[i])}
 			}
 		}
@@ -808,10 +924,125 @@ func (e *AuggieExecutor) executeAuggieStream(ctx context.Context, auth *cliproxy
 			out <- cliproxyexecutor.StreamChunk{Err: errScan}
 			return
 		}
+		conversationState.Model = strings.TrimSpace(gjson.GetBytes(translated, "model").String())
+		if conversationState.Model == "" {
+			conversationState.Model = responseModel
+		}
+		if opts.SourceFormat == sdktranslator.FormatOpenAIResponse && translatedResponseID != "" {
+			defaultAuggieResponsesStateStore.Store(translatedResponseID, conversationState)
+		}
+		if opts.SourceFormat == sdktranslator.FormatOpenAI && len(toolCallIDs) > 0 {
+			for _, toolCallID := range toolCallIDs {
+				defaultAuggieToolCallStateStore.Store(toolCallID, conversationState)
+			}
+		}
 		reporter.ensurePublished(ctx)
 	}()
 
 	return &cliproxyexecutor.StreamResult{Headers: httpResp.Header.Clone(), Chunks: out}, nil
+}
+
+func (e *AuggieExecutor) executeAuggieJSON(ctx context.Context, auth *cliproxyauth.Auth, path string, requestBody []byte, allowRefresh bool) ([]byte, error) {
+	if auth == nil {
+		return nil, statusErr{code: http.StatusInternalServerError, msg: "auggie executor: auth is nil"}
+	}
+
+	tenantURL, err := sdkauth.NormalizeAuggieTenantURL(auggieTenantURL(auth))
+	if err != nil {
+		if allowRefresh {
+			refreshed, refreshErr := e.Refresh(ctx, auth)
+			if refreshErr != nil {
+				replaceAuggieAuthState(auth, markAuggieAuthUnauthorized(auth, refreshErr.Error()))
+				return nil, refreshErr
+			}
+			replaceAuggieAuthState(auth, refreshed)
+			return e.executeAuggieJSON(ctx, auth, path, requestBody, false)
+		}
+		replaceAuggieAuthState(auth, markAuggieAuthUnauthorized(auth, err.Error()))
+		return nil, statusErr{code: http.StatusUnauthorized, msg: err.Error()}
+	}
+
+	token := auggieAccessToken(auth)
+	if strings.TrimSpace(token) == "" {
+		if allowRefresh {
+			refreshed, refreshErr := e.Refresh(ctx, auth)
+			if refreshErr != nil {
+				replaceAuggieAuthState(auth, markAuggieAuthUnauthorized(auth, refreshErr.Error()))
+				return nil, refreshErr
+			}
+			replaceAuggieAuthState(auth, refreshed)
+			return e.executeAuggieJSON(ctx, auth, path, requestBody, false)
+		}
+		replaceAuggieAuthState(auth, markAuggieAuthUnauthorized(auth, "missing access token"))
+		return nil, statusErr{code: http.StatusUnauthorized, msg: "missing access token"}
+	}
+
+	requestURL := strings.TrimSuffix(tenantURL, "/") + path
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, requestURL, bytes.NewReader(requestBody))
+	if err != nil {
+		return nil, err
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Accept", "application/json")
+	httpReq.Header.Set("User-Agent", "cli-proxy-auggie")
+	httpReq.Header.Set("Authorization", "Bearer "+token)
+
+	var authID, authLabel, authType, authValue string
+	if auth != nil {
+		authID = auth.ID
+		authLabel = auth.Label
+		authType, authValue = auth.AccountInfo()
+	}
+	recordAPIRequest(ctx, e.cfg, upstreamRequestLog{
+		URL:       requestURL,
+		Method:    http.MethodPost,
+		Headers:   httpReq.Header.Clone(),
+		Body:      requestBody,
+		Provider:  e.Identifier(),
+		AuthID:    authID,
+		AuthLabel: authLabel,
+		AuthType:  authType,
+		AuthValue: authValue,
+	})
+
+	httpResp, err := newProxyAwareHTTPClient(ctx, e.cfg, auth, 0).Do(httpReq)
+	if err != nil {
+		recordAPIResponseError(ctx, e.cfg, err)
+		return nil, err
+	}
+	defer func() {
+		if errClose := httpResp.Body.Close(); errClose != nil {
+			log.Errorf("auggie executor: close response body error: %v", errClose)
+		}
+	}()
+
+	recordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
+	responseBody, readErr := io.ReadAll(httpResp.Body)
+	if readErr != nil {
+		recordAPIResponseError(ctx, e.cfg, readErr)
+		return nil, readErr
+	}
+	appendAPIResponseChunk(ctx, e.cfg, responseBody)
+
+	if httpResp.StatusCode == http.StatusUnauthorized {
+		if allowRefresh {
+			refreshed, refreshErr := e.Refresh(ctx, auth)
+			if refreshErr != nil {
+				replaceAuggieAuthState(auth, markAuggieAuthUnauthorized(auth, refreshErr.Error()))
+				return nil, refreshErr
+			}
+			replaceAuggieAuthState(auth, refreshed)
+			return e.executeAuggieJSON(ctx, auth, path, requestBody, false)
+		}
+		replaceAuggieAuthState(auth, markAuggieAuthUnauthorized(auth, "unauthorized"))
+		return nil, statusErr{code: http.StatusUnauthorized, msg: string(responseBody)}
+	}
+	if httpResp.StatusCode < http.StatusOK || httpResp.StatusCode >= http.StatusMultipleChoices {
+		return nil, statusErr{code: httpResp.StatusCode, msg: string(responseBody)}
+	}
+
+	markAuggieAuthActive(auth, time.Now().UTC())
+	return responseBody, nil
 }
 
 func (e *AuggieExecutor) refreshAndRetryAuggieStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, translated []byte, from sdktranslator.Format) (*cliproxyexecutor.StreamResult, error) {
@@ -877,12 +1108,17 @@ func collectAuggieOpenAINonStream(chunks <-chan cliproxyexecutor.StreamChunk, fa
 	}
 
 	var (
-		content            strings.Builder
-		responseID         string
-		responseModel      = strings.TrimSpace(fallbackModel)
-		nativeFinishReason any
-		finishReason       any = "stop"
-		created            int64
+		content                   strings.Builder
+		reasoning                 strings.Builder
+		reasoningEncryptedContent string
+		reasoningItemID           string
+		responseID                string
+		responseModel             = strings.TrimSpace(fallbackModel)
+		nativeFinishReason        any
+		finishReason              any = "stop"
+		created                   int64
+		toolCalls                 []json.RawMessage
+		usageRaw                  json.RawMessage
 	)
 
 	for chunk := range chunks {
@@ -908,11 +1144,29 @@ func collectAuggieOpenAINonStream(chunks <-chan cliproxyexecutor.StreamChunk, fa
 		if text := gjson.GetBytes(payload, "choices.0.delta.content"); text.Exists() {
 			content.WriteString(text.String())
 		}
+		if rc := gjson.GetBytes(payload, "choices.0.delta.reasoning_content"); rc.Exists() {
+			reasoning.WriteString(rc.String())
+		}
+		if itemID := gjson.GetBytes(payload, "choices.0.delta.reasoning_item_id"); itemID.Exists() && strings.TrimSpace(itemID.String()) != "" {
+			reasoningItemID = itemID.String()
+		}
+		if encrypted := gjson.GetBytes(payload, "choices.0.delta.reasoning_encrypted_content"); encrypted.Exists() && strings.TrimSpace(encrypted.String()) != "" {
+			reasoningEncryptedContent = encrypted.String()
+		}
+		if tcs := gjson.GetBytes(payload, "choices.0.delta.tool_calls"); tcs.Exists() && tcs.IsArray() {
+			tcs.ForEach(func(_, tc gjson.Result) bool {
+				toolCalls = append(toolCalls, json.RawMessage(tc.Raw))
+				return true
+			})
+		}
 		if fr := gjson.GetBytes(payload, "choices.0.finish_reason"); fr.Exists() && strings.TrimSpace(fr.String()) != "" && fr.String() != "null" {
 			finishReason = fr.Value()
 		}
 		if nfr := gjson.GetBytes(payload, "choices.0.native_finish_reason"); nfr.Exists() && strings.TrimSpace(nfr.String()) != "" && nfr.String() != "null" {
 			nativeFinishReason = nfr.Value()
+		}
+		if u := gjson.GetBytes(payload, "usage"); u.Exists() && u.Type != gjson.Null {
+			usageRaw = json.RawMessage(u.Raw)
 		}
 	}
 
@@ -931,6 +1185,18 @@ func collectAuggieOpenAINonStream(chunks <-chan cliproxyexecutor.StreamChunk, fa
 		},
 		"finish_reason": finishReason,
 	}
+	if len(toolCalls) > 0 {
+		choice["message"].(map[string]any)["tool_calls"] = toolCalls
+	}
+	if reasoning.Len() > 0 {
+		choice["message"].(map[string]any)["reasoning_content"] = reasoning.String()
+	}
+	if reasoningItemID != "" {
+		choice["message"].(map[string]any)["reasoning_item_id"] = reasoningItemID
+	}
+	if reasoningEncryptedContent != "" {
+		choice["message"].(map[string]any)["reasoning_encrypted_content"] = reasoningEncryptedContent
+	}
 	if nativeFinishReason != nil {
 		choice["native_finish_reason"] = nativeFinishReason
 	}
@@ -941,6 +1207,9 @@ func collectAuggieOpenAINonStream(chunks <-chan cliproxyexecutor.StreamChunk, fa
 		"created": created,
 		"model":   responseModel,
 		"choices": []map[string]any{choice},
+	}
+	if len(usageRaw) > 0 {
+		response["usage"] = usageRaw
 	}
 
 	data, err := json.Marshal(response)
@@ -1039,38 +1308,105 @@ func (e *AuggieExecutor) executeClaudeStream(ctx context.Context, auth *cliproxy
 }
 
 func (e *AuggieExecutor) executeOpenAIResponses(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
-	openAIReq, originalPayload := buildAuggieOpenAIRequest(req, opts, false)
-	openAIOpts := opts
-	openAIOpts.SourceFormat = sdktranslator.FormatOpenAI
-
-	openAIResp, err := e.Execute(ctx, auth, openAIReq, openAIOpts)
+	resolvedReq := req
+	resolvedReq.Model = resolveAuggieModelAlias(auth, req.Model)
+	translated, originalPayload, err := buildAuggieResponsesTranslatedRequest(resolvedReq.Model, req, opts, false)
+	if err != nil {
+		return cliproxyexecutor.Response{}, err
+	}
+	openAIPayload, headers, err := e.executeAuggieResponsesTurn(ctx, auth, resolvedReq, opts, translated)
+	if err != nil {
+		return cliproxyexecutor.Response{}, err
+	}
+	openAIPayload, headers, err = e.completeAuggieResponsesBuiltInToolLoop(ctx, auth, resolvedReq, opts, translated, openAIPayload, headers)
 	if err != nil {
 		return cliproxyexecutor.Response{}, err
 	}
 
 	responseModel := payloadRequestedModel(opts, req.Model)
 	var param any
-	translated := sdktranslator.TranslateNonStream(
+	translatedResponse := sdktranslator.TranslateNonStream(
 		ctx,
 		sdktranslator.FormatOpenAI,
 		sdktranslator.FormatOpenAIResponse,
 		responseModel,
 		originalPayload,
-		openAIReq.Payload,
-		openAIResp.Payload,
+		originalPayload,
+		openAIPayload,
 		&param,
 	)
 
-	openAIResp.Payload = []byte(translated)
-	return openAIResp, nil
+	return cliproxyexecutor.Response{
+		Payload: []byte(translatedResponse),
+		Headers: headers,
+	}, nil
+}
+
+func (e *AuggieExecutor) executeAuggieResponsesTurn(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, translated []byte) ([]byte, http.Header, error) {
+	streamResult, err := e.executeAuggieStream(ctx, auth, req, opts, translated, sdktranslator.FormatOpenAI, true)
+	if err != nil {
+		return nil, nil, err
+	}
+	if streamResult == nil {
+		return nil, nil, statusErr{code: http.StatusBadGateway, msg: "auggie stream result is nil"}
+	}
+
+	openAIPayload, err := collectAuggieOpenAINonStream(streamResult.Chunks, payloadRequestedModel(opts, req.Model))
+	if err != nil {
+		return nil, nil, err
+	}
+	return openAIPayload, streamResult.Headers, nil
+}
+
+func (e *AuggieExecutor) completeAuggieResponsesBuiltInToolLoop(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, baseTranslated, openAIPayload []byte, headers http.Header) ([]byte, http.Header, error) {
+	currentPayload := openAIPayload
+	currentHeaders := headers
+
+	for continuationCount := 0; continuationCount < auggieMaxInternalToolContinuations; continuationCount++ {
+		toolCalls, shouldContinue, err := extractAuggieBuiltInToolCalls(currentPayload)
+		if err != nil {
+			return nil, nil, err
+		}
+		if !shouldContinue {
+			return currentPayload, currentHeaders, nil
+		}
+
+		responseID := strings.TrimSpace(gjson.GetBytes(currentPayload, "id").String())
+		if responseID == "" {
+			return nil, nil, statusErr{code: http.StatusBadGateway, msg: "missing response id for Auggie built-in tool continuation"}
+		}
+		state, ok := defaultAuggieResponsesStateStore.Load(responseID)
+		if !ok {
+			return nil, nil, statusErr{code: http.StatusBadGateway, msg: fmt.Sprintf("missing Auggie conversation state for built-in tool continuation: %s", responseID)}
+		}
+
+		toolResults, err := e.runAuggieBuiltInToolCalls(ctx, auth, toolCalls)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		continuationRequest, err := buildAuggieToolContinuationRequest(baseTranslated, state, toolResults)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		currentPayload, currentHeaders, err = e.executeAuggieResponsesTurn(ctx, auth, req, opts, continuationRequest)
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+
+	return nil, nil, statusErr{code: http.StatusBadGateway, msg: fmt.Sprintf("Auggie built-in tool continuation exceeded %d internal turns", auggieMaxInternalToolContinuations)}
 }
 
 func (e *AuggieExecutor) executeOpenAIResponsesStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
-	openAIReq, originalPayload := buildAuggieOpenAIRequest(req, opts, true)
-	openAIOpts := opts
-	openAIOpts.SourceFormat = sdktranslator.FormatOpenAI
-
-	openAIResult, err := e.ExecuteStream(ctx, auth, openAIReq, openAIOpts)
+	resolvedReq := req
+	resolvedReq.Model = resolveAuggieModelAlias(auth, req.Model)
+	translated, originalPayload, err := buildAuggieResponsesTranslatedRequest(resolvedReq.Model, req, opts, true)
+	if err != nil {
+		return nil, err
+	}
+	openAIResult, err := e.executeAuggieStream(ctx, auth, resolvedReq, opts, translated, sdktranslator.FormatOpenAI, true)
 	if err != nil {
 		return nil, err
 	}
@@ -1097,12 +1433,12 @@ func (e *AuggieExecutor) executeOpenAIResponsesStream(ctx context.Context, auth 
 				sdktranslator.FormatOpenAIResponse,
 				responseModel,
 				originalPayload,
-				openAIReq.Payload,
+				originalPayload,
 				bytes.Clone(chunk.Payload),
 				&param,
 			)
 			for i := range lines {
-				if strings.Contains(lines[i], `"type":"response.completed"`) {
+				if isOpenAIResponsesTerminalEventLine(lines[i]) {
 					if completedSent {
 						continue
 					}
@@ -1119,8 +1455,594 @@ func (e *AuggieExecutor) executeOpenAIResponsesStream(ctx context.Context, auth 
 	}, nil
 }
 
+func isOpenAIResponsesTerminalEventLine(line string) bool {
+	return strings.Contains(line, `"type":"response.completed"`) || strings.Contains(line, `"type":"response.incomplete"`)
+}
+
 func buildAuggieOpenAIRequest(req cliproxyexecutor.Request, opts cliproxyexecutor.Options, stream bool) (cliproxyexecutor.Request, []byte) {
 	return buildAuggieBridgeToOpenAIRequest(req, opts, sdktranslator.FormatOpenAIResponse, stream)
+}
+
+func buildAuggieResponsesTranslatedRequest(model string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, stream bool) ([]byte, []byte, error) {
+	originalPayload := req.Payload
+	if len(opts.OriginalRequest) > 0 {
+		originalPayload = opts.OriginalRequest
+	}
+	if err := validateAuggieResponsesRequestCapabilities(originalPayload); err != nil {
+		return nil, originalPayload, err
+	}
+
+	openAIPayload := sdktranslator.TranslateRequest(sdktranslator.FormatOpenAIResponse, sdktranslator.FormatOpenAI, model, req.Payload, stream)
+	translated := sdktranslator.TranslateRequest(sdktranslator.FormatOpenAI, sdktranslator.FormatAuggie, model, openAIPayload, stream)
+
+	previousResponseID := strings.TrimSpace(gjson.GetBytes(originalPayload, "previous_response_id").String())
+	if previousResponseID == "" {
+		return translated, originalPayload, nil
+	}
+
+	state, ok := defaultAuggieResponsesStateStore.Load(previousResponseID)
+	if !ok {
+		return nil, originalPayload, statusErr{code: http.StatusBadRequest, msg: fmt.Sprintf("unknown previous_response_id: %s", previousResponseID)}
+	}
+	if strings.TrimSpace(state.ConversationID) == "" || strings.TrimSpace(state.TurnID) == "" {
+		return nil, originalPayload, statusErr{code: http.StatusBadRequest, msg: fmt.Sprintf("missing Auggie conversation state for previous_response_id: %s", previousResponseID)}
+	}
+
+	var err error
+	translated, err = applyAuggieConversationState(translated, state)
+	if err != nil {
+		return nil, originalPayload, err
+	}
+	return translated, originalPayload, nil
+}
+
+func validateAuggieResponsesRequestCapabilities(rawJSON []byte) error {
+	if err := validateAuggieStoreSupport(rawJSON); err != nil {
+		return err
+	}
+	if err := validateAuggieResponsesIncludeSupport(rawJSON); err != nil {
+		return err
+	}
+	if err := validateAuggieResponsesToolTypes(rawJSON); err != nil {
+		return err
+	}
+	if err := validateAuggieResponsesToolChoice(rawJSON); err != nil {
+		return err
+	}
+	return validateAuggieResponsesInputItemTypes(rawJSON)
+}
+
+func validateAuggieOpenAIRequestCapabilities(rawJSON []byte) error {
+	if err := validateAuggieStoreSupport(rawJSON); err != nil {
+		return err
+	}
+	if err := validateAuggieOpenAIIncludeSupport(rawJSON); err != nil {
+		return err
+	}
+	if err := validateAuggieOpenAIToolTypes(rawJSON); err != nil {
+		return err
+	}
+	return validateAuggieOpenAIToolChoice(rawJSON)
+}
+
+func validateAuggieStoreSupport(rawJSON []byte) error {
+	store := gjson.GetBytes(rawJSON, "store")
+	if !store.Exists() {
+		return nil
+	}
+	if store.Type != gjson.True && store.Type != gjson.False {
+		return statusErr{
+			code: http.StatusBadRequest,
+			msg:  "store must be a boolean",
+		}
+	}
+	return nil
+}
+
+var supportedAuggieResponsesIncludeValues = map[string]struct{}{
+	"code_interpreter_call.outputs":         {},
+	"computer_call_output.output.image_url": {},
+	"file_search_call.results":              {},
+	"message.input_image.image_url":         {},
+	"message.output_text.logprobs":          {},
+	"reasoning.encrypted_content":           {},
+	"web_search_call.action.sources":        {},
+	"web_search_call.results":               {},
+}
+
+func parseAuggieIncludeValues(rawJSON []byte) ([]string, error) {
+	include := gjson.GetBytes(rawJSON, "include")
+	if !include.Exists() {
+		return nil, nil
+	}
+	if !include.IsArray() {
+		return nil, statusErr{
+			code: http.StatusBadRequest,
+			msg:  "include must be an array",
+		}
+	}
+	values := make([]string, 0, len(include.Array()))
+	for index, item := range include.Array() {
+		if item.Type != gjson.String {
+			return nil, statusErr{
+				code: http.StatusBadRequest,
+				msg:  fmt.Sprintf("include[%d] must be a string", index),
+			}
+		}
+		value := strings.TrimSpace(item.String())
+		if value == "" {
+			return nil, statusErr{
+				code: http.StatusBadRequest,
+				msg:  fmt.Sprintf("include[%d] must be a non-empty string", index),
+			}
+		}
+		values = append(values, value)
+	}
+	return values, nil
+}
+
+func validateAuggieResponsesIncludeSupport(rawJSON []byte) error {
+	values, err := parseAuggieIncludeValues(rawJSON)
+	if err != nil {
+		return err
+	}
+	for index, value := range values {
+		if _, ok := supportedAuggieResponsesIncludeValues[value]; ok {
+			continue
+		}
+		return statusErr{
+			code: http.StatusBadRequest,
+			msg:  fmt.Sprintf("include[%d]=%q is not supported on /v1/responses", index, value),
+		}
+	}
+	return nil
+}
+
+func validateAuggieOpenAIIncludeSupport(rawJSON []byte) error {
+	values, err := parseAuggieIncludeValues(rawJSON)
+	if err != nil {
+		return err
+	}
+	if len(values) == 0 {
+		return nil
+	}
+	return statusErr{
+		code: http.StatusBadRequest,
+		msg:  "include is not supported on /v1/chat/completions",
+	}
+}
+
+func validateAuggieResponsesToolTypes(rawJSON []byte) error {
+	return validateAuggieToolTypes(rawJSON, true)
+}
+
+func validateAuggieOpenAIToolTypes(rawJSON []byte) error {
+	return validateAuggieToolTypes(rawJSON, false)
+}
+
+func validateAuggieToolTypes(rawJSON []byte, allowResponsesBuiltIns bool) error {
+	tools := gjson.GetBytes(rawJSON, "tools")
+	if !tools.Exists() || !tools.IsArray() {
+		return nil
+	}
+
+	for index, tool := range tools.Array() {
+		toolType := strings.TrimSpace(tool.Get("type").String())
+		if toolType == "" || toolType == "function" {
+			continue
+		}
+		if allowResponsesBuiltIns && toolType == "web_search" {
+			continue
+		}
+		return statusErr{
+			code: http.StatusBadRequest,
+			msg:  fmt.Sprintf("tools[%d].type=%q is not supported by Auggie; only function tools are currently supported", index, toolType),
+		}
+	}
+
+	return nil
+}
+
+func validateAuggieResponsesToolChoice(rawJSON []byte) error {
+	return validateAuggieToolChoice(rawJSON, true)
+}
+
+func validateAuggieOpenAIToolChoice(rawJSON []byte) error {
+	return validateAuggieToolChoice(rawJSON, false)
+}
+
+func validateAuggieToolChoice(rawJSON []byte, allowResponsesBuiltIns bool) error {
+	toolChoice := gjson.GetBytes(rawJSON, "tool_choice")
+	if !toolChoice.Exists() || toolChoice.Type == gjson.Null {
+		return nil
+	}
+
+	if toolChoice.Type == gjson.String {
+		value := strings.TrimSpace(toolChoice.String())
+		if value == "" || value == "auto" || value == "none" {
+			return nil
+		}
+		return statusErr{
+			code: http.StatusBadRequest,
+			msg:  fmt.Sprintf("tool_choice=%q is not supported by Auggie; supported values are auto, none, or omitted tool_choice", value),
+		}
+	}
+
+	if toolChoice.IsObject() {
+		toolChoiceType := strings.TrimSpace(toolChoice.Get("type").String())
+		if allowResponsesBuiltIns && toolChoiceType == "web_search" {
+			return nil
+		}
+		if toolChoiceType == "" {
+			toolChoiceType = "object"
+		}
+		return statusErr{
+			code: http.StatusBadRequest,
+			msg:  fmt.Sprintf("tool_choice.type=%q is not supported by Auggie; supported values are auto, none, or omitted tool_choice", toolChoiceType),
+		}
+	}
+
+	return statusErr{
+		code: http.StatusBadRequest,
+		msg:  "tool_choice must be a string or object for Auggie requests",
+	}
+}
+
+func validateAuggieResponsesInputItemTypes(rawJSON []byte) error {
+	input := gjson.GetBytes(rawJSON, "input")
+	if !input.Exists() || !input.IsArray() {
+		return nil
+	}
+
+	for index, item := range input.Array() {
+		itemType := strings.TrimSpace(item.Get("type").String())
+		if itemType == "" && strings.TrimSpace(item.Get("role").String()) != "" {
+			itemType = "message"
+		}
+
+		switch itemType {
+		case "", "message", "function_call", "function_call_output":
+			continue
+		case "item_reference":
+			return statusErr{
+				code: http.StatusBadRequest,
+				msg: fmt.Sprintf(
+					"input[%d].type=%q is not supported by Auggie /v1/responses because Auggie cannot resolve prior response item references; use previous_response_id for native continuation or a native OpenAI Responses route for manual item replay",
+					index,
+					itemType,
+				),
+			}
+		case "reasoning":
+			return statusErr{
+				code: http.StatusBadRequest,
+				msg: fmt.Sprintf(
+					"input[%d].type=%q is not supported by Auggie /v1/responses because Auggie cannot accept prior reasoning items as input; use previous_response_id for native continuation or a native OpenAI Responses route for manual item replay",
+					index,
+					itemType,
+				),
+			}
+		default:
+			return statusErr{
+				code: http.StatusBadRequest,
+				msg:  fmt.Sprintf("input[%d].type=%q is not supported by Auggie /v1/responses; supported item types are message, function_call, and function_call_output", index, itemType),
+			}
+		}
+	}
+
+	return nil
+}
+
+func extractAuggieBuiltInToolCalls(openAIPayload []byte) ([]auggieBuiltInToolCall, bool, error) {
+	if strings.TrimSpace(gjson.GetBytes(openAIPayload, "choices.0.finish_reason").String()) != "tool_calls" {
+		return nil, false, nil
+	}
+
+	toolCalls := gjson.GetBytes(openAIPayload, "choices.0.message.tool_calls")
+	if !toolCalls.Exists() || !toolCalls.IsArray() || len(toolCalls.Array()) == 0 {
+		return nil, false, statusErr{code: http.StatusBadGateway, msg: "Auggie returned finish_reason=tool_calls without tool calls"}
+	}
+
+	out := make([]auggieBuiltInToolCall, 0, len(toolCalls.Array()))
+	unsupportedNames := make([]string, 0, len(toolCalls.Array()))
+	for index, toolCall := range toolCalls.Array() {
+		name := strings.TrimSpace(toolCall.Get("function.name").String())
+		normalizedName, ok := normalizeAuggieRemoteToolName(name)
+		if !ok {
+			unsupportedNames = append(unsupportedNames, name)
+			continue
+		}
+
+		toolCallID := strings.TrimSpace(toolCall.Get("id").String())
+		if toolCallID == "" {
+			return nil, false, statusErr{code: http.StatusBadGateway, msg: fmt.Sprintf("Auggie built-in tool call %d is missing id", index)}
+		}
+
+		arguments := strings.TrimSpace(toolCall.Get("function.arguments").String())
+		if arguments == "" {
+			arguments = "{}"
+		}
+
+		out = append(out, auggieBuiltInToolCall{
+			ID:        toolCallID,
+			Name:      normalizedName,
+			Arguments: arguments,
+		})
+	}
+
+	if len(out) == 0 {
+		return nil, false, nil
+	}
+	if len(unsupportedNames) > 0 {
+		return nil, false, statusErr{
+			code: http.StatusBadGateway,
+			msg:  fmt.Sprintf("Auggie returned mixed built-in and client-executed tool calls; unsupported names: %s", strings.Join(unsupportedNames, ", ")),
+		}
+	}
+
+	return out, true, nil
+}
+
+func normalizeAuggieRemoteToolName(name string) (string, bool) {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "web-search", "web_search":
+		return "web-search", true
+	default:
+		return "", false
+	}
+}
+
+func buildAuggieToolContinuationRequest(baseTranslated []byte, state auggieConversationState, toolResults []auggieToolResultContinuation) ([]byte, error) {
+	translated := bytes.Clone(baseTranslated)
+	translated, err := applyAuggieConversationState(translated, state)
+	if err != nil {
+		return nil, err
+	}
+
+	nodes := make([]map[string]any, 0, len(toolResults))
+	for index, toolResult := range toolResults {
+		nodes = append(nodes, map[string]any{
+			"id":   index + 1,
+			"type": 1,
+			"tool_result_node": map[string]any{
+				"tool_use_id": toolResult.ToolUseID,
+				"content":     toolResult.Content,
+				"is_error":    toolResult.IsError,
+			},
+		})
+	}
+
+	nodesRaw, err := json.Marshal(nodes)
+	if err != nil {
+		return nil, err
+	}
+
+	translated, err = sjson.SetRawBytes(translated, "nodes", nodesRaw)
+	if err != nil {
+		return nil, err
+	}
+	return translated, nil
+}
+
+func (e *AuggieExecutor) runAuggieBuiltInToolCalls(ctx context.Context, auth *cliproxyauth.Auth, toolCalls []auggieBuiltInToolCall) ([]auggieToolResultContinuation, error) {
+	registry, err := e.listAuggieRemoteTools(ctx, auth)
+	if err != nil {
+		return nil, err
+	}
+
+	byName := make(map[string]auggieRemoteToolRegistryEntry, len(registry))
+	for _, entry := range registry {
+		name, ok := normalizeAuggieRemoteToolName(entry.ToolDefinition.Name)
+		if !ok {
+			continue
+		}
+		byName[name] = entry
+	}
+
+	out := make([]auggieToolResultContinuation, 0, len(toolCalls))
+	for _, toolCall := range toolCalls {
+		entry, ok := byName[toolCall.Name]
+		if !ok {
+			return nil, statusErr{code: http.StatusBadGateway, msg: fmt.Sprintf("Auggie remote tool registry missing tool %q", toolCall.Name)}
+		}
+
+		result, err := e.runAuggieRemoteTool(ctx, auth, entry, toolCall)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, result)
+	}
+
+	return out, nil
+}
+
+func (e *AuggieExecutor) listAuggieRemoteTools(ctx context.Context, auth *cliproxyauth.Auth) ([]auggieRemoteToolRegistryEntry, error) {
+	requestBody, err := json.Marshal(map[string]any{
+		"tool_id_list": map[string]any{
+			"tool_ids": defaultAuggieRemoteToolIDs,
+		},
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	responseBody, err := e.executeAuggieJSON(ctx, auth, auggieListRemoteToolsPath, requestBody, true)
+	if err != nil {
+		return nil, err
+	}
+
+	var response auggieListRemoteToolsResponse
+	if err := json.Unmarshal(responseBody, &response); err != nil {
+		return nil, err
+	}
+	return response.Tools, nil
+}
+
+func (e *AuggieExecutor) runAuggieRemoteTool(ctx context.Context, auth *cliproxyauth.Auth, entry auggieRemoteToolRegistryEntry, toolCall auggieBuiltInToolCall) (auggieToolResultContinuation, error) {
+	requestBody, err := json.Marshal(map[string]any{
+		"tool_name":       entry.ToolDefinition.Name,
+		"tool_input_json": toolCall.Arguments,
+		"tool_id":         entry.RemoteToolID,
+	})
+	if err != nil {
+		return auggieToolResultContinuation{}, err
+	}
+
+	responseBody, err := e.executeAuggieJSON(ctx, auth, auggieRunRemoteToolPath, requestBody, true)
+	if err != nil {
+		return auggieToolResultContinuation{}, err
+	}
+
+	var response auggieRunRemoteToolResponse
+	if err := json.Unmarshal(responseBody, &response); err != nil {
+		return auggieToolResultContinuation{}, err
+	}
+
+	content := strings.TrimSpace(response.ToolOutput)
+	if content == "" {
+		content = strings.TrimSpace(response.ToolResultMessage)
+	}
+
+	return auggieToolResultContinuation{
+		ToolUseID: toolCall.ID,
+		Content:   content,
+		IsError:   response.IsError,
+	}, nil
+}
+
+func enrichAuggieOpenAIChatCompletionRequest(model string, _ []byte, translated []byte) ([]byte, error) {
+	state, ok := lookupAuggieToolCallConversationState(model, translated)
+	if !ok {
+		return translated, nil
+	}
+	return applyAuggieConversationState(translated, state)
+}
+
+func lookupAuggieToolCallConversationState(model string, translated []byte) (auggieConversationState, bool) {
+	toolCallIDs := auggieToolResultNodeIDs(translated)
+	if len(toolCallIDs) == 0 {
+		return auggieConversationState{}, false
+	}
+
+	model = strings.TrimSpace(model)
+	var selected auggieConversationState
+	for _, toolCallID := range toolCallIDs {
+		state, ok := defaultAuggieToolCallStateStore.Load(toolCallID)
+		if !ok {
+			continue
+		}
+		if model != "" && strings.TrimSpace(state.Model) != "" && !strings.EqualFold(state.Model, model) {
+			log.Debugf("auggie executor: ignoring tool call continuation state for %s due to model mismatch state=%s request=%s", toolCallID, state.Model, model)
+			continue
+		}
+		if strings.TrimSpace(selected.ConversationID) == "" {
+			selected = state
+			continue
+		}
+		if selected.ConversationID != state.ConversationID || selected.TurnID != state.TurnID {
+			log.Debugf("auggie executor: mismatched conversation state across tool call ids, using first match for %s", toolCallID)
+		}
+	}
+	if strings.TrimSpace(selected.ConversationID) == "" || strings.TrimSpace(selected.TurnID) == "" {
+		return auggieConversationState{}, false
+	}
+	return selected, true
+}
+
+func auggieToolResultNodeIDs(translated []byte) []string {
+	nodes := gjson.GetBytes(translated, "nodes")
+	if !nodes.Exists() || !nodes.IsArray() {
+		return nil
+	}
+
+	var ids []string
+	nodes.ForEach(func(_, node gjson.Result) bool {
+		toolCallID := strings.TrimSpace(node.Get("tool_result_node.tool_use_id").String())
+		if toolCallID != "" {
+			ids = appendUniqueStrings(ids, toolCallID)
+		}
+		return true
+	})
+	return ids
+}
+
+func applyAuggieConversationState(translated []byte, state auggieConversationState) ([]byte, error) {
+	var err error
+	translated, err = sjson.SetBytes(translated, "conversation_id", state.ConversationID)
+	if err != nil {
+		return nil, err
+	}
+	translated, err = sjson.SetBytes(translated, "turn_id", state.TurnID)
+	if err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(state.ParentConversationID) != "" {
+		translated, err = sjson.SetBytes(translated, "parent_conversation_id", state.ParentConversationID)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if strings.TrimSpace(state.RootConversationID) != "" {
+		translated, err = sjson.SetBytes(translated, "root_conversation_id", state.RootConversationID)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return translated, nil
+}
+
+func updateAuggieConversationStateFromPayload(state *auggieConversationState, payload []byte) {
+	if state == nil {
+		return
+	}
+	if got := strings.TrimSpace(gjson.GetBytes(payload, "conversation_id").String()); got != "" {
+		state.ConversationID = got
+	}
+	if got := strings.TrimSpace(gjson.GetBytes(payload, "turn_id").String()); got != "" {
+		state.TurnID = got
+	}
+	if got := strings.TrimSpace(gjson.GetBytes(payload, "parent_conversation_id").String()); got != "" {
+		state.ParentConversationID = got
+	}
+	if got := strings.TrimSpace(gjson.GetBytes(payload, "root_conversation_id").String()); got != "" {
+		state.RootConversationID = got
+	}
+}
+
+func openAIToolCallIDsFromChunk(chunk []byte) []string {
+	toolCalls := gjson.GetBytes(chunk, "choices.0.delta.tool_calls")
+	if !toolCalls.Exists() || !toolCalls.IsArray() {
+		return nil
+	}
+
+	var ids []string
+	toolCalls.ForEach(func(_, toolCall gjson.Result) bool {
+		toolCallID := strings.TrimSpace(toolCall.Get("id").String())
+		if toolCallID != "" {
+			ids = appendUniqueStrings(ids, toolCallID)
+		}
+		return true
+	})
+	return ids
+}
+
+func appendUniqueStrings(dst []string, values ...string) []string {
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		exists := false
+		for _, existing := range dst {
+			if existing == value {
+				exists = true
+				break
+			}
+		}
+		if !exists {
+			dst = append(dst, value)
+		}
+	}
+	return dst
 }
 
 func buildAuggieBridgeToOpenAIRequest(req cliproxyexecutor.Request, opts cliproxyexecutor.Options, from sdktranslator.Format, stream bool) (cliproxyexecutor.Request, []byte) {

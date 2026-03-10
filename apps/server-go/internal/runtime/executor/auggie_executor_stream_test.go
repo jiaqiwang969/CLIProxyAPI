@@ -129,6 +129,233 @@ func TestAuggieExecute_AggregatesTranslatedStreamIntoOpenAIResponse(t *testing.T
 	}
 }
 
+func TestAuggieExecute_OpenAIChatCompletionToolLoopCompletes(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read body: %v", err)
+		}
+		if got := gjson.GetBytes(body, "nodes.0.tool_result_node.tool_use_id").String(); got != "call_chat_1" {
+			t.Fatalf("tool_use_id = %q, want call_chat_1; body=%s", got, body)
+		}
+		if got := gjson.GetBytes(body, "nodes.0.tool_result_node.content").String(); got != "{\"temperature\":23}" {
+			t.Fatalf("tool_result content = %q, want {\"temperature\":23}; body=%s", got, body)
+		}
+
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		flusher, _ := w.(http.Flusher)
+		_, _ = fmt.Fprintln(w, `{"text":"The temperature is 23C","stop_reason":"end_turn"}`)
+		flusher.Flush()
+	}))
+	defer server.Close()
+
+	resp, err := executeAuggieNonStreamWithPayloadForTest(t, context.Background(), newAuggieStreamTestAuth("token-1"), server.URL, `{
+		"messages":[
+			{"role":"user","content":"Weather in Shanghai?"},
+			{"role":"assistant","tool_calls":[{"id":"call_chat_1","type":"function","function":{"name":"get_weather","arguments":"{\"location\":\"Shanghai\"}"}}]},
+			{"role":"tool","tool_call_id":"call_chat_1","content":"{\"temperature\":23}"}
+		],
+		"tools":[{"type":"function","function":{"name":"get_weather","parameters":{"type":"object","properties":{"location":{"type":"string"}},"required":["location"]}}}]
+	}`)
+	if err != nil {
+		t.Fatalf("Execute error: %v", err)
+	}
+	if got := gjson.GetBytes(resp.Payload, "choices.0.message.content").String(); got != "The temperature is 23C" {
+		t.Fatalf("message.content = %q, want The temperature is 23C; payload=%s", got, resp.Payload)
+	}
+	if got := gjson.GetBytes(resp.Payload, "choices.0.finish_reason").String(); got != "stop" {
+		t.Fatalf("finish_reason = %q, want stop; payload=%s", got, resp.Payload)
+	}
+}
+
+func TestAuggieExecute_OpenAIChatCompletionToolLoopRestoresConversationState(t *testing.T) {
+	attempts := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read body: %v", err)
+		}
+
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		flusher, _ := w.(http.Flusher)
+		switch attempts {
+		case 1:
+			if gjson.GetBytes(body, "conversation_id").Exists() {
+				t.Fatalf("first request must not include conversation_id; body=%s", body)
+			}
+			if gjson.GetBytes(body, "turn_id").Exists() {
+				t.Fatalf("first request must not include turn_id; body=%s", body)
+			}
+			_, _ = fmt.Fprintln(w, `{"conversation_id":"conv-chat-1","turn_id":"turn-chat-1","nodes":[{"tool_use":{"id":"call_chat_state_1","name":"get_weather","input":{"location":"Boston"}}}],"stop_reason":"tool_use"}`)
+			flusher.Flush()
+		case 2:
+			if got := gjson.GetBytes(body, "conversation_id").String(); got != "conv-chat-1" {
+				t.Fatalf("conversation_id = %q, want conv-chat-1; body=%s", got, body)
+			}
+			if got := gjson.GetBytes(body, "turn_id").String(); got != "turn-chat-1" {
+				t.Fatalf("turn_id = %q, want turn-chat-1; body=%s", got, body)
+			}
+			if got := gjson.GetBytes(body, "nodes.0.tool_result_node.tool_use_id").String(); got != "call_chat_state_1" {
+				t.Fatalf("tool_use_id = %q, want call_chat_state_1; body=%s", got, body)
+			}
+			if got := gjson.GetBytes(body, "nodes.0.tool_result_node.content").String(); got != "{\"temperature\":7,\"condition\":\"Cloudy\"}" {
+				t.Fatalf("tool_result content = %q, want weather payload; body=%s", got, body)
+			}
+			_, _ = fmt.Fprintln(w, `{"conversation_id":"conv-chat-1","turn_id":"turn-chat-2","text":"Boston is 7C and cloudy.","stop_reason":"end_turn"}`)
+			flusher.Flush()
+		default:
+			t.Fatalf("unexpected attempt %d", attempts)
+		}
+	}))
+	defer server.Close()
+
+	firstResp, err := executeAuggieNonStreamWithPayloadForTest(t, context.Background(), newAuggieStreamTestAuth("token-1"), server.URL, `{
+		"messages":[
+			{"role":"user","content":"What is the weather in Boston? Please use the weather tool."}
+		],
+		"tools":[{"type":"function","function":{"name":"get_weather","parameters":{"type":"object","properties":{"location":{"type":"string"}},"required":["location"]}}}]
+	}`)
+	if err != nil {
+		t.Fatalf("first Execute error: %v", err)
+	}
+	if got := gjson.GetBytes(firstResp.Payload, "choices.0.finish_reason").String(); got != "tool_calls" {
+		t.Fatalf("first finish_reason = %q, want tool_calls; payload=%s", got, firstResp.Payload)
+	}
+
+	toolCalls := gjson.GetBytes(firstResp.Payload, "choices.0.message.tool_calls")
+	if !toolCalls.Exists() || !toolCalls.IsArray() || len(toolCalls.Array()) != 1 {
+		t.Fatalf("first response missing tool_calls: %s", firstResp.Payload)
+	}
+	toolCallID := toolCalls.Get("0.id").String()
+	if toolCallID != "call_chat_state_1" {
+		t.Fatalf("tool_call_id = %q, want call_chat_state_1; payload=%s", toolCallID, firstResp.Payload)
+	}
+
+	secondPayload := fmt.Sprintf(`{
+		"messages":[
+			{"role":"user","content":"What is the weather in Boston? Please use the weather tool."},
+			{"role":"assistant","tool_calls":[{"id":"%s","type":"function","function":{"name":"get_weather","arguments":"{\"location\":\"Boston\"}"}}]},
+			{"role":"tool","tool_call_id":"%s","content":"{\"temperature\":7,\"condition\":\"Cloudy\"}"}
+		],
+		"tools":[{"type":"function","function":{"name":"get_weather","parameters":{"type":"object","properties":{"location":{"type":"string"}},"required":["location"]}}}]
+	}`, toolCallID, toolCallID)
+	secondResp, err := executeAuggieNonStreamWithPayloadForTest(t, context.Background(), newAuggieStreamTestAuth("token-1"), server.URL, secondPayload)
+	if err != nil {
+		t.Fatalf("second Execute error: %v", err)
+	}
+	if got := gjson.GetBytes(secondResp.Payload, "choices.0.message.content").String(); got != "Boston is 7C and cloudy." {
+		t.Fatalf("message.content = %q, want Boston is 7C and cloudy.; payload=%s", got, secondResp.Payload)
+	}
+	if got := gjson.GetBytes(secondResp.Payload, "choices.0.finish_reason").String(); got != "stop" {
+		t.Fatalf("finish_reason = %q, want stop; payload=%s", got, secondResp.Payload)
+	}
+}
+
+func TestAuggieResponses_WebSearchCompletesViaRemoteToolBridge(t *testing.T) {
+	chatStreamCalls := 0
+	listRemoteToolsCalls := 0
+	runRemoteToolCalls := 0
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read body: %v", err)
+		}
+
+		switch r.URL.Path {
+		case "/chat-stream":
+			chatStreamCalls++
+			w.Header().Set("Content-Type", "application/x-ndjson")
+			flusher, _ := w.(http.Flusher)
+
+			switch chatStreamCalls {
+			case 1:
+				if got := gjson.GetBytes(body, "tool_definitions.#").Int(); got != 1 {
+					t.Fatalf("tool_definitions length = %d, want 1; body=%s", got, body)
+				}
+				if got := gjson.GetBytes(body, "tool_definitions.0.name").String(); got != "web-search" {
+					t.Fatalf("tool_definitions.0.name = %q, want web-search; body=%s", got, body)
+				}
+				_, _ = fmt.Fprintln(w, `{"conversation_id":"conv-web-1","turn_id":"turn-web-1","text":"","nodes":[{"tool_use":{"tool_use_id":"call_web_1","tool_name":"web-search","input_json":"{\"query\":\"OpenAI latest news\",\"num_results\":1}","is_partial":false}}]}`)
+				flusher.Flush()
+				_, _ = fmt.Fprintln(w, `{"conversation_id":"conv-web-1","turn_id":"turn-web-1","text":"","stop_reason":"tool_use"}`)
+				flusher.Flush()
+			case 2:
+				if got := gjson.GetBytes(body, "conversation_id").String(); got != "conv-web-1" {
+					t.Fatalf("conversation_id = %q, want conv-web-1; body=%s", got, body)
+				}
+				if got := gjson.GetBytes(body, "turn_id").String(); got != "turn-web-1" {
+					t.Fatalf("turn_id = %q, want turn-web-1; body=%s", got, body)
+				}
+				if got := gjson.GetBytes(body, "nodes.0.tool_result_node.tool_use_id").String(); got != "call_web_1" {
+					t.Fatalf("tool_use_id = %q, want call_web_1; body=%s", got, body)
+				}
+				if got := gjson.GetBytes(body, "nodes.0.tool_result_node.content").String(); !strings.Contains(got, "OpenAI News") {
+					t.Fatalf("tool_result content = %q, want OpenAI News; body=%s", got, body)
+				}
+				_, _ = fmt.Fprintln(w, `{"conversation_id":"conv-web-1","turn_id":"turn-web-2","text":"Top headline: OpenAI News","stop_reason":"end_turn"}`)
+				flusher.Flush()
+			default:
+				t.Fatalf("unexpected /chat-stream call %d", chatStreamCalls)
+			}
+
+		case "/agents/list-remote-tools":
+			listRemoteToolsCalls++
+			if got := gjson.GetBytes(body, "tool_id_list.tool_ids.#").Int(); got == 0 {
+				t.Fatalf("tool_id_list.tool_ids missing; body=%s", body)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprintln(w, `{"tools":[{"remote_tool_id":1,"availability_status":1,"tool_safety":1,"tool_definition":{"name":"web-search"}}]}`)
+
+		case "/agents/run-remote-tool":
+			runRemoteToolCalls++
+			if got := gjson.GetBytes(body, "tool_name").String(); got != "web-search" {
+				t.Fatalf("tool_name = %q, want web-search; body=%s", got, body)
+			}
+			if got := gjson.GetBytes(body, "tool_id").Int(); got != 1 {
+				t.Fatalf("tool_id = %d, want 1; body=%s", got, body)
+			}
+			if got := gjson.GetBytes(body, "tool_input_json").String(); !strings.Contains(got, "OpenAI latest news") {
+				t.Fatalf("tool_input_json = %q, want OpenAI latest news; body=%s", got, body)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprintln(w, `{"tool_output":"- [OpenAI News](https://openai.com/news/)","tool_result_message":"","is_error":false,"status":1}`)
+
+		default:
+			t.Fatalf("unexpected path %q body=%s", r.URL.Path, body)
+		}
+	}))
+	defer server.Close()
+
+	resp, err := executeAuggieResponsesNonStreamWithPayloadForTest(t, context.Background(), newAuggieStreamTestAuth("token-1"), server.URL, `{
+		"model":"gpt-5.4",
+		"input":[
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"Find the latest OpenAI news"}]}
+		],
+		"tools":[{"type":"web_search","search_context_size":"high"}]
+	}`)
+	if err != nil {
+		t.Fatalf("Execute error: %v", err)
+	}
+
+	if chatStreamCalls != 2 {
+		t.Fatalf("chatStreamCalls = %d, want 2", chatStreamCalls)
+	}
+	if listRemoteToolsCalls != 1 {
+		t.Fatalf("listRemoteToolsCalls = %d, want 1", listRemoteToolsCalls)
+	}
+	if runRemoteToolCalls != 1 {
+		t.Fatalf("runRemoteToolCalls = %d, want 1", runRemoteToolCalls)
+	}
+	if got := gjson.GetBytes(resp.Payload, `output.#(type=="message").content.0.text`).String(); got != "Top headline: OpenAI News" {
+		t.Fatalf("message output text = %q, want Top headline: OpenAI News; payload=%s", got, resp.Payload)
+	}
+	if got := gjson.GetBytes(resp.Payload, `output.#(type=="function_call")#`).Int(); got != 0 {
+		t.Fatalf("function_call outputs = %d, want 0; payload=%s", got, resp.Payload)
+	}
+}
+
 func TestAuggieExecute_AggregatesTranslatedStreamIntoOpenAIResponsesResponse(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/chat-stream" {
@@ -185,6 +412,695 @@ func TestAuggieExecute_AggregatesTranslatedStreamIntoOpenAIResponsesResponse(t *
 	}
 	if got := gjson.GetBytes(resp.Payload, `output.#(type=="message").content.0.text`).String(); got != "hello world" {
 		t.Fatalf("message output text = %q, want hello world", got)
+	}
+}
+
+func TestAuggieExecute_AggregatesReasoningIntoOpenAIResponsesResponse(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		flusher, _ := w.(http.Flusher)
+		_, _ = fmt.Fprintln(w, `{"text":"","nodes":[{"id":1,"type":9,"thinking":{"content":"I should inspect the tool result first."}}]}`)
+		flusher.Flush()
+		_, _ = fmt.Fprintln(w, `{"text":"All set","stop_reason":"end_turn"}`)
+		flusher.Flush()
+	}))
+	defer server.Close()
+
+	resp, err := executeAuggieResponsesNonStreamForTest(t, context.Background(), newAuggieStreamTestAuth("token-1"), server.URL)
+	if err != nil {
+		t.Fatalf("Execute error: %v", err)
+	}
+
+	if got := gjson.GetBytes(resp.Payload, `output.#(type=="reasoning").summary.0.text`).String(); got != "I should inspect the tool result first." {
+		t.Fatalf("reasoning summary text = %q, want thinking text; payload=%s", got, resp.Payload)
+	}
+	if got := gjson.GetBytes(resp.Payload, `output.#(type=="message").content.0.text`).String(); got != "All set" {
+		t.Fatalf("message output text = %q, want All set; payload=%s", got, resp.Payload)
+	}
+}
+
+func TestAuggieExecute_AggregatesReasoningItemIDIntoOpenAIChatCompletionResponse(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		flusher, _ := w.(http.Flusher)
+		_, _ = fmt.Fprintln(w, `{"text":"","nodes":[{"id":1,"type":9,"thinking":{"content":"I should inspect the tool result first.","openai_responses_api_item_id":"rs_native_resp_1"}}]}`)
+		flusher.Flush()
+		_, _ = fmt.Fprintln(w, `{"text":"All set","stop_reason":"end_turn"}`)
+		flusher.Flush()
+	}))
+	defer server.Close()
+
+	resp, err := executeAuggieNonStreamForTest(t, context.Background(), newAuggieStreamTestAuth("token-1"), server.URL)
+	if err != nil {
+		t.Fatalf("Execute error: %v", err)
+	}
+
+	if got := gjson.GetBytes(resp.Payload, "choices.0.message.reasoning_item_id").String(); got != "rs_native_resp_1" {
+		t.Fatalf("reasoning_item_id = %q, want rs_native_resp_1; payload=%s", got, resp.Payload)
+	}
+}
+
+func TestAuggieExecute_AggregatesEncryptedReasoningIntoOpenAIResponsesResponseWhenIncluded(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		flusher, _ := w.(http.Flusher)
+		_, _ = fmt.Fprintln(w, `{"text":"","nodes":[{"id":1,"type":9,"thinking":{"content":"I should inspect the tool result first.","encrypted_content":"enc:auggie:resp-1"}}]}`)
+		flusher.Flush()
+		_, _ = fmt.Fprintln(w, `{"text":"All set","stop_reason":"end_turn"}`)
+		flusher.Flush()
+	}))
+	defer server.Close()
+
+	resp, err := executeAuggieResponsesNonStreamWithPayloadForTest(t, context.Background(), newAuggieStreamTestAuth("token-1"), server.URL, `{
+		"model":"gpt-5.4",
+		"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}],
+		"include":["reasoning.encrypted_content"]
+	}`)
+	if err != nil {
+		t.Fatalf("Execute error: %v", err)
+	}
+
+	if got := gjson.GetBytes(resp.Payload, `output.#(type=="reasoning").summary.0.text`).String(); got != "I should inspect the tool result first." {
+		t.Fatalf("reasoning summary text = %q, want thinking text; payload=%s", got, resp.Payload)
+	}
+	if got := gjson.GetBytes(resp.Payload, `output.#(type=="reasoning").encrypted_content`).String(); got != "enc:auggie:resp-1" {
+		t.Fatalf("reasoning encrypted_content = %q, want enc:auggie:resp-1; payload=%s", got, resp.Payload)
+	}
+}
+
+func TestValidateAuggieResponsesInputItemTypes_RejectsItemReferenceWithGuidance(t *testing.T) {
+	err := validateAuggieResponsesInputItemTypes([]byte(`{"input":[{"type":"item_reference","id":"rs_native_1"}]}`))
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "item_reference") {
+		t.Fatalf("error = %q, want item_reference guidance", err.Error())
+	}
+	if !strings.Contains(err.Error(), "previous_response_id") {
+		t.Fatalf("error = %q, want previous_response_id guidance", err.Error())
+	}
+}
+
+func TestValidateAuggieResponsesInputItemTypes_RejectsReasoningItemWithGuidance(t *testing.T) {
+	err := validateAuggieResponsesInputItemTypes([]byte(`{"input":[{"type":"reasoning","id":"rs_native_1","encrypted_content":"enc:reasoning:1"}]}`))
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "reasoning") {
+		t.Fatalf("error = %q, want reasoning guidance", err.Error())
+	}
+	if !strings.Contains(err.Error(), "previous_response_id") {
+		t.Fatalf("error = %q, want previous_response_id guidance", err.Error())
+	}
+}
+
+func TestValidateAuggieResponsesIncludeSupport_RejectsItemReferenceContent(t *testing.T) {
+	err := validateAuggieResponsesIncludeSupport([]byte(`{"include":["item_reference.content"]}`))
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "item_reference.content") {
+		t.Fatalf("error = %q, want item_reference.content", err.Error())
+	}
+}
+
+func TestAuggieResponses_UsesStoredConversationStateForPreviousResponseID(t *testing.T) {
+	attempts := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read body: %v", err)
+		}
+
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		flusher, _ := w.(http.Flusher)
+		switch attempts {
+		case 1:
+			if gjson.GetBytes(body, "conversation_id").Exists() {
+				t.Fatalf("first request must not include conversation_id; body=%s", body)
+			}
+			_, _ = fmt.Fprintln(w, `{"conversation_id":"conv-prev-1","turn_id":"turn-prev-1","nodes":[{"tool_use":{"id":"call_prev_1","name":"get_weather","input":{"location":"Shanghai"}}}],"stop_reason":"tool_use"}`)
+			flusher.Flush()
+		case 2:
+			if got := gjson.GetBytes(body, "conversation_id").String(); got != "conv-prev-1" {
+				t.Fatalf("conversation_id = %q, want conv-prev-1; body=%s", got, body)
+			}
+			if got := gjson.GetBytes(body, "turn_id").String(); got != "turn-prev-1" {
+				t.Fatalf("turn_id = %q, want turn-prev-1; body=%s", got, body)
+			}
+			if got := gjson.GetBytes(body, "nodes.0.tool_result_node.tool_use_id").String(); got != "call_prev_1" {
+				t.Fatalf("tool_use_id = %q, want call_prev_1; body=%s", got, body)
+			}
+			if got := gjson.GetBytes(body, "nodes.0.tool_result_node.content").String(); got != "{\"temperature\":23}" {
+				t.Fatalf("tool_result content = %q, want {\"temperature\":23}; body=%s", got, body)
+			}
+			_, _ = fmt.Fprintln(w, `{"conversation_id":"conv-prev-1","turn_id":"turn-prev-2","text":"The temperature is 23C","stop_reason":"end_turn"}`)
+			flusher.Flush()
+		default:
+			t.Fatalf("unexpected attempt %d", attempts)
+		}
+	}))
+	defer server.Close()
+
+	firstPayload := `{
+		"model":"gpt-5.4",
+		"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"Weather in Shanghai?"}]}],
+		"tools":[{"type":"function","name":"get_weather","parameters":{"type":"object","properties":{"location":{"type":"string"}},"required":["location"]}}]
+	}`
+	firstResp, err := executeAuggieResponsesNonStreamWithPayloadForTest(t, context.Background(), newAuggieStreamTestAuth("token-1"), server.URL, firstPayload)
+	if err != nil {
+		t.Fatalf("first Execute error: %v", err)
+	}
+	responseID := gjson.GetBytes(firstResp.Payload, "id").String()
+	if responseID == "" {
+		t.Fatalf("first response missing id: %s", firstResp.Payload)
+	}
+
+	secondPayload := fmt.Sprintf(`{
+		"model":"gpt-5.4",
+		"previous_response_id":"%s",
+		"input":[{"type":"function_call_output","call_id":"call_prev_1","output":"{\"temperature\":23}"}],
+		"tools":[{"type":"function","name":"get_weather","parameters":{"type":"object","properties":{"location":{"type":"string"}},"required":["location"]}}]
+	}`, responseID)
+	secondResp, err := executeAuggieResponsesNonStreamWithPayloadForTest(t, context.Background(), newAuggieStreamTestAuth("token-1"), server.URL, secondPayload)
+	if err != nil {
+		t.Fatalf("second Execute error: %v", err)
+	}
+	if got := gjson.GetBytes(secondResp.Payload, `output.#(type=="message").content.0.text`).String(); got != "The temperature is 23C" {
+		t.Fatalf("message output text = %q, want The temperature is 23C; payload=%s", got, secondResp.Payload)
+	}
+}
+
+func TestAuggieResponses_ReturnsOpenAIErrorWhenPreviousResponseIDIsUnknown(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatalf("unexpected upstream request for unknown previous_response_id")
+	}))
+	defer server.Close()
+
+	_, err := executeAuggieResponsesNonStreamWithPayloadForTest(t, context.Background(), newAuggieStreamTestAuth("token-1"), server.URL, `{
+		"model":"gpt-5.4",
+		"previous_response_id":"resp_missing_prev",
+		"input":[{"type":"function_call_output","call_id":"call_missing","output":"{\"temperature\":23}"}]
+	}`)
+	if err == nil {
+		t.Fatal("expected error for unknown previous_response_id")
+	}
+	statusCoder, ok := err.(interface{ StatusCode() int })
+	if !ok {
+		t.Fatalf("error does not expose status code: %T %v", err, err)
+	}
+	if got := statusCoder.StatusCode(); got != http.StatusBadRequest {
+		t.Fatalf("status code = %d, want %d; err=%v", got, http.StatusBadRequest, err)
+	}
+	if !strings.Contains(err.Error(), "previous_response_id") {
+		t.Fatalf("error = %q, want mention of previous_response_id", err.Error())
+	}
+}
+
+func TestAuggieResponses_FullInlineToolLoopCompletes(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read body: %v", err)
+		}
+		if got := gjson.GetBytes(body, "nodes.0.tool_result_node.tool_use_id").String(); got != "call_inline_1" {
+			t.Fatalf("tool_use_id = %q, want call_inline_1; body=%s", got, body)
+		}
+		if got := gjson.GetBytes(body, "nodes.0.tool_result_node.content").String(); got != "{\"temperature\":23}" {
+			t.Fatalf("tool_result content = %q, want {\"temperature\":23}; body=%s", got, body)
+		}
+
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		flusher, _ := w.(http.Flusher)
+		_, _ = fmt.Fprintln(w, `{"text":"The temperature is 23C","stop_reason":"end_turn"}`)
+		flusher.Flush()
+	}))
+	defer server.Close()
+
+	resp, err := executeAuggieResponsesNonStreamWithPayloadForTest(t, context.Background(), newAuggieStreamTestAuth("token-1"), server.URL, `{
+		"model":"gpt-5.4",
+		"input":[
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"Weather in Shanghai?"}]},
+			{"type":"function_call","call_id":"call_inline_1","name":"get_weather","arguments":"{\"location\":\"Shanghai\"}"},
+			{"type":"function_call_output","call_id":"call_inline_1","output":"{\"temperature\":23}"}
+		],
+		"tools":[{"type":"function","name":"get_weather","parameters":{"type":"object","properties":{"location":{"type":"string"}},"required":["location"]}}]
+	}`)
+	if err != nil {
+		t.Fatalf("Execute error: %v", err)
+	}
+	if got := gjson.GetBytes(resp.Payload, `output.#(type=="message").content.0.text`).String(); got != "The temperature is 23C" {
+		t.Fatalf("message output text = %q, want The temperature is 23C; payload=%s", got, resp.Payload)
+	}
+	if got := gjson.GetBytes(resp.Payload, `output.#(type=="function_call")#`).Int(); got != 0 {
+		t.Fatalf("function_call outputs = %d, want 0; payload=%s", got, resp.Payload)
+	}
+}
+
+func TestAuggieResponses_ReturnsOpenAIErrorForUnsupportedToolType(t *testing.T) {
+	for _, toolType := range []string{"custom"} {
+		t.Run(toolType, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				t.Fatalf("unexpected upstream request for unsupported tool type %q", toolType)
+			}))
+			defer server.Close()
+
+			_, err := executeAuggieResponsesNonStreamWithPayloadForTest(t, context.Background(), newAuggieStreamTestAuth("token-1"), server.URL, fmt.Sprintf(`{
+				"model":"gpt-5.4",
+				"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}],
+				"tools":[{"type":"%s","name":"tool_1","description":"test tool"}]
+			}`, toolType))
+			if err == nil {
+				t.Fatalf("expected error for unsupported tool type %q", toolType)
+			}
+			statusCoder, ok := err.(interface{ StatusCode() int })
+			if !ok {
+				t.Fatalf("error does not expose status code: %T %v", err, err)
+			}
+			if got := statusCoder.StatusCode(); got != http.StatusBadRequest {
+				t.Fatalf("status code = %d, want %d; err=%v", got, http.StatusBadRequest, err)
+			}
+			if !strings.Contains(err.Error(), "tools[0].type") || !strings.Contains(err.Error(), toolType) {
+				t.Fatalf("error = %q, want mention of tools[0].type and %q", err.Error(), toolType)
+			}
+		})
+	}
+}
+
+func TestAuggieResponses_ReturnsOpenAIErrorForUnsupportedInputItemType(t *testing.T) {
+	testCases := []struct {
+		name          string
+		inputItemJSON string
+	}{
+		{
+			name:          "custom_tool_call",
+			inputItemJSON: `{"type":"custom_tool_call","call_id":"custom-call-1","name":"bash","input":"ls"}`,
+		},
+		{
+			name:          "custom_tool_call_output",
+			inputItemJSON: `{"type":"custom_tool_call_output","call_id":"custom-call-1","output":"file1\nfile2"}`,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				t.Fatalf("unexpected upstream request for unsupported input item type %q", tc.name)
+			}))
+			defer server.Close()
+
+			payload := fmt.Sprintf(`{
+				"model":"gpt-5.4",
+				"input":[%s]
+			}`, tc.inputItemJSON)
+			_, err := executeAuggieResponsesNonStreamWithPayloadForTest(t, context.Background(), newAuggieStreamTestAuth("token-1"), server.URL, payload)
+			if err == nil {
+				t.Fatalf("expected error for unsupported input item type %q", tc.name)
+			}
+			statusCoder, ok := err.(interface{ StatusCode() int })
+			if !ok {
+				t.Fatalf("error does not expose status code: %T %v", err, err)
+			}
+			if got := statusCoder.StatusCode(); got != http.StatusBadRequest {
+				t.Fatalf("status code = %d, want %d; err=%v", got, http.StatusBadRequest, err)
+			}
+			if !strings.Contains(err.Error(), `input[0].type`) || !strings.Contains(err.Error(), tc.name) {
+				t.Fatalf("error = %q, want mention of input[0].type and %q", err.Error(), tc.name)
+			}
+		})
+	}
+}
+
+func TestAuggieResponses_AllowsStoreTrue(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read body: %v", err)
+		}
+		if gjson.GetBytes(body, "store").Exists() {
+			t.Fatalf("translated Auggie request must not forward store field upstream; body=%s", body)
+		}
+
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		flusher, _ := w.(http.Flusher)
+		_, _ = fmt.Fprintln(w, `{"text":"stored hello","stop_reason":"end_turn"}`)
+		flusher.Flush()
+	}))
+	defer server.Close()
+
+	resp, err := executeAuggieResponsesNonStreamWithPayloadForTest(t, context.Background(), newAuggieStreamTestAuth("token-1"), server.URL, `{
+		"model":"gpt-5.4",
+		"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}],
+		"store":true
+	}`)
+	if err != nil {
+		t.Fatalf("unexpected error for store=true: %v", err)
+	}
+	if got := gjson.GetBytes(resp.Payload, "store"); !got.Exists() || !got.Bool() {
+		t.Fatalf("response store = %s, want true; payload=%s", got.Raw, resp.Payload)
+	}
+}
+
+func TestAuggieResponses_AllowsSupportedInclude(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read body: %v", err)
+		}
+		if gjson.GetBytes(body, "include").Exists() {
+			t.Fatalf("translated Auggie request must not forward include upstream; body=%s", body)
+		}
+
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		flusher, _ := w.(http.Flusher)
+		_, _ = fmt.Fprintln(w, `{"text":"hello","stop_reason":"end_turn"}`)
+		flusher.Flush()
+	}))
+	defer server.Close()
+
+	resp, err := executeAuggieResponsesNonStreamWithPayloadForTest(t, context.Background(), newAuggieStreamTestAuth("token-1"), server.URL, `{
+		"model":"gpt-5.4",
+		"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}],
+		"include":["reasoning.encrypted_content","message.output_text.logprobs"]
+	}`)
+	if err != nil {
+		t.Fatalf("unexpected error for supported include: %v", err)
+	}
+	if got := gjson.GetBytes(resp.Payload, "output.0.content.0.text").String(); got != "hello" {
+		t.Fatalf("response output text = %q, want hello; payload=%s", got, resp.Payload)
+	}
+}
+
+func TestAuggieResponses_AllowsAdditionalDocumentedIncludeValues(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read body: %v", err)
+		}
+		if gjson.GetBytes(body, "include").Exists() {
+			t.Fatalf("translated Auggie request must not forward include upstream; body=%s", body)
+		}
+
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		flusher, _ := w.(http.Flusher)
+		_, _ = fmt.Fprintln(w, `{"text":"hello","stop_reason":"end_turn"}`)
+		flusher.Flush()
+	}))
+	defer server.Close()
+
+	resp, err := executeAuggieResponsesNonStreamWithPayloadForTest(t, context.Background(), newAuggieStreamTestAuth("token-1"), server.URL, `{
+		"model":"gpt-5.4",
+		"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}],
+		"include":["web_search_call.results","web_search_call.action.sources","code_interpreter_call.outputs"]
+	}`)
+	if err != nil {
+		t.Fatalf("unexpected error for additional documented include values: %v", err)
+	}
+	if got := gjson.GetBytes(resp.Payload, "output.0.content.0.text").String(); got != "hello" {
+		t.Fatalf("response output text = %q, want hello; payload=%s", got, resp.Payload)
+	}
+}
+
+func TestAuggieResponses_ReturnsOpenAIErrorForUnsupportedIncludeValue(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("unexpected upstream request when include value is unsupported")
+	}))
+	defer server.Close()
+
+	_, err := executeAuggieResponsesNonStreamWithPayloadForTest(t, context.Background(), newAuggieStreamTestAuth("token-1"), server.URL, `{
+		"model":"gpt-5.4",
+		"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}],
+		"include":["unsupported.include"]
+	}`)
+	if err == nil {
+		t.Fatal("expected error for unsupported include value")
+	}
+	statusCoder, ok := err.(interface{ StatusCode() int })
+	if !ok {
+		t.Fatalf("error does not expose status code: %T %v", err, err)
+	}
+	if got := statusCoder.StatusCode(); got != http.StatusBadRequest {
+		t.Fatalf("status code = %d, want %d; err=%v", got, http.StatusBadRequest, err)
+	}
+	if !strings.Contains(err.Error(), "unsupported.include") {
+		t.Fatalf("error = %q, want mention of unsupported.include", err.Error())
+	}
+}
+
+func TestAuggieExecute_OpenAIReturnsOpenAIErrorForUnsupportedToolType(t *testing.T) {
+	for _, toolType := range []string{"custom", "web_search"} {
+		t.Run(toolType, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				t.Fatalf("unexpected upstream request for unsupported tool type %q", toolType)
+			}))
+			defer server.Close()
+
+			_, err := executeAuggieNonStreamWithPayloadForTest(t, context.Background(), newAuggieStreamTestAuth("token-1"), server.URL, fmt.Sprintf(`{
+				"messages":[{"role":"user","content":"hello"}],
+				"tools":[{"type":"%s","name":"tool_1","description":"test tool"}]
+			}`, toolType))
+			if err == nil {
+				t.Fatalf("expected error for unsupported tool type %q", toolType)
+			}
+			statusCoder, ok := err.(interface{ StatusCode() int })
+			if !ok {
+				t.Fatalf("error does not expose status code: %T %v", err, err)
+			}
+			if got := statusCoder.StatusCode(); got != http.StatusBadRequest {
+				t.Fatalf("status code = %d, want %d; err=%v", got, http.StatusBadRequest, err)
+			}
+			if !strings.Contains(err.Error(), "tools[0].type") || !strings.Contains(err.Error(), toolType) {
+				t.Fatalf("error = %q, want mention of tools[0].type and %q", err.Error(), toolType)
+			}
+		})
+	}
+}
+
+func TestAuggieExecute_OpenAIReturnsOpenAIErrorForUnsupportedToolChoice(t *testing.T) {
+	testCases := []struct {
+		name           string
+		toolChoiceJSON string
+	}{
+		{name: "required", toolChoiceJSON: `"required"`},
+		{name: "function_object", toolChoiceJSON: `{"type":"function","function":{"name":"get_weather"}}`},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				t.Fatalf("unexpected upstream request for unsupported tool_choice %q", tc.name)
+			}))
+			defer server.Close()
+
+			payload := fmt.Sprintf(`{
+				"messages":[{"role":"user","content":"hello"}],
+				"tools":[{"type":"function","function":{"name":"get_weather","parameters":{"type":"object","properties":{"location":{"type":"string"}}}}}],
+				"tool_choice":%s
+			}`, tc.toolChoiceJSON)
+			_, err := executeAuggieNonStreamWithPayloadForTest(t, context.Background(), newAuggieStreamTestAuth("token-1"), server.URL, payload)
+			if err == nil {
+				t.Fatalf("expected error for unsupported tool_choice %q", tc.name)
+			}
+			statusCoder, ok := err.(interface{ StatusCode() int })
+			if !ok {
+				t.Fatalf("error does not expose status code: %T %v", err, err)
+			}
+			if got := statusCoder.StatusCode(); got != http.StatusBadRequest {
+				t.Fatalf("status code = %d, want %d; err=%v", got, http.StatusBadRequest, err)
+			}
+			if !strings.Contains(err.Error(), "tool_choice") {
+				t.Fatalf("error = %q, want mention of tool_choice", err.Error())
+			}
+		})
+	}
+}
+
+func TestAuggieExecute_OpenAIAllowsStoreTrue(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read body: %v", err)
+		}
+		if gjson.GetBytes(body, "store").Exists() {
+			t.Fatalf("translated Auggie request must not forward store field upstream; body=%s", body)
+		}
+
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		flusher, _ := w.(http.Flusher)
+		_, _ = fmt.Fprintln(w, `{"text":"hello","stop_reason":"end_turn"}`)
+		flusher.Flush()
+	}))
+	defer server.Close()
+
+	resp, err := executeAuggieNonStreamWithPayloadForTest(t, context.Background(), newAuggieStreamTestAuth("token-1"), server.URL, `{
+		"messages":[{"role":"user","content":"hello"}],
+		"store":true
+	}`)
+	if err != nil {
+		t.Fatalf("unexpected error for store=true: %v", err)
+	}
+	if got := gjson.GetBytes(resp.Payload, "choices.0.message.content").String(); got != "hello" {
+		t.Fatalf("message.content = %q, want hello; payload=%s", got, resp.Payload)
+	}
+}
+
+func TestAuggieExecute_OpenAIReturnsOpenAIErrorForUnsupportedInclude(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("unexpected upstream request when include is unsupported")
+	}))
+	defer server.Close()
+
+	_, err := executeAuggieNonStreamWithPayloadForTest(t, context.Background(), newAuggieStreamTestAuth("token-1"), server.URL, `{
+		"messages":[{"role":"user","content":"hello"}],
+		"include":["reasoning.encrypted_content"]
+	}`)
+	if err == nil {
+		t.Fatal("expected error for unsupported include")
+	}
+	statusCoder, ok := err.(interface{ StatusCode() int })
+	if !ok {
+		t.Fatalf("error does not expose status code: %T %v", err, err)
+	}
+	if got := statusCoder.StatusCode(); got != http.StatusBadRequest {
+		t.Fatalf("status code = %d, want %d; err=%v", got, http.StatusBadRequest, err)
+	}
+	if !strings.Contains(err.Error(), "include") {
+		t.Fatalf("error = %q, want mention of include", err.Error())
+	}
+}
+
+func TestAuggieExecute_OpenAIToolChoiceNoneSuppressesUpstreamTools(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read body: %v", err)
+		}
+		if got := gjson.GetBytes(body, "tool_definitions.#").Int(); got != 0 {
+			t.Fatalf("tool_definitions length = %d, want 0 when tool_choice=none; body=%s", got, body)
+		}
+
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		flusher, _ := w.(http.Flusher)
+		_, _ = fmt.Fprintln(w, `{"text":"hello","stop_reason":"end_turn"}`)
+		flusher.Flush()
+	}))
+	defer server.Close()
+
+	payload := `{
+		"messages":[{"role":"user","content":"hello"}],
+		"tools":[{"type":"function","function":{"name":"get_weather","parameters":{"type":"object","properties":{"location":{"type":"string"}}}}}],
+		"tool_choice":"none"
+	}`
+	resp, err := executeAuggieNonStreamWithPayloadForTest(t, context.Background(), newAuggieStreamTestAuth("token-1"), server.URL, payload)
+	if err != nil {
+		t.Fatalf("execute returned error: %v", err)
+	}
+	if got := gjson.GetBytes(resp.Payload, "choices.0.message.content").String(); got != "hello" {
+		t.Fatalf("choices.0.message.content = %q, want hello; payload=%s", got, resp.Payload)
+	}
+}
+
+func TestAuggieResponses_ReturnsOpenAIErrorForUnsupportedToolChoice(t *testing.T) {
+	testCases := []struct {
+		name           string
+		toolChoiceJSON string
+	}{
+		{name: "required", toolChoiceJSON: `"required"`},
+		{name: "function_object", toolChoiceJSON: `{"type":"function","function":{"name":"get_weather"}}`},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				t.Fatalf("unexpected upstream request for unsupported responses tool_choice %q", tc.name)
+			}))
+			defer server.Close()
+
+			payload := fmt.Sprintf(`{
+				"model":"gpt-5.4",
+				"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}],
+				"tools":[{"type":"function","name":"get_weather","parameters":{"type":"object","properties":{"location":{"type":"string"}}}}],
+				"tool_choice":%s
+			}`, tc.toolChoiceJSON)
+			_, err := executeAuggieResponsesNonStreamWithPayloadForTest(t, context.Background(), newAuggieStreamTestAuth("token-1"), server.URL, payload)
+			if err == nil {
+				t.Fatalf("expected error for unsupported responses tool_choice %q", tc.name)
+			}
+			statusCoder, ok := err.(interface{ StatusCode() int })
+			if !ok {
+				t.Fatalf("error does not expose status code: %T %v", err, err)
+			}
+			if got := statusCoder.StatusCode(); got != http.StatusBadRequest {
+				t.Fatalf("status code = %d, want %d; err=%v", got, http.StatusBadRequest, err)
+			}
+			if !strings.Contains(err.Error(), "tool_choice") {
+				t.Fatalf("error = %q, want mention of tool_choice", err.Error())
+			}
+		})
+	}
+}
+
+func TestAuggieResponses_AllowsBuiltInWebSearchToolChoice(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read body: %v", err)
+		}
+		if got := gjson.GetBytes(body, "tool_definitions.0.name").String(); got != "web-search" {
+			t.Fatalf("tool_definitions.0.name = %q, want web-search; body=%s", got, body)
+		}
+
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		flusher, _ := w.(http.Flusher)
+		_, _ = fmt.Fprintln(w, `{"text":"headline ready","stop_reason":"end_turn"}`)
+		flusher.Flush()
+	}))
+	defer server.Close()
+
+	resp, err := executeAuggieResponsesNonStreamWithPayloadForTest(t, context.Background(), newAuggieStreamTestAuth("token-1"), server.URL, `{
+		"model":"gpt-5.4",
+		"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}],
+		"tools":[{"type":"web_search","search_context_size":"high"}],
+		"tool_choice":{"type":"web_search"}
+	}`)
+	if err != nil {
+		t.Fatalf("unexpected error for built-in web_search tool_choice: %v", err)
+	}
+	if got := gjson.GetBytes(resp.Payload, `output.#(type=="message").content.0.text`).String(); got != "headline ready" {
+		t.Fatalf("message output text = %q, want headline ready; payload=%s", got, resp.Payload)
+	}
+}
+
+func TestAuggieResponses_ToolChoiceNoneSuppressesUpstreamTools(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read body: %v", err)
+		}
+		if got := gjson.GetBytes(body, "tool_definitions.#").Int(); got != 0 {
+			t.Fatalf("tool_definitions length = %d, want 0 when tool_choice=none; body=%s", got, body)
+		}
+
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		flusher, _ := w.(http.Flusher)
+		_, _ = fmt.Fprintln(w, `{"text":"hello","stop_reason":"end_turn"}`)
+		flusher.Flush()
+	}))
+	defer server.Close()
+
+	payload := `{
+		"model":"gpt-5.4",
+		"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}],
+		"tools":[{"type":"function","name":"get_weather","parameters":{"type":"object","properties":{"location":{"type":"string"}}}}],
+		"tool_choice":"none"
+	}`
+	resp, err := executeAuggieResponsesNonStreamWithPayloadForTest(t, context.Background(), newAuggieStreamTestAuth("token-1"), server.URL, payload)
+	if err != nil {
+		t.Fatalf("execute returned error: %v", err)
+	}
+	if got := gjson.GetBytes(resp.Payload, "status").String(); got != "completed" {
+		t.Fatalf("status = %q, want completed; payload=%s", got, resp.Payload)
 	}
 }
 
@@ -329,6 +1245,33 @@ func TestAuggieExecuteStream_EmitsTranslatedOpenAIResponsesSSE(t *testing.T) {
 	}
 }
 
+func TestAuggieExecuteStream_EmitsTranslatedOpenAIResponsesIncompleteSSE(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		flusher, _ := w.(http.Flusher)
+		_, _ = fmt.Fprintln(w, `{"text":"hello"}`)
+		flusher.Flush()
+		_, _ = fmt.Fprintln(w, `{"text":" world","stop_reason":"max_output_tokens"}`)
+		flusher.Flush()
+	}))
+	defer server.Close()
+
+	chunks, err := executeAuggieResponsesStreamForTest(t, context.Background(), newAuggieStreamTestAuth("token-1"), server.URL)
+	if err != nil {
+		t.Fatalf("ExecuteStream error: %v", err)
+	}
+	joined := strings.Join(chunks, "\n")
+	if !strings.Contains(joined, `"type":"response.incomplete"`) {
+		t.Fatalf("missing response.incomplete event: %s", joined)
+	}
+	if !strings.Contains(joined, `"reason":"max_output_tokens"`) {
+		t.Fatalf("missing incomplete_details.reason=max_output_tokens: %s", joined)
+	}
+	if strings.Contains(joined, `"type":"response.completed"`) {
+		t.Fatalf("unexpected response.completed event: %s", joined)
+	}
+}
+
 func TestAuggieExecuteStream_OpenAIResponsesSuppressesDuplicateCompletedEvents(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/x-ndjson")
@@ -350,6 +1293,139 @@ func TestAuggieExecuteStream_OpenAIResponsesSuppressesDuplicateCompletedEvents(t
 	joined := strings.Join(chunks, "\n")
 	if got := strings.Count(joined, `"type":"response.completed"`); got != 1 {
 		t.Fatalf("response.completed count = %d, want 1: %s", got, joined)
+	}
+}
+
+func TestAuggieExecuteStream_OpenAIResponsesSuppressesDuplicateIncompleteEvents(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		flusher, _ := w.(http.Flusher)
+		_, _ = fmt.Fprintln(w, `{"text":"hello"}`)
+		flusher.Flush()
+		_, _ = fmt.Fprintln(w, `{"text":" world","stop_reason":"max_output_tokens"}`)
+		flusher.Flush()
+		_, _ = fmt.Fprintln(w, `{"stop_reason":"max_output_tokens"}`)
+		flusher.Flush()
+	}))
+	defer server.Close()
+
+	chunks, err := executeAuggieResponsesStreamForTest(t, context.Background(), newAuggieStreamTestAuth("token-1"), server.URL)
+	if err != nil {
+		t.Fatalf("ExecuteStream error: %v", err)
+	}
+
+	joined := strings.Join(chunks, "\n")
+	if got := strings.Count(joined, `"type":"response.incomplete"`); got != 1 {
+		t.Fatalf("response.incomplete count = %d, want 1: %s", got, joined)
+	}
+}
+
+func TestAuggieExecuteStream_OpenAIResponsesWebSearchCompletesViaRemoteToolBridge(t *testing.T) {
+	chatStreamCalls := 0
+	listRemoteToolsCalls := 0
+	runRemoteToolCalls := 0
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read body: %v", err)
+		}
+
+		switch r.URL.Path {
+		case "/chat-stream":
+			chatStreamCalls++
+			w.Header().Set("Content-Type", "application/x-ndjson")
+			flusher, _ := w.(http.Flusher)
+
+			switch chatStreamCalls {
+			case 1:
+				if got := gjson.GetBytes(body, "tool_definitions.0.name").String(); got != "web-search" {
+					t.Fatalf("tool_definitions.0.name = %q, want web-search; body=%s", got, body)
+				}
+				_, _ = fmt.Fprintln(w, `{"conversation_id":"conv-web-stream-1","turn_id":"turn-web-stream-1","text":"","nodes":[{"tool_use":{"tool_use_id":"call_web_stream_1","tool_name":"web-search","input_json":"{\"query\":\"OpenAI latest news\",\"num_results\":1}","is_partial":false}}]}`)
+				flusher.Flush()
+				_, _ = fmt.Fprintln(w, `{"conversation_id":"conv-web-stream-1","turn_id":"turn-web-stream-1","text":"","stop_reason":"tool_use"}`)
+				flusher.Flush()
+			case 2:
+				if got := gjson.GetBytes(body, "conversation_id").String(); got != "conv-web-stream-1" {
+					t.Fatalf("conversation_id = %q, want conv-web-stream-1; body=%s", got, body)
+				}
+				if got := gjson.GetBytes(body, "turn_id").String(); got != "turn-web-stream-1" {
+					t.Fatalf("turn_id = %q, want turn-web-stream-1; body=%s", got, body)
+				}
+				if got := gjson.GetBytes(body, "nodes.0.tool_result_node.tool_use_id").String(); got != "call_web_stream_1" {
+					t.Fatalf("tool_use_id = %q, want call_web_stream_1; body=%s", got, body)
+				}
+				if got := gjson.GetBytes(body, "nodes.0.tool_result_node.content").String(); !strings.Contains(got, "OpenAI News") {
+					t.Fatalf("tool_result content = %q, want OpenAI News; body=%s", got, body)
+				}
+				_, _ = fmt.Fprintln(w, `{"conversation_id":"conv-web-stream-1","turn_id":"turn-web-stream-2","text":"Top headline: OpenAI News","stop_reason":"end_turn"}`)
+				flusher.Flush()
+			default:
+				t.Fatalf("unexpected /chat-stream call %d", chatStreamCalls)
+			}
+
+		case "/agents/list-remote-tools":
+			listRemoteToolsCalls++
+			if got := gjson.GetBytes(body, "tool_id_list.tool_ids.#").Int(); got == 0 {
+				t.Fatalf("tool_id_list.tool_ids missing; body=%s", body)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprintln(w, `{"tools":[{"remote_tool_id":1,"availability_status":1,"tool_safety":1,"tool_definition":{"name":"web-search"}}]}`)
+
+		case "/agents/run-remote-tool":
+			runRemoteToolCalls++
+			if got := gjson.GetBytes(body, "tool_name").String(); got != "web-search" {
+				t.Fatalf("tool_name = %q, want web-search; body=%s", got, body)
+			}
+			if got := gjson.GetBytes(body, "tool_id").Int(); got != 1 {
+				t.Fatalf("tool_id = %d, want 1; body=%s", got, body)
+			}
+			if got := gjson.GetBytes(body, "tool_input_json").String(); !strings.Contains(got, "OpenAI latest news") {
+				t.Fatalf("tool_input_json = %q, want OpenAI latest news; body=%s", got, body)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprintln(w, `{"tool_output":"- [OpenAI News](https://openai.com/news/)","tool_result_message":"","is_error":false,"status":1}`)
+
+		default:
+			t.Fatalf("unexpected path %q body=%s", r.URL.Path, body)
+		}
+	}))
+	defer server.Close()
+
+	chunks, err := executeAuggieResponsesStreamWithPayloadForTest(t, context.Background(), newAuggieStreamTestAuth("token-1"), server.URL, `{
+		"model":"gpt-5.4",
+		"input":[
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"Find the latest OpenAI news"}]}
+		],
+		"tools":[{"type":"web_search","search_context_size":"high"}]
+	}`)
+	if err != nil {
+		t.Fatalf("ExecuteStream error: %v", err)
+	}
+
+	if chatStreamCalls != 2 {
+		t.Fatalf("chatStreamCalls = %d, want 2", chatStreamCalls)
+	}
+	if listRemoteToolsCalls != 1 {
+		t.Fatalf("listRemoteToolsCalls = %d, want 1", listRemoteToolsCalls)
+	}
+	if runRemoteToolCalls != 1 {
+		t.Fatalf("runRemoteToolCalls = %d, want 1", runRemoteToolCalls)
+	}
+
+	joined := strings.Join(chunks, "\n")
+	if !strings.Contains(joined, `"delta":"Top headline: OpenAI News"`) {
+		t.Fatalf("missing final output delta: %s", joined)
+	}
+	if !strings.Contains(joined, `"type":"response.completed"`) {
+		t.Fatalf("missing response.completed event: %s", joined)
+	}
+	if strings.Contains(joined, `"type":"response.function_call_arguments.delta"`) {
+		t.Fatalf("unexpected function_call_arguments delta event: %s", joined)
+	}
+	if strings.Contains(joined, `"type":"response.output_item.added"`) && strings.Contains(joined, `"type":"function_call"`) {
+		t.Fatalf("unexpected function_call output item in responses stream: %s", joined)
 	}
 }
 
@@ -640,20 +1716,26 @@ func executeAuggieStreamForTest(t *testing.T, ctx context.Context, auth *cliprox
 func executeAuggieNonStreamForTest(t *testing.T, ctx context.Context, auth *cliproxyauth.Auth, targetURL string) (cliproxyexecutor.Response, error) {
 	t.Helper()
 
+	return executeAuggieNonStreamWithPayloadForTest(t, ctx, auth, targetURL, `{
+		"messages":[
+			{"role":"system","content":"You are terse."},
+			{"role":"user","content":"hello"},
+			{"role":"assistant","content":"hi"},
+			{"role":"user","content":"help me"}
+		]
+	}`)
+}
+
+func executeAuggieNonStreamWithPayloadForTest(t *testing.T, ctx context.Context, auth *cliproxyauth.Auth, targetURL, payload string) (cliproxyexecutor.Response, error) {
+	t.Helper()
+
 	exec := NewAuggieExecutor(&config.Config{})
 	ctx = context.WithValue(ctx, "cliproxy.roundtripper", newAuggieRewriteTransport(t, targetURL))
 
 	req := cliproxyexecutor.Request{
-		Model: "gpt-5.4",
-		Payload: []byte(`{
-			"messages":[
-				{"role":"system","content":"You are terse."},
-				{"role":"user","content":"hello"},
-				{"role":"assistant","content":"hi"},
-				{"role":"user","content":"help me"}
-			]
-		}`),
-		Format: sdktranslator.FormatOpenAI,
+		Model:   "gpt-5.4",
+		Payload: []byte(payload),
+		Format:  sdktranslator.FormatOpenAI,
 	}
 	opts := cliproxyexecutor.Options{
 		Stream:          false,
@@ -667,21 +1749,27 @@ func executeAuggieNonStreamForTest(t *testing.T, ctx context.Context, auth *clip
 func executeAuggieResponsesNonStreamForTest(t *testing.T, ctx context.Context, auth *cliproxyauth.Auth, targetURL string) (cliproxyexecutor.Response, error) {
 	t.Helper()
 
+	return executeAuggieResponsesNonStreamWithPayloadForTest(t, ctx, auth, targetURL, `{
+		"instructions":"You are terse.",
+		"input":[
+			{"role":"user","content":[{"type":"input_text","text":"hello"}]},
+			{"role":"assistant","content":[{"type":"output_text","text":"hi"}]},
+			{"role":"user","content":[{"type":"input_text","text":"help me"}]}
+		],
+		"tools":[{"type":"function","name":"list_files","description":"List files","parameters":{"type":"object","properties":{"path":{"type":"string"}}}}]
+	}`)
+}
+
+func executeAuggieResponsesNonStreamWithPayloadForTest(t *testing.T, ctx context.Context, auth *cliproxyauth.Auth, targetURL, payload string) (cliproxyexecutor.Response, error) {
+	t.Helper()
+
 	exec := NewAuggieExecutor(&config.Config{})
 	ctx = context.WithValue(ctx, "cliproxy.roundtripper", newAuggieRewriteTransport(t, targetURL))
 
 	req := cliproxyexecutor.Request{
-		Model: "gpt-5.4",
-		Payload: []byte(`{
-			"instructions":"You are terse.",
-			"input":[
-				{"role":"user","content":[{"type":"input_text","text":"hello"}]},
-				{"role":"assistant","content":[{"type":"output_text","text":"hi"}]},
-				{"role":"user","content":[{"type":"input_text","text":"help me"}]}
-			],
-			"tools":[{"type":"function","name":"list_files","description":"List files","parameters":{"type":"object","properties":{"path":{"type":"string"}}}}]
-		}`),
-		Format: sdktranslator.FormatOpenAIResponse,
+		Model:   "gpt-5.4",
+		Payload: []byte(payload),
+		Format:  sdktranslator.FormatOpenAIResponse,
 	}
 	opts := cliproxyexecutor.Options{
 		Stream:          false,
@@ -849,5 +1937,78 @@ func newAuggieStreamTestAuth(token string) *cliproxyauth.Auth {
 			"client_id":    "auggie-cli",
 			"login_mode":   "localhost",
 		},
+	}
+}
+
+func TestAuggieExecuteStream_EmitsToolCallsInOpenAIChunks(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		flusher, _ := w.(http.Flusher)
+		_, _ = fmt.Fprintln(w, `{"text":"","nodes":[{"tool_use":{"id":"tooluse_abc","name":"get_weather","input":{"location":"SF"}}}]}`)
+		flusher.Flush()
+		_, _ = fmt.Fprintln(w, `{"text":"","stop_reason":"tool_use"}`)
+		flusher.Flush()
+	}))
+	defer server.Close()
+
+	chunks, err := executeAuggieStreamForTest(t, context.Background(), newAuggieStreamTestAuth("token-1"), server.URL)
+	if err != nil {
+		t.Fatalf("ExecuteStream error: %v", err)
+	}
+	if len(chunks) != 2 {
+		t.Fatalf("chunks = %d, want 2", len(chunks))
+	}
+
+	// First chunk should contain tool_calls
+	if !strings.Contains(chunks[0], `"tool_calls"`) {
+		t.Fatalf("expected tool_calls in first chunk: %s", chunks[0])
+	}
+	if !strings.Contains(chunks[0], `"get_weather"`) {
+		t.Fatalf("expected get_weather in first chunk: %s", chunks[0])
+	}
+	if !strings.Contains(chunks[0], `"tooluse_abc"`) {
+		t.Fatalf("expected tooluse_abc id in first chunk: %s", chunks[0])
+	}
+
+	// Second chunk should have finish_reason=tool_calls
+	if !strings.Contains(chunks[1], `"finish_reason":"tool_calls"`) {
+		t.Fatalf("expected finish_reason tool_calls in second chunk: %s", chunks[1])
+	}
+}
+
+func TestAuggieExecute_AggregatesToolCallsInNonStreamResponse(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		flusher, _ := w.(http.Flusher)
+		_, _ = fmt.Fprintln(w, `{"text":"","nodes":[{"tool_use":{"id":"tooluse_xyz","name":"read_file","input":{"path":"/tmp/test.txt"}}}]}`)
+		flusher.Flush()
+		_, _ = fmt.Fprintln(w, `{"text":"","stop_reason":"tool_use"}`)
+		flusher.Flush()
+	}))
+	defer server.Close()
+
+	resp, err := executeAuggieNonStreamForTest(t, context.Background(), newAuggieStreamTestAuth("token-1"), server.URL)
+	if err != nil {
+		t.Fatalf("Execute error: %v", err)
+	}
+
+	if got := gjson.GetBytes(resp.Payload, "choices.0.finish_reason").String(); got != "tool_calls" {
+		t.Fatalf("finish_reason = %q, want tool_calls; payload=%s", got, resp.Payload)
+	}
+	tc := gjson.GetBytes(resp.Payload, "choices.0.message.tool_calls")
+	if !tc.Exists() || !tc.IsArray() {
+		t.Fatalf("expected tool_calls array in message; payload=%s", resp.Payload)
+	}
+	if tc.Get("#").Int() != 1 {
+		t.Fatalf("expected 1 tool_call, got %d; payload=%s", tc.Get("#").Int(), resp.Payload)
+	}
+	if got := tc.Get("0.id").String(); got != "tooluse_xyz" {
+		t.Fatalf("tool_call id = %q, want tooluse_xyz", got)
+	}
+	if got := tc.Get("0.function.name").String(); got != "read_file" {
+		t.Fatalf("function.name = %q, want read_file", got)
+	}
+	if got := tc.Get("0.function.arguments").String(); !strings.Contains(got, "/tmp/test.txt") {
+		t.Fatalf("function.arguments = %q, want to contain /tmp/test.txt", got)
 	}
 }
