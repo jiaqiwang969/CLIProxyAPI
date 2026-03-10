@@ -348,6 +348,19 @@ func TestAuggieResponses_WebSearchCompletesViaRemoteToolBridge(t *testing.T) {
 	if runRemoteToolCalls != 1 {
 		t.Fatalf("runRemoteToolCalls = %d, want 1", runRemoteToolCalls)
 	}
+	webSearchCount := int64(0)
+	gjson.GetBytes(resp.Payload, "output").ForEach(func(_, item gjson.Result) bool {
+		if item.Get("type").String() == "web_search_call" {
+			webSearchCount++
+		}
+		return true
+	})
+	if webSearchCount != 1 {
+		t.Fatalf("web_search_call outputs = %d, want 1; payload=%s", webSearchCount, resp.Payload)
+	}
+	if got := gjson.GetBytes(resp.Payload, `output.#(type=="web_search_call").status`).String(); got != "completed" {
+		t.Fatalf("web_search_call status = %q, want completed; payload=%s", got, resp.Payload)
+	}
 	if got := gjson.GetBytes(resp.Payload, `output.#(type=="message").content.0.text`).String(); got != "Top headline: OpenAI News" {
 		t.Fatalf("message output text = %q, want Top headline: OpenAI News; payload=%s", got, resp.Payload)
 	}
@@ -1417,6 +1430,15 @@ func TestAuggieExecuteStream_OpenAIResponsesWebSearchCompletesViaRemoteToolBridg
 	joined := strings.Join(chunks, "\n")
 	if !strings.Contains(joined, `"delta":"Top headline: OpenAI News"`) {
 		t.Fatalf("missing final output delta: %s", joined)
+	}
+	if !strings.Contains(joined, "event: response.web_search_call.searching") {
+		t.Fatalf("missing response.web_search_call.searching event: %s", joined)
+	}
+	if !strings.Contains(joined, "event: response.web_search_call.completed") {
+		t.Fatalf("missing response.web_search_call.completed event: %s", joined)
+	}
+	if !strings.Contains(joined, `"type":"web_search_call"`) {
+		t.Fatalf("missing web_search_call output item: %s", joined)
 	}
 	if !strings.Contains(joined, `"type":"response.completed"`) {
 		t.Fatalf("missing response.completed event: %s", joined)

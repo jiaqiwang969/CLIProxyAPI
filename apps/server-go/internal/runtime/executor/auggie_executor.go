@@ -113,6 +113,14 @@ type auggieBuiltInToolCall struct {
 	Arguments string
 }
 
+type auggieResponsesBuiltInToolOutput struct {
+	ID     string `json:"id"`
+	Type   string `json:"type"`
+	Status string `json:"status"`
+	Query  string `json:"query,omitempty"`
+	Output string `json:"output,omitempty"`
+}
+
 func NewAuggieExecutor(cfg *config.Config) *AuggieExecutor { return &AuggieExecutor{cfg: cfg} }
 
 func (e *AuggieExecutor) Identifier() string { return "auggie" }
@@ -1361,6 +1369,7 @@ func (e *AuggieExecutor) executeAuggieResponsesTurn(ctx context.Context, auth *c
 func (e *AuggieExecutor) completeAuggieResponsesBuiltInToolLoop(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, baseTranslated, openAIPayload []byte, headers http.Header) ([]byte, http.Header, error) {
 	currentPayload := openAIPayload
 	currentHeaders := headers
+	builtInOutputs := make([]auggieResponsesBuiltInToolOutput, 0)
 
 	for continuationCount := 0; continuationCount < auggieMaxInternalToolContinuations; continuationCount++ {
 		toolCalls, shouldContinue, err := extractAuggieBuiltInToolCalls(currentPayload)
@@ -1368,6 +1377,12 @@ func (e *AuggieExecutor) completeAuggieResponsesBuiltInToolLoop(ctx context.Cont
 			return nil, nil, err
 		}
 		if !shouldContinue {
+			if len(builtInOutputs) > 0 {
+				currentPayload, err = attachAuggieResponsesBuiltInToolOutputs(currentPayload, builtInOutputs)
+				if err != nil {
+					return nil, nil, err
+				}
+			}
 			return currentPayload, currentHeaders, nil
 		}
 
@@ -1384,6 +1399,7 @@ func (e *AuggieExecutor) completeAuggieResponsesBuiltInToolLoop(ctx context.Cont
 		if err != nil {
 			return nil, nil, err
 		}
+		builtInOutputs = append(builtInOutputs, buildAuggieResponsesBuiltInToolOutputs(toolCalls, toolResults)...)
 
 		continuationRequest, err := buildAuggieToolContinuationRequest(baseTranslated, state, toolResults)
 		if err != nil {
@@ -1567,6 +1583,9 @@ func synthesizeOpenAIResponseChunks(openAIPayload []byte) ([][]byte, error) {
 				"delta": delta,
 			},
 		},
+	}
+	if builtInOutputs := root.Get("_cliproxy_builtin_tool_outputs"); builtInOutputs.Exists() && builtInOutputs.Type != gjson.Null {
+		firstChunk["_cliproxy_builtin_tool_outputs"] = builtInOutputs.Value()
 	}
 
 	finishReason := strings.TrimSpace(root.Get("choices.0.finish_reason").String())
@@ -1937,6 +1956,48 @@ func normalizeAuggieRemoteToolName(name string) (string, bool) {
 	default:
 		return "", false
 	}
+}
+
+func buildAuggieResponsesBuiltInToolOutputs(toolCalls []auggieBuiltInToolCall, toolResults []auggieToolResultContinuation) []auggieResponsesBuiltInToolOutput {
+	resultsByID := make(map[string]auggieToolResultContinuation, len(toolResults))
+	for _, result := range toolResults {
+		resultsByID[strings.TrimSpace(result.ToolUseID)] = result
+	}
+
+	outputs := make([]auggieResponsesBuiltInToolOutput, 0, len(toolCalls))
+	for _, toolCall := range toolCalls {
+		switch toolCall.Name {
+		case "web-search":
+			status := "completed"
+			if result, ok := resultsByID[strings.TrimSpace(toolCall.ID)]; ok && result.IsError {
+				status = "failed"
+			}
+			output := auggieResponsesBuiltInToolOutput{
+				ID:     "ws_" + strings.TrimSpace(toolCall.ID),
+				Type:   "web_search_call",
+				Status: status,
+				Query:  strings.TrimSpace(gjson.Get(toolCall.Arguments, "query").String()),
+			}
+			if result, ok := resultsByID[strings.TrimSpace(toolCall.ID)]; ok {
+				output.Output = strings.TrimSpace(result.Content)
+			}
+			outputs = append(outputs, output)
+		}
+	}
+
+	return outputs
+}
+
+func attachAuggieResponsesBuiltInToolOutputs(openAIPayload []byte, outputs []auggieResponsesBuiltInToolOutput) ([]byte, error) {
+	if len(outputs) == 0 {
+		return openAIPayload, nil
+	}
+
+	outputsRaw, err := json.Marshal(outputs)
+	if err != nil {
+		return nil, err
+	}
+	return sjson.SetRawBytes(openAIPayload, "_cliproxy_builtin_tool_outputs", outputsRaw)
 }
 
 func buildAuggieToolContinuationRequest(baseTranslated []byte, state auggieConversationState, toolResults []auggieToolResultContinuation) ([]byte, error) {
