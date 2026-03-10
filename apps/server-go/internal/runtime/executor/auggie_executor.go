@@ -1406,6 +1406,18 @@ func (e *AuggieExecutor) executeOpenAIResponsesStream(ctx context.Context, auth 
 	if err != nil {
 		return nil, err
 	}
+	if auggieResponsesRequestUsesBuiltInToolBridge(originalPayload) {
+		openAIPayload, headers, err := e.executeAuggieResponsesTurn(ctx, auth, resolvedReq, opts, translated)
+		if err != nil {
+			return nil, err
+		}
+		openAIPayload, headers, err = e.completeAuggieResponsesBuiltInToolLoop(ctx, auth, resolvedReq, opts, translated, openAIPayload, headers)
+		if err != nil {
+			return nil, err
+		}
+		return streamAuggieBufferedResponsesPayload(ctx, payloadRequestedModel(opts, req.Model), originalPayload, openAIPayload, headers)
+	}
+
 	openAIResult, err := e.executeAuggieStream(ctx, auth, resolvedReq, opts, translated, sdktranslator.FormatOpenAI, true)
 	if err != nil {
 		return nil, err
@@ -1453,6 +1465,142 @@ func (e *AuggieExecutor) executeOpenAIResponsesStream(ctx context.Context, auth 
 		Headers: openAIResult.Headers,
 		Chunks:  out,
 	}, nil
+}
+
+func auggieResponsesRequestUsesBuiltInToolBridge(rawJSON []byte) bool {
+	tools := gjson.GetBytes(rawJSON, "tools")
+	if tools.Exists() && tools.IsArray() {
+		for _, tool := range tools.Array() {
+			if strings.TrimSpace(tool.Get("type").String()) == "web_search" {
+				return true
+			}
+		}
+	}
+
+	toolChoice := gjson.GetBytes(rawJSON, "tool_choice")
+	return toolChoice.IsObject() && strings.TrimSpace(toolChoice.Get("type").String()) == "web_search"
+}
+
+func streamAuggieBufferedResponsesPayload(ctx context.Context, responseModel string, originalPayload, openAIPayload []byte, headers http.Header) (*cliproxyexecutor.StreamResult, error) {
+	openAIChunks, err := synthesizeOpenAIResponseChunks(openAIPayload)
+	if err != nil {
+		return nil, err
+	}
+
+	out := make(chan cliproxyexecutor.StreamChunk)
+	go func() {
+		defer close(out)
+
+		var param any
+		completedSent := false
+		for _, openAIChunk := range openAIChunks {
+			lines := sdktranslator.TranslateStream(
+				ctx,
+				sdktranslator.FormatOpenAI,
+				sdktranslator.FormatOpenAIResponse,
+				responseModel,
+				originalPayload,
+				originalPayload,
+				bytes.Clone(openAIChunk),
+				&param,
+			)
+			for i := range lines {
+				if isOpenAIResponsesTerminalEventLine(lines[i]) {
+					if completedSent {
+						continue
+					}
+					completedSent = true
+				}
+				out <- cliproxyexecutor.StreamChunk{Payload: []byte(lines[i])}
+			}
+		}
+	}()
+
+	return &cliproxyexecutor.StreamResult{
+		Headers: headers,
+		Chunks:  out,
+	}, nil
+}
+
+func synthesizeOpenAIResponseChunks(openAIPayload []byte) ([][]byte, error) {
+	root := gjson.ParseBytes(openAIPayload)
+
+	responseID := strings.TrimSpace(root.Get("id").String())
+	if responseID == "" {
+		responseID = fmt.Sprintf("chatcmpl_%d", time.Now().UnixNano())
+	}
+
+	created := root.Get("created").Int()
+	if created == 0 {
+		created = time.Now().Unix()
+	}
+
+	model := strings.TrimSpace(root.Get("model").String())
+	if model == "" {
+		model = "gpt-5.4"
+	}
+
+	delta := map[string]any{
+		"role": "assistant",
+	}
+	if content := root.Get("choices.0.message.content"); content.Exists() && content.String() != "" {
+		delta["content"] = content.String()
+	}
+	if reasoning := root.Get("choices.0.message.reasoning_content"); reasoning.Exists() && reasoning.String() != "" {
+		delta["reasoning_content"] = reasoning.String()
+	}
+	if reasoningItemID := strings.TrimSpace(root.Get("choices.0.message.reasoning_item_id").String()); reasoningItemID != "" {
+		delta["reasoning_item_id"] = reasoningItemID
+	}
+	if reasoningEncrypted := strings.TrimSpace(root.Get("choices.0.message.reasoning_encrypted_content").String()); reasoningEncrypted != "" {
+		delta["reasoning_encrypted_content"] = reasoningEncrypted
+	}
+
+	firstChunk := map[string]any{
+		"id":      responseID,
+		"object":  "chat.completion.chunk",
+		"created": created,
+		"model":   model,
+		"choices": []map[string]any{
+			{
+				"index": 0,
+				"delta": delta,
+			},
+		},
+	}
+
+	finishReason := strings.TrimSpace(root.Get("choices.0.finish_reason").String())
+	if finishReason == "" {
+		finishReason = "stop"
+	}
+
+	secondChunk := map[string]any{
+		"id":      responseID,
+		"object":  "chat.completion.chunk",
+		"created": created,
+		"model":   model,
+		"choices": []map[string]any{
+			{
+				"index":         0,
+				"delta":         map[string]any{},
+				"finish_reason": finishReason,
+			},
+		},
+	}
+	if usage := root.Get("usage"); usage.Exists() && usage.Type != gjson.Null {
+		secondChunk["usage"] = usage.Value()
+	}
+
+	firstRaw, err := json.Marshal(firstChunk)
+	if err != nil {
+		return nil, err
+	}
+	secondRaw, err := json.Marshal(secondChunk)
+	if err != nil {
+		return nil, err
+	}
+
+	return [][]byte{firstRaw, secondRaw}, nil
 }
 
 func isOpenAIResponsesTerminalEventLine(line string) bool {

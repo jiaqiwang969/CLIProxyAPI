@@ -1783,16 +1783,22 @@ func executeAuggieResponsesNonStreamWithPayloadForTest(t *testing.T, ctx context
 func executeAuggieResponsesStreamForTest(t *testing.T, ctx context.Context, auth *cliproxyauth.Auth, targetURL string) ([]string, error) {
 	t.Helper()
 
+	return executeAuggieResponsesStreamWithPayloadForTest(t, ctx, auth, targetURL, `{
+		"instructions":"You are terse.",
+		"input":[{"role":"user","content":[{"type":"input_text","text":"help me"}]}]
+	}`)
+}
+
+func executeAuggieResponsesStreamWithPayloadForTest(t *testing.T, ctx context.Context, auth *cliproxyauth.Auth, targetURL, payload string) ([]string, error) {
+	t.Helper()
+
 	exec := NewAuggieExecutor(&config.Config{})
 	ctx = context.WithValue(ctx, "cliproxy.roundtripper", newAuggieRewriteTransport(t, targetURL))
 
 	req := cliproxyexecutor.Request{
-		Model: "gpt-5.4",
-		Payload: []byte(`{
-			"instructions":"You are terse.",
-			"input":[{"role":"user","content":[{"type":"input_text","text":"help me"}]}]
-		}`),
-		Format: sdktranslator.FormatOpenAIResponse,
+		Model:   "gpt-5.4",
+		Payload: []byte(payload),
+		Format:  sdktranslator.FormatOpenAIResponse,
 	}
 	opts := cliproxyexecutor.Options{
 		Stream:          true,
