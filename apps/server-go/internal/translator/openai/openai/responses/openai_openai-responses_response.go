@@ -3,7 +3,9 @@ package responses
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
+	"regexp"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -25,6 +27,12 @@ type oaiToResponsesStateWebSearchCall struct {
 	Query       string
 	Output      string
 	OutputIndex int
+}
+
+type oaiToResponsesWebSearchResult struct {
+	Title string
+	URL   string
+	Text  string
 }
 
 type oaiToResponsesState struct {
@@ -70,6 +78,8 @@ type oaiToResponsesState struct {
 
 // responseIDCounter provides a process-wide unique counter for synthesized response identifiers.
 var responseIDCounter uint64
+
+var responsesWebSearchMarkdownLinkPattern = regexp.MustCompile(`\[(.*?)\]\((https?://[^)]+)\)(.*)`)
 
 func emitRespEvent(event string, payload string) string {
 	return fmt.Sprintf("event: %s\ndata: %s", event, payload)
@@ -162,6 +172,114 @@ func parseResponsesBuiltInToolOutputs(root gjson.Result) []oaiToResponsesStateWe
 		})
 	}
 	return out
+}
+
+func parseResponsesWebSearchResults(output string) []oaiToResponsesWebSearchResult {
+	if strings.TrimSpace(output) == "" {
+		return nil
+	}
+
+	output = strings.ReplaceAll(output, `\r\n`, "\n")
+	output = strings.ReplaceAll(output, `\n`, "\n")
+	output = strings.ReplaceAll(output, `\r`, "\n")
+
+	lines := strings.Split(output, "\n")
+	results := make([]oaiToResponsesWebSearchResult, 0, len(lines))
+	for _, line := range lines {
+		match := responsesWebSearchMarkdownLinkPattern.FindStringSubmatch(line)
+		if len(match) != 4 {
+			continue
+		}
+
+		title := strings.TrimSpace(match[1])
+		url := strings.TrimSpace(match[2])
+		text := strings.TrimSpace(strings.TrimLeft(strings.TrimSpace(match[3]), "-:"))
+		if title == "" || url == "" {
+			continue
+		}
+
+		results = append(results, oaiToResponsesWebSearchResult{
+			Title: title,
+			URL:   url,
+			Text:  text,
+		})
+	}
+
+	return results
+}
+
+func buildResponsesWebSearchAction(call oaiToResponsesStateWebSearchCall, requestRawJSON []byte, includeExpandedOutput bool) map[string]any {
+	action := map[string]any{
+		"type":  "search",
+		"query": strings.TrimSpace(call.Query),
+	}
+	if query := strings.TrimSpace(call.Query); query != "" {
+		action["queries"] = []string{query}
+	}
+
+	if includeExpandedOutput && responsesRequestIncludes(requestRawJSON, "web_search_call.action.sources") {
+		results := parseResponsesWebSearchResults(call.Output)
+		sources := make([]map[string]any, 0, len(results))
+		seenURLs := make(map[string]struct{}, len(results))
+		for _, result := range results {
+			if result.URL == "" {
+				continue
+			}
+			if _, seen := seenURLs[result.URL]; seen {
+				continue
+			}
+			seenURLs[result.URL] = struct{}{}
+			sources = append(sources, map[string]any{
+				"type": "url",
+				"url":  result.URL,
+			})
+		}
+		if len(sources) > 0 {
+			action["sources"] = sources
+		}
+	}
+
+	return action
+}
+
+func buildResponsesWebSearchCallItem(call oaiToResponsesStateWebSearchCall, requestRawJSON []byte, status string, includeExpandedOutput bool) string {
+	if strings.TrimSpace(status) == "" {
+		status = strings.TrimSpace(call.Status)
+	}
+	if strings.TrimSpace(status) == "" {
+		status = "completed"
+	}
+
+	item := map[string]any{
+		"id":     call.ID,
+		"type":   "web_search_call",
+		"status": status,
+		"action": buildResponsesWebSearchAction(call, requestRawJSON, includeExpandedOutput),
+	}
+
+	if includeExpandedOutput && responsesRequestIncludes(requestRawJSON, "web_search_call.results") {
+		parsedResults := parseResponsesWebSearchResults(call.Output)
+		if len(parsedResults) > 0 {
+			results := make([]map[string]any, 0, len(parsedResults))
+			for _, result := range parsedResults {
+				entry := map[string]any{
+					"title": result.Title,
+					"url":   result.URL,
+				}
+				if result.Text != "" {
+					entry["text"] = result.Text
+				}
+				results = append(results, entry)
+			}
+			item["results"] = results
+		}
+	}
+
+	raw, err := json.Marshal(item)
+	if err != nil {
+		return `{"id":"","type":"web_search_call","status":"completed","action":{"type":"search","query":""}}`
+	}
+	return string(raw)
 }
 
 func deepMergeJSONObject(dst, src any) any {
@@ -437,19 +555,22 @@ func ConvertOpenAIChatCompletionsResponseToOpenAIResponses(ctx context.Context, 
 			st.WebSearchCalls[builtInCall.ID] = builtInCall
 			st.WebSearchOrder = append(st.WebSearchOrder, builtInCall.ID)
 
-			item := `{"type":"response.output_item.added","sequence_number":0,"output_index":0,"item":{"id":"","type":"web_search_call","status":"in_progress"}}`
+			item := `{"type":"response.output_item.added","sequence_number":0,"output_index":0,"item":{}}`
 			item, _ = sjson.Set(item, "sequence_number", nextSeq())
 			item, _ = sjson.Set(item, "output_index", builtInCall.OutputIndex)
-			item, _ = sjson.Set(item, "item.id", builtInCall.ID)
+			item, _ = sjson.SetRaw(item, "item", buildResponsesWebSearchCallItem(builtInCall, requestRawJSON, "in_progress", false))
 			out = append(out, emitRespEvent("response.output_item.added", item))
+
+			inProgress := `{"type":"response.web_search_call.in_progress","sequence_number":0,"item_id":"","output_index":0}`
+			inProgress, _ = sjson.Set(inProgress, "sequence_number", nextSeq())
+			inProgress, _ = sjson.Set(inProgress, "item_id", builtInCall.ID)
+			inProgress, _ = sjson.Set(inProgress, "output_index", builtInCall.OutputIndex)
+			out = append(out, emitRespEvent("response.web_search_call.in_progress", inProgress))
 
 			searching := `{"type":"response.web_search_call.searching","sequence_number":0,"item_id":"","output_index":0}`
 			searching, _ = sjson.Set(searching, "sequence_number", nextSeq())
 			searching, _ = sjson.Set(searching, "item_id", builtInCall.ID)
 			searching, _ = sjson.Set(searching, "output_index", builtInCall.OutputIndex)
-			if builtInCall.Query != "" {
-				searching, _ = sjson.Set(searching, "query", builtInCall.Query)
-			}
 			out = append(out, emitRespEvent("response.web_search_call.searching", searching))
 			continue
 		}
@@ -753,16 +874,12 @@ func ConvertOpenAIChatCompletionsResponseToOpenAIResponses(ctx context.Context, 
 						completedEvent, _ = sjson.Set(completedEvent, "sequence_number", nextSeq())
 						completedEvent, _ = sjson.Set(completedEvent, "item_id", call.ID)
 						completedEvent, _ = sjson.Set(completedEvent, "output_index", call.OutputIndex)
-						if call.Query != "" {
-							completedEvent, _ = sjson.Set(completedEvent, "query", call.Query)
-						}
 						out = append(out, emitRespEvent("response.web_search_call.completed", completedEvent))
 
-						itemDone := `{"type":"response.output_item.done","sequence_number":0,"output_index":0,"item":{"id":"","type":"web_search_call","status":"completed"}}`
+						itemDone := `{"type":"response.output_item.done","sequence_number":0,"output_index":0,"item":{}}`
 						itemDone, _ = sjson.Set(itemDone, "sequence_number", nextSeq())
 						itemDone, _ = sjson.Set(itemDone, "output_index", call.OutputIndex)
-						itemDone, _ = sjson.Set(itemDone, "item.id", call.ID)
-						itemDone, _ = sjson.Set(itemDone, "item.status", call.Status)
+						itemDone, _ = sjson.SetRaw(itemDone, "item", buildResponsesWebSearchCallItem(call, requestRawJSON, call.Status, true))
 						out = append(out, emitRespEvent("response.output_item.done", itemDone))
 
 						st.WebSearchDone[itemID] = true
@@ -908,9 +1025,7 @@ func ConvertOpenAIChatCompletionsResponseToOpenAIResponses(ctx context.Context, 
 						if call.Status == "" {
 							call.Status = "completed"
 						}
-						item := `{"id":"","type":"web_search_call","status":"completed"}`
-						item, _ = sjson.Set(item, "id", call.ID)
-						item, _ = sjson.Set(item, "status", call.Status)
+						item := buildResponsesWebSearchCallItem(call, requestRawJSON, call.Status, true)
 						outputItems = append(outputItems, indexedOutputItem{Index: call.OutputIndex, Raw: item})
 					}
 				}
@@ -1082,11 +1197,7 @@ func ConvertOpenAIChatCompletionsResponseToOpenAIResponsesNonStream(_ context.Co
 	}
 
 	for _, builtInCall := range parseResponsesBuiltInToolOutputs(root) {
-		item := `{"id":"","type":"web_search_call","status":"completed"}`
-		item, _ = sjson.Set(item, "id", builtInCall.ID)
-		if builtInCall.Status != "" {
-			item, _ = sjson.Set(item, "status", builtInCall.Status)
-		}
+		item := buildResponsesWebSearchCallItem(builtInCall, requestRawJSON, builtInCall.Status, true)
 		outputsWrapper, _ = sjson.SetRaw(outputsWrapper, "arr.-1", item)
 	}
 

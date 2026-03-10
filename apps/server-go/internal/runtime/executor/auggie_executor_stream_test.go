@@ -17,6 +17,22 @@ import (
 	"github.com/tidwall/gjson"
 )
 
+func parseExecutorResponsesSSEEvent(t *testing.T, chunk string) (string, gjson.Result) {
+	t.Helper()
+
+	lines := strings.Split(chunk, "\n")
+	if len(lines) < 2 {
+		t.Fatalf("unexpected SSE chunk: %q", chunk)
+	}
+
+	event := strings.TrimSpace(strings.TrimPrefix(lines[0], "event:"))
+	dataLine := strings.TrimSpace(strings.TrimPrefix(lines[1], "data:"))
+	if !gjson.Valid(dataLine) {
+		t.Fatalf("invalid SSE data JSON: %q", dataLine)
+	}
+	return event, gjson.Parse(dataLine)
+}
+
 func TestAuggieExecuteStream_EmitsTranslatedOpenAISSE(t *testing.T) {
 	attempts := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1448,6 +1464,123 @@ func TestAuggieExecuteStream_OpenAIResponsesWebSearchCompletesViaRemoteToolBridg
 	}
 	if strings.Contains(joined, `"type":"response.output_item.added"`) && strings.Contains(joined, `"type":"function_call"`) {
 		t.Fatalf("unexpected function_call output item in responses stream: %s", joined)
+	}
+}
+
+func TestAuggieExecuteStream_OpenAIResponsesWebSearchIncludesRequestedSourcesAndResults(t *testing.T) {
+	chatStreamCalls := 0
+	listRemoteToolsCalls := 0
+	runRemoteToolCalls := 0
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read body: %v", err)
+		}
+
+		switch r.URL.Path {
+		case "/chat-stream":
+			chatStreamCalls++
+			w.Header().Set("Content-Type", "application/x-ndjson")
+			flusher, _ := w.(http.Flusher)
+
+			switch chatStreamCalls {
+			case 1:
+				if got := gjson.GetBytes(body, "tool_definitions.0.name").String(); got != "web-search" {
+					t.Fatalf("tool_definitions.0.name = %q, want web-search; body=%s", got, body)
+				}
+				_, _ = fmt.Fprintln(w, `{"conversation_id":"conv-web-stream-include-1","turn_id":"turn-web-stream-include-1","text":"","nodes":[{"tool_use":{"tool_use_id":"call_web_stream_include_1","tool_name":"web-search","input_json":"{\"query\":\"OpenAI latest news\",\"num_results\":2}","is_partial":false}}]}`)
+				flusher.Flush()
+				_, _ = fmt.Fprintln(w, `{"conversation_id":"conv-web-stream-include-1","turn_id":"turn-web-stream-include-1","text":"","stop_reason":"tool_use"}`)
+				flusher.Flush()
+			case 2:
+				if got := gjson.GetBytes(body, "nodes.0.tool_result_node.tool_use_id").String(); got != "call_web_stream_include_1" {
+					t.Fatalf("tool_use_id = %q, want call_web_stream_include_1; body=%s", got, body)
+				}
+				_, _ = fmt.Fprintln(w, `{"conversation_id":"conv-web-stream-include-1","turn_id":"turn-web-stream-include-2","text":"Top headline: OpenAI News","stop_reason":"end_turn"}`)
+				flusher.Flush()
+			default:
+				t.Fatalf("unexpected /chat-stream call %d", chatStreamCalls)
+			}
+
+		case "/agents/list-remote-tools":
+			listRemoteToolsCalls++
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprintln(w, `{"tools":[{"remote_tool_id":1,"availability_status":1,"tool_safety":1,"tool_definition":{"name":"web-search"}}]}`)
+
+		case "/agents/run-remote-tool":
+			runRemoteToolCalls++
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprintln(w, `{"tool_output":"- [OpenAI News](https://openai.com/news/) Latest updates from OpenAI\n- [OpenAI Blog](https://openai.com/blog/) Product announcements","tool_result_message":"","is_error":false,"status":1}`)
+
+		default:
+			t.Fatalf("unexpected path %q body=%s", r.URL.Path, body)
+		}
+	}))
+	defer server.Close()
+
+	chunks, err := executeAuggieResponsesStreamWithPayloadForTest(t, context.Background(), newAuggieStreamTestAuth("token-1"), server.URL, `{
+		"model":"gpt-5.4",
+		"input":[
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"Find the latest OpenAI news"}]}
+		],
+		"tools":[{"type":"web_search","search_context_size":"high"}],
+		"include":["web_search_call.results","web_search_call.action.sources"]
+	}`)
+	if err != nil {
+		t.Fatalf("ExecuteStream error: %v", err)
+	}
+
+	if chatStreamCalls != 2 {
+		t.Fatalf("chatStreamCalls = %d, want 2", chatStreamCalls)
+	}
+	if listRemoteToolsCalls != 1 {
+		t.Fatalf("listRemoteToolsCalls = %d, want 1", listRemoteToolsCalls)
+	}
+	if runRemoteToolCalls != 1 {
+		t.Fatalf("runRemoteToolCalls = %d, want 1", runRemoteToolCalls)
+	}
+
+	var (
+		itemDone  gjson.Result
+		completed gjson.Result
+	)
+	for _, chunk := range chunks {
+		event, data := parseExecutorResponsesSSEEvent(t, chunk)
+		switch event {
+		case "response.output_item.done":
+			if data.Get("item.type").String() == "web_search_call" {
+				itemDone = data
+			}
+		case "response.completed":
+			completed = data
+		}
+	}
+
+	if !itemDone.Exists() {
+		t.Fatalf("missing web_search_call output_item.done event: %v", chunks)
+	}
+	if got := itemDone.Get("item.action.sources.0.url").String(); got != "https://openai.com/news/" {
+		t.Fatalf("output_item.done action.sources[0].url = %q, want https://openai.com/news/; chunk=%s", got, itemDone.Raw)
+	}
+	if got := itemDone.Get("item.results.0.title").String(); got != "OpenAI News" {
+		t.Fatalf("output_item.done results[0].title = %q, want OpenAI News; chunk=%s", got, itemDone.Raw)
+	}
+	if got := itemDone.Get("item.results.0.text").String(); got != "Latest updates from OpenAI" {
+		t.Fatalf("output_item.done results[0].text = %q, want Latest updates from OpenAI; chunk=%s", got, itemDone.Raw)
+	}
+
+	if !completed.Exists() {
+		t.Fatalf("missing response.completed event: %v", chunks)
+	}
+	if got := completed.Get(`response.output.#(type=="web_search_call").action.query`).String(); got != "OpenAI latest news" {
+		t.Fatalf("response.output web_search_call action.query = %q, want OpenAI latest news; chunk=%s", got, completed.Raw)
+	}
+	if got := completed.Get(`response.output.#(type=="web_search_call").action.sources.1.url`).String(); got != "https://openai.com/blog/" {
+		t.Fatalf("response.output web_search_call action.sources[1].url = %q, want https://openai.com/blog/; chunk=%s", got, completed.Raw)
+	}
+	if got := completed.Get(`response.output.#(type=="web_search_call").results.1.title`).String(); got != "OpenAI Blog" {
+		t.Fatalf("response.output web_search_call results[1].title = %q, want OpenAI Blog; chunk=%s", got, completed.Raw)
 	}
 }
 
