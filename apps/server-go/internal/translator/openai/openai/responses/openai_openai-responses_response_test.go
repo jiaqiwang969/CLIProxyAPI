@@ -49,8 +49,8 @@ func assertOfficialDefaultResponseScaffold(t *testing.T, payload gjson.Result, p
 	if got := payload.Get(path("previous_response_id")); got.Type != gjson.Null {
 		t.Fatalf("%s = %s, want null; payload=%s", path("previous_response_id"), got.Raw, payload.Raw)
 	}
-	if got := payload.Get(path("reasoning.effort")); got.Type != gjson.Null {
-		t.Fatalf("%s = %s, want null; payload=%s", path("reasoning.effort"), got.Raw, payload.Raw)
+	if got := payload.Get(path("reasoning.effort")).String(); got != "none" {
+		t.Fatalf("%s = %q, want \"none\"; payload=%s", path("reasoning.effort"), got, payload.Raw)
 	}
 	if got := payload.Get(path("reasoning.summary")); got.Type != gjson.Null {
 		t.Fatalf("%s = %s, want null; payload=%s", path("reasoning.summary"), got.Raw, payload.Raw)
@@ -63,6 +63,9 @@ func assertOfficialDefaultResponseScaffold(t *testing.T, payload gjson.Result, p
 	}
 	if got := payload.Get(path("text.format.type")).String(); got != "text" {
 		t.Fatalf("%s = %q, want text; payload=%s", path("text.format.type"), got, payload.Raw)
+	}
+	if got := payload.Get(path("text.verbosity")).String(); got != "medium" {
+		t.Fatalf("%s = %q, want medium; payload=%s", path("text.verbosity"), got, payload.Raw)
 	}
 	if got := payload.Get(path("tool_choice")).String(); got != "auto" {
 		t.Fatalf("%s = %q, want auto; payload=%s", path("tool_choice"), got, payload.Raw)
@@ -80,10 +83,37 @@ func assertOfficialDefaultResponseScaffold(t *testing.T, payload gjson.Result, p
 		t.Fatalf("%s = %s, want null; payload=%s", path("user"), got.Raw, payload.Raw)
 	}
 	if got := payload.Get(path("metadata")); got.Type != gjson.JSON || got.Raw != "{}" {
-		t.Fatalf("%s = %s, want {}; payload=%s", path("metadata"), got.Raw, payload.Raw)
+		t.Fatalf("%s = %s, want ; payload=%s", path("metadata"), got.Raw, payload.Raw)
 	}
 	if got := payload.Get(path("usage")); !got.Exists() || got.Type != gjson.Null {
 		t.Fatalf("%s = %s, want null; payload=%s", path("usage"), got.Raw, payload.Raw)
+	}
+	if got := payload.Get(path("content_filters")); got.Type != gjson.Null {
+		t.Fatalf("%s = %s, want null; payload=%s", path("content_filters"), got.Raw, payload.Raw)
+	}
+	if got := payload.Get(path("frequency_penalty")).Float(); got != 0 {
+		t.Fatalf("%s = %v, want 0; payload=%s", path("frequency_penalty"), got, payload.Raw)
+	}
+	if got := payload.Get(path("max_tool_calls")); got.Type != gjson.Null {
+		t.Fatalf("%s = %s, want null; payload=%s", path("max_tool_calls"), got.Raw, payload.Raw)
+	}
+	if got := payload.Get(path("presence_penalty")).Float(); got != 0 {
+		t.Fatalf("%s = %v, want 0; payload=%s", path("presence_penalty"), got, payload.Raw)
+	}
+	if got := payload.Get(path("prompt_cache_key")); got.Type != gjson.Null {
+		t.Fatalf("%s = %s, want null; payload=%s", path("prompt_cache_key"), got.Raw, payload.Raw)
+	}
+	if got := payload.Get(path("prompt_cache_retention")); got.Type != gjson.Null {
+		t.Fatalf("%s = %s, want null; payload=%s", path("prompt_cache_retention"), got.Raw, payload.Raw)
+	}
+	if got := payload.Get(path("safety_identifier")); got.Type != gjson.Null {
+		t.Fatalf("%s = %s, want null; payload=%s", path("safety_identifier"), got.Raw, payload.Raw)
+	}
+	if got := payload.Get(path("service_tier")).String(); got != "default" {
+		t.Fatalf("%s = %q, want default; payload=%s", path("service_tier"), got, payload.Raw)
+	}
+	if got := payload.Get(path("top_logprobs")).Int(); got != 0 {
+		t.Fatalf("%s = %d, want 0; payload=%s", path("top_logprobs"), got, payload.Raw)
 	}
 	if got := payload.Get(path("output_text")); got.Exists() {
 		t.Fatalf("%s = %s, want field omitted; payload=%s", path("output_text"), got.Raw, payload.Raw)

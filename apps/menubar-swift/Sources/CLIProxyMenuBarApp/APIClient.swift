@@ -196,14 +196,10 @@ actor CLIProxyAPIClient: CLIProxyAPIManaging {
     private func finalizeURL(
         components: URLComponents,
         queryItems: [URLQueryItem],
-        managementKey: String
+        managementKey _: String
     ) throws -> URL {
         var mutable = components
-        var finalQueryItems = queryItems
-        if !managementKey.isEmpty {
-            finalQueryItems.append(URLQueryItem(name: "key", value: managementKey))
-        }
-        mutable.queryItems = finalQueryItems
+        mutable.queryItems = queryItems.isEmpty ? nil : queryItems
 
         guard let url = mutable.url else {
             throw APIClientError.invalidBaseURL

@@ -53,6 +53,7 @@ func ConvertAuggieResponseToOpenAI(_ context.Context, modelName string, original
 	// Check for tool_use and token_usage in nodes array
 	var toolUses []gjson.Result
 	var tokenUsage gjson.Result
+	var nodeTextSegments []string
 	var thinkingTexts []string
 	var thinkingEncryptedContent string
 	var thinkingItemID string
@@ -80,8 +81,16 @@ func ConvertAuggieResponseToOpenAI(_ context.Context, modelName string, original
 			if tu := node.Get("token_usage"); tu.Exists() && tu.Type != gjson.Null {
 				tokenUsage = tu
 			}
+			if strings.TrimSpace(text) == "" {
+				if nodeText := auggieTextFromNode(node); nodeText != "" {
+					nodeTextSegments = append(nodeTextSegments, nodeText)
+				}
+			}
 			return true
 		})
+	}
+	if strings.TrimSpace(text) == "" && len(nodeTextSegments) > 0 {
+		text = strings.Join(nodeTextSegments, "")
 	}
 
 	hasToolUse := len(toolUses) > 0
@@ -257,6 +266,29 @@ func auggieThinkingItemID(thinking gjson.Result) string {
 		return ""
 	}
 	return strings.TrimSpace(result.String())
+}
+
+func auggieTextFromNode(node gjson.Result) string {
+	if !node.Exists() || !node.IsObject() {
+		return ""
+	}
+	if tu := node.Get("tool_use"); tu.Exists() && tu.Type != gjson.Null {
+		return ""
+	}
+	if tu := node.Get("token_usage"); tu.Exists() && tu.Type != gjson.Null {
+		return ""
+	}
+	if th := node.Get("thinking"); th.Exists() && th.Type != gjson.Null {
+		return ""
+	}
+	content := node.Get("content")
+	if !content.Exists() || content.Type != gjson.String {
+		return ""
+	}
+	if strings.TrimSpace(content.String()) == "" {
+		return ""
+	}
+	return content.String()
 }
 
 func requestIncludesReasoningEncryptedContent(rawJSON []byte) bool {

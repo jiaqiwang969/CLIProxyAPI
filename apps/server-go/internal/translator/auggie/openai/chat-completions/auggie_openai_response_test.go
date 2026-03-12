@@ -34,6 +34,55 @@ func TestConvertAuggieResponseToOpenAI_EmitsTextAndFinishReason(t *testing.T) {
 	}
 }
 
+func TestConvertAuggieResponseToOpenAI_FallsBackToNodeContentWhenTopLevelTextIsEmpty(t *testing.T) {
+	var param any
+
+	first := ConvertAuggieResponseToOpenAI(
+		context.Background(),
+		"gpt-5.4",
+		nil,
+		nil,
+		[]byte(`{"text":"I'll create a Snake game in HTML with embedded CSS and JavaScript."}`),
+		&param,
+	)
+	if len(first) != 1 {
+		t.Fatalf("first chunk lines = %d, want 1", len(first))
+	}
+	if got := gjson.Get(first[0], "choices.0.delta.content").String(); got == "" {
+		t.Fatalf("first chunk content is empty: %s", first[0])
+	}
+
+	second := ConvertAuggieResponseToOpenAI(
+		context.Background(),
+		"gpt-5.4",
+		nil,
+		nil,
+		[]byte(`{"text":"","nodes":[{"id":2,"type":2,"content":"\n<canvas id=\"game\"></canvas>\n","tool_use":null,"thinking":null,"token_usage":null}]}`),
+		&param,
+	)
+	if len(second) != 1 {
+		t.Fatalf("second chunk lines = %d, want 1", len(second))
+	}
+	if got := gjson.Get(second[0], "choices.0.delta.content").String(); !strings.Contains(got, "<canvas id=\"game\"></canvas>") {
+		t.Fatalf("second chunk content = %q, want node content fallback; chunk=%s", got, second[0])
+	}
+
+	third := ConvertAuggieResponseToOpenAI(
+		context.Background(),
+		"gpt-5.4",
+		nil,
+		nil,
+		[]byte(`{"text":"","stop_reason":"end_turn"}`),
+		&param,
+	)
+	if len(third) != 1 {
+		t.Fatalf("third chunk lines = %d, want 1", len(third))
+	}
+	if got := gjson.Get(third[0], "choices.0.finish_reason").String(); got != "stop" {
+		t.Fatalf("third chunk finish_reason = %q, want stop; chunk=%s", got, third[0])
+	}
+}
+
 func TestConvertAuggieResponseToOpenAI_ExtractsToolUseFromNodes(t *testing.T) {
 	var param any
 

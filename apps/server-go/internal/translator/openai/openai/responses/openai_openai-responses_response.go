@@ -379,20 +379,29 @@ func applyDefaultFieldsToResponsesObject(payload string, objectPath string, fall
 	}{
 		{field: "background", value: false},
 		{field: "completed_at", value: nil},
+		{field: "content_filters", value: nil},
 		{field: "error", value: nil},
+		{field: "frequency_penalty", value: 0.0},
 		{field: "incomplete_details", value: nil},
 		{field: "instructions", value: nil},
 		{field: "max_output_tokens", value: nil},
+		{field: "max_tool_calls", value: nil},
 		{field: "metadata", value: map[string]any{}},
 		{field: "output", value: []any{}},
 		{field: "parallel_tool_calls", value: true},
+		{field: "presence_penalty", value: 0.0},
 		{field: "previous_response_id", value: nil},
-		{field: "reasoning", value: map[string]any{"effort": nil, "summary": nil}},
+		{field: "prompt_cache_key", value: nil},
+		{field: "prompt_cache_retention", value: nil},
+		{field: "reasoning", value: map[string]any{"effort": "none", "summary": nil}},
+		{field: "safety_identifier", value: nil},
+		{field: "service_tier", value: "default"},
 		{field: "store", value: true},
 		{field: "temperature", value: 1.0},
-		{field: "text", value: map[string]any{"format": map[string]any{"type": "text"}}},
+		{field: "text", value: map[string]any{"format": map[string]any{"type": "text"}, "verbosity": "medium"}},
 		{field: "tool_choice", value: "auto"},
 		{field: "tools", value: []any{}},
+		{field: "top_logprobs", value: 0},
 		{field: "top_p", value: 1.0},
 		{field: "truncation", value: "disabled"},
 		{field: "usage", value: nil},
@@ -455,6 +464,12 @@ func applyRequestFieldsToResponsesObject(payload string, objectPath string, requ
 		}
 		if v := req.Get("background"); v.Exists() {
 			payload, _ = sjson.Set(payload, responseObjectPath(objectPath, "background"), v.Bool())
+		}
+		if v := req.Get("frequency_penalty"); v.Exists() {
+			payload, _ = sjson.Set(payload, responseObjectPath(objectPath, "frequency_penalty"), v.Float())
+		}
+		if v := req.Get("presence_penalty"); v.Exists() {
+			payload, _ = sjson.Set(payload, responseObjectPath(objectPath, "presence_penalty"), v.Float())
 		}
 		if v := req.Get("temperature"); v.Exists() {
 			payload, _ = sjson.Set(payload, responseObjectPath(objectPath, "temperature"), v.Float())

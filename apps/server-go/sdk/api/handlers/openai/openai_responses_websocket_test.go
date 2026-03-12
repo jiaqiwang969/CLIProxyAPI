@@ -1782,6 +1782,50 @@ func TestResponsesWebsocket_RejectsUnsupportedTextVerbosityBeforeExecution(t *te
 	}
 }
 
+func TestResponsesWebsocket_AllowsSupportedTextVerbosityBeforeExecutionForAuggie(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	executor, manager, auth := newOpenAISurfaceTestHarness(t)
+	registerSurfaceModel(t, auth.ID, auth.Provider, &registry.ModelInfo{
+		ID:      "gpt-5-4",
+		Object:  "model",
+		OwnedBy: "auggie",
+		Type:    "auggie",
+		Version: "gpt-5-4",
+	})
+
+	base := handlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, manager)
+	h := NewOpenAIResponsesAPIHandler(base)
+	router := gin.New()
+	router.GET("/v1/responses", h.ResponsesWebsocket)
+
+	server := httptest.NewServer(router)
+	t.Cleanup(server.Close)
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/v1/responses"
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		t.Fatalf("Dial websocket: %v", err)
+	}
+	defer conn.Close()
+
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","model":"gpt-5-4","input":"hello","text":{"verbosity":"high"}}`)); err != nil {
+		t.Fatalf("WriteMessage: %v", err)
+	}
+
+	_, payload, err := conn.ReadMessage()
+	if err != nil {
+		t.Fatalf("ReadMessage: %v", err)
+	}
+
+	if got := gjson.GetBytes(payload, "type").String(); got != "response.done" {
+		t.Fatalf("event type = %q, want response.done; payload=%s", got, payload)
+	}
+	if executor.streamExecuteCalls != 1 {
+		t.Fatalf("stream execute calls = %d, want 1", executor.streamExecuteCalls)
+	}
+}
+
 func TestResponsesWebsocket_RejectsUnsupportedReasoningEffortBeforeExecution(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
@@ -1886,53 +1930,65 @@ func TestResponsesWebsocket_RejectsNonPreservedReasoningEffortBeforeExecutionFor
 	}
 }
 
-func TestResponsesWebsocket_RejectsReasoningSummaryBeforeExecutionForAuggie(t *testing.T) {
+func TestResponsesWebsocket_AllowsReasoningSummaryControlsBeforeExecutionForAuggie(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
-	executor, manager, auth := newOpenAISurfaceTestHarness(t)
-	registerSurfaceModel(t, auth.ID, auth.Provider, &registry.ModelInfo{
-		ID:      "gpt-5-4",
-		Object:  "model",
-		OwnedBy: "auggie",
-		Type:    "auggie",
-		Version: "gpt-5-4",
-	})
-
-	base := handlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, manager)
-	h := NewOpenAIResponsesAPIHandler(base)
-	router := gin.New()
-	router.GET("/v1/responses", h.ResponsesWebsocket)
-
-	server := httptest.NewServer(router)
-	t.Cleanup(server.Close)
-
-	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/v1/responses"
-	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
-	if err != nil {
-		t.Fatalf("Dial websocket: %v", err)
-	}
-	defer conn.Close()
-
-	if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","model":"gpt-5-4","input":"hello","reasoning":{"summary":"detailed"}}`)); err != nil {
-		t.Fatalf("WriteMessage: %v", err)
+	testCases := []struct {
+		name        string
+		requestBody string
+	}{
+		{
+			name:        "reasoning_summary",
+			requestBody: `{"type":"response.create","model":"gpt-5-4","input":"hello","reasoning":{"summary":"detailed"}}`,
+		},
+		{
+			name:        "reasoning_generate_summary",
+			requestBody: `{"type":"response.create","model":"gpt-5-4","input":"hello","reasoning":{"generate_summary":true}}`,
+		},
 	}
 
-	_, payload, err := conn.ReadMessage()
-	if err != nil {
-		t.Fatalf("ReadMessage: %v", err)
-	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			executor, manager, auth := newOpenAISurfaceTestHarness(t)
+			registerSurfaceModel(t, auth.ID, auth.Provider, &registry.ModelInfo{
+				ID:      "gpt-5-4",
+				Object:  "model",
+				OwnedBy: "auggie",
+				Type:    "auggie",
+				Version: "gpt-5-4",
+			})
 
-	if got := gjson.GetBytes(payload, "type").String(); got != "error" {
-		t.Fatalf("event type = %q, want error; payload=%s", got, payload)
-	}
-	if got := int(gjson.GetBytes(payload, "status").Int()); got != http.StatusBadRequest {
-		t.Fatalf("status = %d, want %d; payload=%s", got, http.StatusBadRequest, payload)
-	}
-	if got := gjson.GetBytes(payload, "error.param").String(); got != "reasoning.summary" {
-		t.Fatalf("error.param = %q, want reasoning.summary; payload=%s", got, payload)
-	}
-	if executor.streamExecuteCalls != 0 {
-		t.Fatalf("stream execute calls = %d, want 0", executor.streamExecuteCalls)
+			base := handlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, manager)
+			h := NewOpenAIResponsesAPIHandler(base)
+			router := gin.New()
+			router.GET("/v1/responses", h.ResponsesWebsocket)
+
+			server := httptest.NewServer(router)
+			t.Cleanup(server.Close)
+
+			wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/v1/responses"
+			conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+			if err != nil {
+				t.Fatalf("Dial websocket: %v", err)
+			}
+			defer conn.Close()
+
+			if err := conn.WriteMessage(websocket.TextMessage, []byte(tc.requestBody)); err != nil {
+				t.Fatalf("WriteMessage: %v", err)
+			}
+
+			_, payload, err := conn.ReadMessage()
+			if err != nil {
+				t.Fatalf("ReadMessage: %v", err)
+			}
+
+			if got := gjson.GetBytes(payload, "type").String(); got != "response.done" {
+				t.Fatalf("event type = %q, want response.done; payload=%s", got, payload)
+			}
+			if executor.streamExecuteCalls != 1 {
+				t.Fatalf("stream execute calls = %d, want 1", executor.streamExecuteCalls)
+			}
+		})
 	}
 }
 
@@ -1968,11 +2024,6 @@ func TestResponsesWebsocket_RejectsNonPreservedAuggieSamplingControlsBeforeExecu
 			name:        "top_p",
 			requestBody: `{"type":"response.create","model":"gpt-5-4","input":"hello","top_p":0.9}`,
 			wantParam:   "top_p",
-		},
-		{
-			name:        "text.verbosity",
-			requestBody: `{"type":"response.create","model":"gpt-5-4","input":"hello","text":{"verbosity":"high"}}`,
-			wantParam:   "text.verbosity",
 		},
 	}
 
@@ -2227,7 +2278,7 @@ func TestResponsesWebsocket_RejectsNonPreservedAuggieContextManagementBeforeExec
 	}
 }
 
-func TestResponsesWebsocket_RejectsNonPreservedAuggiePromptCacheAndSafetyControlsBeforeExecution(t *testing.T) {
+func TestResponsesWebsocket_AllowsAuggiePromptCacheAndSafetyControlsBeforeExecution(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
 	testCases := []struct {
@@ -2292,17 +2343,11 @@ func TestResponsesWebsocket_RejectsNonPreservedAuggiePromptCacheAndSafetyControl
 				t.Fatalf("ReadMessage: %v", err)
 			}
 
-			if got := gjson.GetBytes(payload, "type").String(); got != "error" {
-				t.Fatalf("event type = %q, want error; payload=%s", got, payload)
+			if got := gjson.GetBytes(payload, "type").String(); got != "response.done" {
+				t.Fatalf("event type = %q, want response.done; payload=%s", got, payload)
 			}
-			if got := int(gjson.GetBytes(payload, "status").Int()); got != http.StatusBadRequest {
-				t.Fatalf("status = %d, want %d; payload=%s", got, http.StatusBadRequest, payload)
-			}
-			if got := gjson.GetBytes(payload, "error.param").String(); got != tc.wantParam {
-				t.Fatalf("error.param = %q, want %q; payload=%s", got, tc.wantParam, payload)
-			}
-			if executor.streamExecuteCalls != 0 {
-				t.Fatalf("stream execute calls = %d, want 0", executor.streamExecuteCalls)
+			if executor.streamExecuteCalls != 1 {
+				t.Fatalf("stream execute calls = %d, want 1", executor.streamExecuteCalls)
 			}
 		})
 	}
@@ -2588,7 +2633,7 @@ func TestResponsesWebsocket_RejectsNonPreservedAuggieForcedToolChoiceFormsBefore
 	}
 }
 
-func TestResponsesWebsocket_RejectsNonPreservedAuggieBuiltInWebSearchToolConfigBeforeExecution(t *testing.T) {
+func TestResponsesWebsocket_AllowsAuggieBuiltInWebSearchToolConfigBeforeExecution(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
 	testCases := []struct {
@@ -2615,6 +2660,11 @@ func TestResponsesWebsocket_RejectsNonPreservedAuggieBuiltInWebSearchToolConfigB
 			name:        "web_search_user_location",
 			requestBody: `{"type":"response.create","model":"gpt-5-4","input":"Find local weather news","tools":[{"type":"web_search","user_location":{"type":"approximate","country":"US","timezone":"America/Los_Angeles"}}]}`,
 			wantParam:   "tools[0].user_location",
+		},
+		{
+			name:        "web_search_external_web_access",
+			requestBody: `{"type":"response.create","model":"gpt-5-4","input":"Find the latest OpenAI news","tools":[{"type":"web_search","external_web_access":true}]}`,
+			wantParam:   "tools[0].external_web_access",
 		},
 	}
 
@@ -2653,17 +2703,11 @@ func TestResponsesWebsocket_RejectsNonPreservedAuggieBuiltInWebSearchToolConfigB
 				t.Fatalf("ReadMessage: %v", err)
 			}
 
-			if got := gjson.GetBytes(payload, "type").String(); got != "error" {
-				t.Fatalf("event type = %q, want error; payload=%s", got, payload)
+			if got := gjson.GetBytes(payload, "type").String(); got != "response.done" {
+				t.Fatalf("event type = %q, want response.done; payload=%s", got, payload)
 			}
-			if got := int(gjson.GetBytes(payload, "status").Int()); got != http.StatusBadRequest {
-				t.Fatalf("status = %d, want %d; payload=%s", got, http.StatusBadRequest, payload)
-			}
-			if got := gjson.GetBytes(payload, "error.param").String(); got != tc.wantParam {
-				t.Fatalf("error.param = %q, want %q; payload=%s", got, tc.wantParam, payload)
-			}
-			if executor.streamExecuteCalls != 0 {
-				t.Fatalf("stream execute calls = %d, want 0", executor.streamExecuteCalls)
+			if executor.streamExecuteCalls != 1 {
+				t.Fatalf("stream execute calls = %d, want 1", executor.streamExecuteCalls)
 			}
 		})
 	}
@@ -2737,7 +2781,7 @@ func TestResponsesWebsocket_RejectsDefaultStrictFunctionToolsBeforeExecutionForA
 	}
 }
 
-func TestResponsesWebsocket_RejectsCustomToolGrammarBeforeExecutionForAuggie(t *testing.T) {
+func TestResponsesWebsocket_AllowsCustomToolGrammarBeforeExecutionForAuggie(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
 	executor, manager, auth := newOpenAISurfaceTestHarness(t)
@@ -2773,20 +2817,11 @@ func TestResponsesWebsocket_RejectsCustomToolGrammarBeforeExecutionForAuggie(t *
 		t.Fatalf("ReadMessage: %v", err)
 	}
 
-	if got := gjson.GetBytes(payload, "type").String(); got != "error" {
-		t.Fatalf("event type = %q, want error; payload=%s", got, payload)
+	if got := gjson.GetBytes(payload, "type").String(); got != "response.done" {
+		t.Fatalf("event type = %q, want response.done; payload=%s", got, payload)
 	}
-	if got := int(gjson.GetBytes(payload, "status").Int()); got != http.StatusBadRequest {
-		t.Fatalf("status = %d, want %d; payload=%s", got, http.StatusBadRequest, payload)
-	}
-	if got := gjson.GetBytes(payload, "error.param").String(); got != "tools[0].format.type" {
-		t.Fatalf("error.param = %q, want tools[0].format.type; payload=%s", got, payload)
-	}
-	if !strings.Contains(gjson.GetBytes(payload, "error.message").String(), "grammar") {
-		t.Fatalf("expected grammar guidance, got %s", payload)
-	}
-	if executor.streamExecuteCalls != 0 {
-		t.Fatalf("stream execute calls = %d, want 0", executor.streamExecuteCalls)
+	if executor.streamExecuteCalls != 1 {
+		t.Fatalf("stream execute calls = %d, want 1", executor.streamExecuteCalls)
 	}
 }
 

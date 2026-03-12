@@ -360,6 +360,32 @@ func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_CustomToolBecomesF
 	}
 }
 
+func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_CustomToolGrammarRegexSetsInputPattern(t *testing.T) {
+	out := ConvertOpenAIResponsesRequestToOpenAIChatCompletions("gpt-5", []byte(`{
+		"tools":[
+			{
+				"type":"custom",
+				"name":"bash",
+				"format":{
+					"type":"grammar",
+					"syntax":"regex",
+					"definition":"^(pwd|ls)(\\s+[-\\w./]+)?$"
+				}
+			}
+		]
+	}`), false)
+
+	if got := gjson.GetBytes(out, "tools.0.type").String(); got != "function" {
+		t.Fatalf("tools.0.type = %q, want function; payload=%s", got, out)
+	}
+	if got := gjson.GetBytes(out, "tools.0.function.parameters.properties.input.type").String(); got != "string" {
+		t.Fatalf("tools.0.function.parameters.properties.input.type = %q, want string; payload=%s", got, out)
+	}
+	if got := gjson.GetBytes(out, "tools.0.function.parameters.properties.input.pattern").String(); got != "^(pwd|ls)(\\s+[-\\w./]+)?$" {
+		t.Fatalf("tools.0.function.parameters.properties.input.pattern = %q, want regex definition; payload=%s", got, out)
+	}
+}
+
 func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_CustomToolItemsUseInputWrapper(t *testing.T) {
 	out := ConvertOpenAIResponsesRequestToOpenAIChatCompletions("gpt-5", []byte(`{
 		"input":[

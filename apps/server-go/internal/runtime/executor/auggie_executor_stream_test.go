@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -117,8 +118,8 @@ func TestAuggieExecuteStream_EmitsTranslatedOpenAISSE(t *testing.T) {
 		if got := gjson.GetBytes(body, "mode").String(); got != "CHAT" {
 			t.Fatalf("mode = %q, want CHAT", got)
 		}
-		if got := gjson.GetBytes(body, "message").String(); got != "help me" {
-			t.Fatalf("message = %q, want help me", got)
+		if got := gjson.GetBytes(body, "message").String(); got != "You are terse.\n\nhelp me" {
+			t.Fatalf("message = %q, want inlined system instructions + help me", got)
 		}
 		if got := gjson.GetBytes(body, "chat_history.0.request_message").String(); got != "hello" {
 			t.Fatalf("chat_history[0].request_message = %q, want hello", got)
@@ -211,6 +212,42 @@ func TestAuggieExecute_AggregatesTranslatedStreamIntoOpenAIResponse(t *testing.T
 	}
 	if got := gjson.GetBytes(resp.Payload, "choices.0.finish_reason").String(); got != "stop" {
 		t.Fatalf("finish_reason = %q, want stop", got)
+	}
+}
+
+func TestAuggieExecute_AggregatesNodeContentWhenTopLevelTextMissing(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/chat-stream" {
+			t.Fatalf("path = %q, want /chat-stream", r.URL.Path)
+		}
+		if r.Method != http.MethodPost {
+			t.Fatalf("method = %q, want POST", r.Method)
+		}
+
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		flusher, _ := w.(http.Flusher)
+		_, _ = fmt.Fprintln(w, `{"text":"I'll create a Snake game in HTML with embedded CSS and JavaScript."}`)
+		flusher.Flush()
+		_, _ = fmt.Fprintln(w, `{"text":"","nodes":[{"id":2,"type":2,"content":"\n<canvas id=\"game\"></canvas>\n","tool_use":null,"thinking":null,"token_usage":null}]}`)
+		flusher.Flush()
+		_, _ = fmt.Fprintln(w, `{"text":"","stop_reason":"end_turn"}`)
+		flusher.Flush()
+	}))
+	defer server.Close()
+
+	resp, err := executeAuggieNonStreamWithPayloadForTest(t, context.Background(), newAuggieStreamTestAuth("token-1"), server.URL, `{
+		"messages":[{"role":"user","content":"帮我写一个贪吃蛇的代码，html"}]
+	}`)
+	if err != nil {
+		t.Fatalf("Execute error: %v", err)
+	}
+
+	content := gjson.GetBytes(resp.Payload, "choices.0.message.content").String()
+	if !strings.Contains(content, "I'll create a Snake game in HTML") {
+		t.Fatalf("message.content missing opening sentence; content=%q payload=%s", content, resp.Payload)
+	}
+	if !strings.Contains(content, `<canvas id="game"></canvas>`) {
+		t.Fatalf("message.content missing node content fallback; content=%q payload=%s", content, resp.Payload)
 	}
 }
 
@@ -804,8 +841,8 @@ func TestAuggieExecute_AggregatesTranslatedStreamIntoOpenAIResponsesResponse(t *
 		if got := gjson.GetBytes(body, "mode").String(); got != "CHAT" {
 			t.Fatalf("mode = %q, want CHAT", got)
 		}
-		if got := gjson.GetBytes(body, "message").String(); got != "help me" {
-			t.Fatalf("message = %q, want help me", got)
+		if got := gjson.GetBytes(body, "message").String(); got != "You are terse.\n\nhelp me" {
+			t.Fatalf("message = %q, want inlined system instructions + help me", got)
 		}
 		if got := gjson.GetBytes(body, "chat_history.0.request_message").String(); got != "hello" {
 			t.Fatalf("chat_history[0].request_message = %q, want hello", got)
@@ -1411,6 +1448,10 @@ func TestAuggieResponses_CustomToolLoopUsesFunctionShim(t *testing.T) {
 		if got := gjson.GetBytes(body, "tool_definitions.0.input_schema_json").String(); !strings.Contains(got, `"input"`) || !strings.Contains(got, `"string"`) {
 			t.Fatalf("tool_definitions.0.input_schema_json = %q, want string input shim; body=%s", got, body)
 		}
+		schema := gjson.Parse(gjson.GetBytes(body, "tool_definitions.0.input_schema_json").String())
+		if got := schema.Get("properties.input.pattern").String(); got != `^(pwd|ls)(\s+[-\w./]+)?$` {
+			t.Fatalf("tool_definitions.0.input_schema_json pattern = %q, want %q; body=%s", got, `^(pwd|ls)(\s+[-\w./]+)?$`, body)
+		}
 		if got := gjson.GetBytes(body, "chat_history.0.response_nodes.0.tool_use.tool_name").String(); got != "bash" {
 			t.Fatalf("chat_history.0.response_nodes.0.tool_use.tool_name = %q, want bash; body=%s", got, body)
 		}
@@ -1438,7 +1479,7 @@ func TestAuggieResponses_CustomToolLoopUsesFunctionShim(t *testing.T) {
 			{"type":"custom_tool_call","call_id":"custom-call-1","name":"bash","input":"pwd"},
 			{"type":"custom_tool_call_output","call_id":"custom-call-1","output":"/Users/jqwang/05-api-代理/CLIProxyAPI-wjq"}
 		],
-		"tools":[{"type":"custom","name":"bash","description":"Run shell commands"}]
+		"tools":[{"type":"custom","name":"bash","description":"Run shell commands","format":{"type":"grammar","syntax":"regex","definition":"^(pwd|ls)(\\s+[-\\w./]+)?$"}}]
 	}`)
 	if err != nil {
 		t.Fatalf("Execute error: %v", err)
@@ -3334,6 +3375,17 @@ func TestValidateAuggieResponsesRequestCapabilities_RejectsUnsupportedTextVerbos
 	assertOpenAIErrorJSON(t, err, "text.verbosity", "invalid_value", "text.verbosity")
 }
 
+func TestValidateAuggieResponsesRequestCapabilities_AllowsSupportedTextVerbosity(t *testing.T) {
+	t.Parallel()
+
+	err := validateAuggieResponsesRequestCapabilities([]byte(`{
+		"text":{"verbosity":"high"}
+	}`))
+	if err != nil {
+		t.Fatalf("unexpected error for supported text.verbosity: %v", err)
+	}
+}
+
 func TestValidateAuggieResponsesRequestCapabilities_RejectsUnsupportedReasoningEffort(t *testing.T) {
 	t.Parallel()
 
@@ -3362,16 +3414,35 @@ func TestValidateAuggieResponsesRequestCapabilities_RejectsNonPreservedReasoning
 	}
 }
 
-func TestValidateAuggieResponsesRequestCapabilities_RejectsReasoningSummary(t *testing.T) {
+func TestValidateAuggieResponsesRequestCapabilities_AllowsReasoningSummaryControls(t *testing.T) {
 	t.Parallel()
 
-	err := validateAuggieResponsesRequestCapabilities([]byte(`{
+	testCases := []struct {
+		name    string
+		payload string
+	}{
+		{
+			name: "reasoning_summary",
+			payload: `{
 		"reasoning":{"summary":"detailed"}
-	}`))
-	if err == nil {
-		t.Fatal("expected error for unsupported reasoning.summary")
+	}`,
+		},
+		{
+			name: "reasoning_generate_summary",
+			payload: `{
+		"reasoning":{"generate_summary":true}
+	}`,
+		},
 	}
-	assertOpenAIErrorJSON(t, err, "reasoning.summary", "invalid_value", "reasoning.summary")
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateAuggieResponsesRequestCapabilities([]byte(tc.payload))
+			if err != nil {
+				t.Fatalf("unexpected error for reasoning summary control %q: %v", tc.name, err)
+			}
+		})
+	}
 }
 
 func TestValidateAuggieResponsesRequestCapabilities_RejectsNonPreservedSamplingControls(t *testing.T) {
@@ -3406,11 +3477,6 @@ func TestValidateAuggieResponsesRequestCapabilities_RejectsNonPreservedSamplingC
 			name:      "top_p",
 			payload:   `{"top_p":0.9}`,
 			wantParam: "top_p",
-		},
-		{
-			name:      "text.verbosity",
-			payload:   `{"text":{"verbosity":"high"}}`,
-			wantParam: "text.verbosity",
 		},
 	}
 
@@ -3473,7 +3539,7 @@ func TestValidateAuggieResponsesRequestCapabilities_RejectsNonPreservedContextMa
 	assertOpenAIErrorJSON(t, err, "context_management", "invalid_value", "context_management")
 }
 
-func TestValidateAuggieResponsesRequestCapabilities_RejectsNonPreservedPromptCacheAndSafetyControls(t *testing.T) {
+func TestValidateAuggieResponsesRequestCapabilities_AllowsPromptCacheAndSafetyControls(t *testing.T) {
 	t.Parallel()
 
 	testCases := []struct {
@@ -3506,10 +3572,9 @@ func TestValidateAuggieResponsesRequestCapabilities_RejectsNonPreservedPromptCac
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			err := validateAuggieResponsesRequestCapabilities([]byte(tc.payload))
-			if err == nil {
-				t.Fatalf("expected error for non-preserved %s", tc.wantParam)
+			if err != nil {
+				t.Fatalf("unexpected error for %s: %v", tc.wantParam, err)
 			}
-			assertOpenAIErrorJSON(t, err, tc.wantParam, "invalid_value", tc.wantParam)
 		})
 	}
 }
@@ -3571,7 +3636,7 @@ func TestValidateAuggieResponsesToolTypes_ErrorMentionsWebSearchSupport(t *testi
 	}
 }
 
-func TestValidateAuggieResponsesToolTypes_RejectsCustomGrammarFormat(t *testing.T) {
+func TestValidateAuggieResponsesToolTypes_AllowsCustomGrammarFormat(t *testing.T) {
 	t.Parallel()
 
 	err := validateAuggieResponsesToolTypes([]byte(`{
@@ -3585,12 +3650,8 @@ func TestValidateAuggieResponsesToolTypes_RejectsCustomGrammarFormat(t *testing.
 			}
 		}]
 	}`))
-	if err == nil {
-		t.Fatal("expected error for unsupported custom grammar format")
-	}
-	assertOpenAIErrorJSON(t, err, "tools[0].format.type", "invalid_value", "tools[0].format.type")
-	if !strings.Contains(err.Error(), "grammar") {
-		t.Fatalf("error = %q, want grammar guidance", err.Error())
+	if err != nil {
+		t.Fatalf("unexpected error for supported custom grammar format: %v", err)
 	}
 }
 
@@ -3614,7 +3675,7 @@ func TestValidateAuggieResponsesToolTypes_RejectsDeferredFunctionToolLoading(t *
 	}
 }
 
-func TestValidateAuggieResponsesRequestCapabilities_RejectsNonPreservedBuiltInWebSearchToolConfig(t *testing.T) {
+func TestValidateAuggieResponsesRequestCapabilities_AllowsBuiltInWebSearchToolConfig(t *testing.T) {
 	t.Parallel()
 
 	testCases := []struct {
@@ -3642,15 +3703,19 @@ func TestValidateAuggieResponsesRequestCapabilities_RejectsNonPreservedBuiltInWe
 			payload:   `{"tools":[{"type":"web_search","user_location":{"type":"approximate","country":"US"}}]}`,
 			wantParam: "tools[0].user_location",
 		},
+		{
+			name:      "web_search_external_web_access",
+			payload:   `{"tools":[{"type":"web_search","external_web_access":true}]}`,
+			wantParam: "tools[0].external_web_access",
+		},
 	}
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			err := validateAuggieResponsesRequestCapabilities([]byte(tc.payload))
-			if err == nil {
-				t.Fatalf("expected error for non-preserved built-in web search config %q", tc.name)
+			if err != nil {
+				t.Fatalf("unexpected error for built-in web search config %q: %v", tc.name, err)
 			}
-			assertOpenAIErrorJSON(t, err, tc.wantParam, "invalid_value", tc.wantParam)
 		})
 	}
 }
@@ -4018,6 +4083,32 @@ func TestAuggieExecuteStream_RetriesUnauthorizedBeforeFirstByte(t *testing.T) {
 	}
 }
 
+func TestBuildAuggieSystemPromptCustomizationFallbackPayload_StripsNativeFieldsAndInlinesPrompt(t *testing.T) {
+	translated := []byte(`{
+		"model":"gpt-5-4",
+		"mode":"CHAT",
+		"message":"hello",
+		"system_prompt":"You are terse.",
+		"system_prompt_append":"Only answer with JSON.",
+		"chat_history":[]
+	}`)
+	upstreamError := []byte(`{"error":"System prompt customization (override, append, replacements) is not enabled."}`)
+
+	fallback, ok := buildAuggieSystemPromptCustomizationFallbackPayload(translated, upstreamError)
+	if !ok {
+		t.Fatalf("expected fallback payload to be generated; translated=%s", translated)
+	}
+	if gjson.GetBytes(fallback, "system_prompt").Exists() {
+		t.Fatalf("fallback payload should omit system_prompt; payload=%s", fallback)
+	}
+	if gjson.GetBytes(fallback, "system_prompt_append").Exists() {
+		t.Fatalf("fallback payload should omit system_prompt_append; payload=%s", fallback)
+	}
+	if got := gjson.GetBytes(fallback, "message").String(); got != "You are terse.\n\nOnly answer with JSON.\n\nhello" {
+		t.Fatalf("fallback message = %q, want inlined prompt+append+message; payload=%s", got, fallback)
+	}
+}
+
 func TestAuggieExecuteStream_DoesNotRetryAfterFirstByte(t *testing.T) {
 	attempts := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -4108,8 +4199,8 @@ func TestAuggieExecuteStream_EmitsTranslatedOpenAIResponsesSSE(t *testing.T) {
 		if err != nil {
 			t.Fatalf("read body: %v", err)
 		}
-		if got := gjson.GetBytes(body, "message").String(); got != "help me" {
-			t.Fatalf("message = %q, want help me", got)
+		if got := gjson.GetBytes(body, "message").String(); got != "You are terse.\n\nhelp me" {
+			t.Fatalf("message = %q, want inlined instructions + help me", got)
 		}
 
 		w.Header().Set("Content-Type", "application/x-ndjson")
@@ -4399,6 +4490,205 @@ func TestAuggieExecuteStream_OpenAIResponsesWebSearchCompletesViaRemoteToolBridg
 	}
 }
 
+type auggieUnexpectedEOFReadCloser struct {
+	payload []byte
+	emitted bool
+}
+
+func (r *auggieUnexpectedEOFReadCloser) Read(p []byte) (int, error) {
+	if r.emitted {
+		return 0, io.ErrUnexpectedEOF
+	}
+	r.emitted = true
+	n := copy(p, r.payload)
+	return n, io.ErrUnexpectedEOF
+}
+
+func (r *auggieUnexpectedEOFReadCloser) Close() error {
+	return nil
+}
+
+func TestAuggieResponses_RetriesListRemoteToolsOnBodyReadUnexpectedEOF(t *testing.T) {
+	chatStreamCalls := 0
+	listRemoteToolsCalls := 0
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read body: %v", err)
+		}
+
+		switch r.URL.Path {
+		case "/chat-stream":
+			chatStreamCalls++
+			if got := gjson.GetBytes(body, "tool_definitions.0.description").String(); got != testAuggieWebSearchDescription {
+				t.Fatalf("tool_definitions.0.description = %q, want %q; body=%s", got, testAuggieWebSearchDescription, body)
+			}
+			if got := gjson.GetBytes(body, "tool_definitions.0.input_schema_json").String(); got != testAuggieWebSearchInputSchema {
+				t.Fatalf("tool_definitions.0.input_schema_json = %q, want %q; body=%s", got, testAuggieWebSearchInputSchema, body)
+			}
+
+			w.Header().Set("Content-Type", "application/x-ndjson")
+			flusher, _ := w.(http.Flusher)
+			_, _ = fmt.Fprintln(w, `{"text":"hello from retry","stop_reason":"end_turn"}`)
+			flusher.Flush()
+		case "/agents/list-remote-tools":
+			listRemoteToolsCalls++
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprintf(w, `{"tools":[{"remote_tool_id":1,"availability_status":1,"tool_safety":1,"tool_definition":{"name":"web-search","description":%q,"input_schema_json":%q}}]}`+"\n", testAuggieWebSearchDescription, testAuggieWebSearchInputSchema)
+		case "/agents/run-remote-tool":
+			t.Fatalf("unexpected /agents/run-remote-tool request; body=%s", body)
+		default:
+			t.Fatalf("unexpected path %q body=%s", r.URL.Path, body)
+		}
+	}))
+	defer server.Close()
+
+	baseTransport := newAuggieRewriteTransport(t, server.URL)
+	var listRequestAttemptCount atomic.Int32
+	var injectedEOFCount atomic.Int32
+	ctx := context.WithValue(context.Background(), "cliproxy.roundtripper", roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if req.URL.Path == "/agents/list-remote-tools" {
+			listRequestAttemptCount.Add(1)
+			if injectedEOFCount.CompareAndSwap(0, 1) {
+				faultPayload := []byte(`{"tools":[{"remote_tool_id":1}]}`)
+				return &http.Response{
+					StatusCode:    http.StatusOK,
+					Status:        "200 OK",
+					Header:        http.Header{"Content-Type": []string{"application/json"}},
+					ContentLength: int64(len(faultPayload) + 64),
+					Body:          &auggieUnexpectedEOFReadCloser{payload: faultPayload},
+					Request:       req,
+				}, nil
+			}
+		}
+		return baseTransport.RoundTrip(req)
+	}))
+
+	exec := NewAuggieExecutor(&config.Config{})
+	payload := `{
+		"model":"gpt-5.4",
+		"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}],
+		"tools":[{"type":"web_search"}]
+	}`
+	req := cliproxyexecutor.Request{
+		Model:   "gpt-5.4",
+		Payload: []byte(payload),
+		Format:  sdktranslator.FormatOpenAIResponse,
+	}
+	opts := cliproxyexecutor.Options{
+		Stream:          false,
+		OriginalRequest: req.Payload,
+		SourceFormat:    sdktranslator.FormatOpenAIResponse,
+	}
+
+	resp, err := exec.Execute(ctx, newAuggieStreamTestAuth("token-1"), req, opts)
+	if err != nil {
+		t.Fatalf("Execute error: %v", err)
+	}
+
+	if got := injectedEOFCount.Load(); got != 1 {
+		t.Fatalf("injected EOF count = %d, want 1", got)
+	}
+	if got := listRequestAttemptCount.Load(); got != 2 {
+		t.Fatalf("list request attempts = %d, want 2 (one failed + one retry)", got)
+	}
+	if listRemoteToolsCalls != 1 {
+		t.Fatalf("listRemoteToolsCalls = %d, want 1 successful retry call", listRemoteToolsCalls)
+	}
+	if chatStreamCalls != 1 {
+		t.Fatalf("chatStreamCalls = %d, want 1", chatStreamCalls)
+	}
+	if got := gjson.GetBytes(resp.Payload, `output.#(type=="message").content.0.text`).String(); got != "hello from retry" {
+		t.Fatalf("message output text = %q, want hello from retry; payload=%s", got, resp.Payload)
+	}
+}
+
+func TestAuggieResponses_RetriesListRemoteToolsOnTransportUnexpectedEOF(t *testing.T) {
+	chatStreamCalls := 0
+	listRemoteToolsCalls := 0
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read body: %v", err)
+		}
+
+		switch r.URL.Path {
+		case "/chat-stream":
+			chatStreamCalls++
+			if got := gjson.GetBytes(body, "tool_definitions.0.description").String(); got != testAuggieWebSearchDescription {
+				t.Fatalf("tool_definitions.0.description = %q, want %q; body=%s", got, testAuggieWebSearchDescription, body)
+			}
+
+			w.Header().Set("Content-Type", "application/x-ndjson")
+			flusher, _ := w.(http.Flusher)
+			_, _ = fmt.Fprintln(w, `{"text":"hello after transport retry","stop_reason":"end_turn"}`)
+			flusher.Flush()
+		case "/agents/list-remote-tools":
+			listRemoteToolsCalls++
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprintf(w, `{"tools":[{"remote_tool_id":1,"availability_status":1,"tool_safety":1,"tool_definition":{"name":"web-search","description":%q,"input_schema_json":%q}}]}`+"\n", testAuggieWebSearchDescription, testAuggieWebSearchInputSchema)
+		case "/agents/run-remote-tool":
+			t.Fatalf("unexpected /agents/run-remote-tool request; body=%s", body)
+		default:
+			t.Fatalf("unexpected path %q body=%s", r.URL.Path, body)
+		}
+	}))
+	defer server.Close()
+
+	baseTransport := newAuggieRewriteTransport(t, server.URL)
+	var listRequestAttemptCount atomic.Int32
+	var injectedTransportEOFCount atomic.Int32
+	ctx := context.WithValue(context.Background(), "cliproxy.roundtripper", roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if req.URL.Path == "/agents/list-remote-tools" {
+			listRequestAttemptCount.Add(1)
+			if injectedTransportEOFCount.CompareAndSwap(0, 1) {
+				return nil, io.ErrUnexpectedEOF
+			}
+		}
+		return baseTransport.RoundTrip(req)
+	}))
+
+	exec := NewAuggieExecutor(&config.Config{})
+	payload := `{
+		"model":"gpt-5.4",
+		"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}],
+		"tools":[{"type":"web_search"}]
+	}`
+	req := cliproxyexecutor.Request{
+		Model:   "gpt-5.4",
+		Payload: []byte(payload),
+		Format:  sdktranslator.FormatOpenAIResponse,
+	}
+	opts := cliproxyexecutor.Options{
+		Stream:          false,
+		OriginalRequest: req.Payload,
+		SourceFormat:    sdktranslator.FormatOpenAIResponse,
+	}
+
+	resp, err := exec.Execute(ctx, newAuggieStreamTestAuth("token-1"), req, opts)
+	if err != nil {
+		t.Fatalf("Execute error: %v", err)
+	}
+
+	if got := injectedTransportEOFCount.Load(); got != 1 {
+		t.Fatalf("injected transport EOF count = %d, want 1", got)
+	}
+	if got := listRequestAttemptCount.Load(); got != 2 {
+		t.Fatalf("list request attempts = %d, want 2 (one failed + one retry)", got)
+	}
+	if listRemoteToolsCalls != 1 {
+		t.Fatalf("listRemoteToolsCalls = %d, want 1 successful retry call", listRemoteToolsCalls)
+	}
+	if chatStreamCalls != 1 {
+		t.Fatalf("chatStreamCalls = %d, want 1", chatStreamCalls)
+	}
+	if got := gjson.GetBytes(resp.Payload, `output.#(type=="message").content.0.text`).String(); got != "hello after transport retry" {
+		t.Fatalf("message output text = %q, want hello after transport retry; payload=%s", got, resp.Payload)
+	}
+}
+
 func TestAuggieExecuteStream_OpenAIResponsesWebSearchIncludesRequestedSourcesAndResults(t *testing.T) {
 	chatStreamCalls := 0
 	listRemoteToolsCalls := 0
@@ -4548,8 +4838,8 @@ func TestAuggieExecute_AggregatesTranslatedStreamIntoClaudeResponse(t *testing.T
 		if got := gjson.GetBytes(body, "mode").String(); got != "CHAT" {
 			t.Fatalf("mode = %q, want CHAT", got)
 		}
-		if got := gjson.GetBytes(body, "message").String(); got != "help me" {
-			t.Fatalf("message = %q, want help me", got)
+		if got := gjson.GetBytes(body, "message").String(); got != "You are terse.\n\nhelp me" {
+			t.Fatalf("message = %q, want inlined system instructions + help me", got)
 		}
 		if got := gjson.GetBytes(body, "chat_history.0.request_message").String(); got != "hello" {
 			t.Fatalf("chat_history[0].request_message = %q, want hello", got)
@@ -4613,8 +4903,8 @@ func TestAuggieExecuteStream_EmitsTranslatedClaudeSSE(t *testing.T) {
 		if got := gjson.GetBytes(body, "model").String(); got != "claude-sonnet-4-6" {
 			t.Fatalf("model = %q, want claude-sonnet-4-6", got)
 		}
-		if got := gjson.GetBytes(body, "message").String(); got != "help me" {
-			t.Fatalf("message = %q, want help me", got)
+		if got := gjson.GetBytes(body, "message").String(); got != "You are terse.\n\nhelp me" {
+			t.Fatalf("message = %q, want inlined system instructions + help me", got)
 		}
 
 		w.Header().Set("Content-Type", "application/x-ndjson")

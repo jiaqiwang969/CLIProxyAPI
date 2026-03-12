@@ -53,8 +53,6 @@ struct RuntimeConfig: Sendable {
 }
 
 enum RuntimeConfigLoader {
-    private static let defaultManagedManagementKey = "cliproxy-menubar-dev"
-
     static func load() -> RuntimeConfig {
         let env = ProcessInfo.processInfo.environment
 
@@ -188,16 +186,22 @@ enum RuntimeConfigLoader {
             return envManagementKey
         }
 
-        if looksLikeBcryptHash(parsedKey), isManagedRuntimeConfigPath(configPath) {
-            return defaultManagedManagementKey
+        if looksLikeBcryptHash(parsedKey), usesDefaultLocalManagementKey(configPath) {
+            return LocalRuntimeDefaults.managementKey
         }
 
         return parsedKey
     }
 
-    private static func isManagedRuntimeConfigPath(_ path: String) -> Bool {
-        let managedPath = (NSHomeDirectory() as NSString).appendingPathComponent(".cliproxyapi/config.yaml")
-        return path == managedPath
+    private static func usesDefaultLocalManagementKey(_ path: String) -> Bool {
+        let standardizedPath = (path as NSString).standardizingPath
+        let managedPath = (NSHomeDirectory() as NSString)
+            .appendingPathComponent(".cliproxyapi/config.yaml")
+        if standardizedPath == (managedPath as NSString).standardizingPath {
+            return true
+        }
+
+        return standardizedPath.hasSuffix("/apps/server-go/config.yaml")
     }
 
     private static func looksLikeBcryptHash(_ value: String) -> Bool {

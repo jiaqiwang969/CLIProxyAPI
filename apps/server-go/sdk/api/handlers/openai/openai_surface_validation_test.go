@@ -497,7 +497,7 @@ func TestResponses_RejectsNonTextToolOutputArrayBeforeExecutionForAuggie(t *test
 	}
 }
 
-func TestResponses_RejectsCustomToolGrammarBeforeExecutionForAuggie(t *testing.T) {
+func TestResponses_AllowsCustomToolGrammarBeforeExecutionForAuggie(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
 	executor, manager, auth := newOpenAISurfaceTestHarness(t)
@@ -523,15 +523,11 @@ func TestResponses_RejectsCustomToolGrammarBeforeExecutionForAuggie(t *testing.T
 	resp := httptest.NewRecorder()
 	router.ServeHTTP(resp, req)
 
-	if resp.Code != http.StatusBadRequest {
-		t.Fatalf("status = %d, want %d; body=%s", resp.Code, http.StatusBadRequest, resp.Body.String())
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", resp.Code, http.StatusOK, resp.Body.String())
 	}
-	if executor.executeCalls != 0 {
-		t.Fatalf("execute calls = %d, want 0", executor.executeCalls)
-	}
-	assertSurfaceOpenAIErrorBody(t, resp.Body.String(), "tools[0].format.type", "invalid_value", "tools[0].format.type")
-	if !strings.Contains(resp.Body.String(), "grammar") {
-		t.Fatalf("expected grammar guidance, got %s", resp.Body.String())
+	if executor.executeCalls != 1 {
+		t.Fatalf("execute calls = %d, want 1", executor.executeCalls)
 	}
 }
 
@@ -1831,6 +1827,40 @@ func TestResponses_RejectsUnsupportedTextVerbosityBeforeExecution(t *testing.T) 
 	assertSurfaceOpenAIErrorBody(t, resp.Body.String(), "text.verbosity", "invalid_value", "text.verbosity")
 }
 
+func TestResponses_AllowsSupportedTextVerbosityBeforeExecutionForAuggie(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	executor, manager, auth := newOpenAISurfaceTestHarness(t)
+	registerSurfaceModel(t, auth.ID, auth.Provider, &registry.ModelInfo{
+		ID:      "gpt-5-4",
+		Object:  "model",
+		OwnedBy: "auggie",
+		Type:    "auggie",
+		Version: "gpt-5-4",
+	})
+
+	base := handlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, manager)
+	h := NewOpenAIResponsesAPIHandler(base)
+	router := gin.New()
+	router.POST("/v1/responses", h.Responses)
+
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"/v1/responses",
+		strings.NewReader(`{"model":"gpt-5-4","input":"hello","text":{"verbosity":"high"}}`),
+	)
+	req.Header.Set("Content-Type", "application/json")
+	resp := httptest.NewRecorder()
+	router.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", resp.Code, http.StatusOK, resp.Body.String())
+	}
+	if executor.executeCalls != 1 {
+		t.Fatalf("execute calls = %d, want 1", executor.executeCalls)
+	}
+}
+
 func TestResponses_RejectsUnsupportedReasoningEffortBeforeExecution(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
@@ -1905,39 +1935,56 @@ func TestResponses_RejectsNonPreservedReasoningEffortBeforeExecutionForAuggie(t 
 	}
 }
 
-func TestResponses_RejectsReasoningSummaryBeforeExecutionForAuggie(t *testing.T) {
+func TestResponses_AllowsReasoningSummaryControlsBeforeExecutionForAuggie(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
-	executor, manager, auth := newOpenAISurfaceTestHarness(t)
-	registerSurfaceModel(t, auth.ID, auth.Provider, &registry.ModelInfo{
-		ID:      "gpt-5-4",
-		Object:  "model",
-		OwnedBy: "auggie",
-		Type:    "auggie",
-		Version: "gpt-5-4",
-	})
-
-	base := handlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, manager)
-	h := NewOpenAIResponsesAPIHandler(base)
-	router := gin.New()
-	router.POST("/v1/responses", h.Responses)
-
-	req := httptest.NewRequest(
-		http.MethodPost,
-		"/v1/responses",
-		strings.NewReader(`{"model":"gpt-5-4","input":"hello","reasoning":{"summary":"detailed"}}`),
-	)
-	req.Header.Set("Content-Type", "application/json")
-	resp := httptest.NewRecorder()
-	router.ServeHTTP(resp, req)
-
-	if resp.Code != http.StatusBadRequest {
-		t.Fatalf("status = %d, want %d; body=%s", resp.Code, http.StatusBadRequest, resp.Body.String())
+	testCases := []struct {
+		name        string
+		requestBody string
+	}{
+		{
+			name:        "reasoning_summary",
+			requestBody: `{"model":"gpt-5-4","input":"hello","reasoning":{"summary":"detailed"}}`,
+		},
+		{
+			name:        "reasoning_generate_summary",
+			requestBody: `{"model":"gpt-5-4","input":"hello","reasoning":{"generate_summary":true}}`,
+		},
 	}
-	if executor.executeCalls != 0 {
-		t.Fatalf("execute calls = %d, want 0", executor.executeCalls)
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			executor, manager, auth := newOpenAISurfaceTestHarness(t)
+			registerSurfaceModel(t, auth.ID, auth.Provider, &registry.ModelInfo{
+				ID:      "gpt-5-4",
+				Object:  "model",
+				OwnedBy: "auggie",
+				Type:    "auggie",
+				Version: "gpt-5-4",
+			})
+
+			base := handlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, manager)
+			h := NewOpenAIResponsesAPIHandler(base)
+			router := gin.New()
+			router.POST("/v1/responses", h.Responses)
+
+			req := httptest.NewRequest(
+				http.MethodPost,
+				"/v1/responses",
+				strings.NewReader(tc.requestBody),
+			)
+			req.Header.Set("Content-Type", "application/json")
+			resp := httptest.NewRecorder()
+			router.ServeHTTP(resp, req)
+
+			if resp.Code != http.StatusOK {
+				t.Fatalf("status = %d, want %d; body=%s", resp.Code, http.StatusOK, resp.Body.String())
+			}
+			if executor.executeCalls != 1 {
+				t.Fatalf("execute calls = %d, want 1", executor.executeCalls)
+			}
+		})
 	}
-	assertSurfaceOpenAIErrorBody(t, resp.Body.String(), "reasoning.summary", "invalid_value", "reasoning.summary")
 }
 
 func TestResponses_RejectsNonPreservedAuggieSamplingControlsBeforeExecution(t *testing.T) {
@@ -1972,11 +2019,6 @@ func TestResponses_RejectsNonPreservedAuggieSamplingControlsBeforeExecution(t *t
 			name:        "top_p",
 			requestBody: `{"model":"gpt-5-4","input":"hello","top_p":0.9}`,
 			wantParam:   "top_p",
-		},
-		{
-			name:        "text.verbosity",
-			requestBody: `{"model":"gpt-5-4","input":"hello","text":{"verbosity":"high"}}`,
-			wantParam:   "text.verbosity",
 		},
 	}
 
@@ -2152,7 +2194,7 @@ func TestResponses_RejectsNonPreservedAuggieContextManagementBeforeExecution(t *
 	assertSurfaceOpenAIErrorBody(t, resp.Body.String(), "context_management", "invalid_value", "context_management")
 }
 
-func TestResponses_RejectsNonPreservedAuggiePromptCacheAndSafetyControlsBeforeExecution(t *testing.T) {
+func TestResponses_AllowsAuggiePromptCacheAndSafetyControlsBeforeExecution(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
 	testCases := []struct {
@@ -2203,13 +2245,12 @@ func TestResponses_RejectsNonPreservedAuggiePromptCacheAndSafetyControlsBeforeEx
 			resp := httptest.NewRecorder()
 			router.ServeHTTP(resp, req)
 
-			if resp.Code != http.StatusBadRequest {
-				t.Fatalf("status = %d, want %d; body=%s", resp.Code, http.StatusBadRequest, resp.Body.String())
+			if resp.Code != http.StatusOK {
+				t.Fatalf("status = %d, want %d; body=%s", resp.Code, http.StatusOK, resp.Body.String())
 			}
-			if executor.executeCalls != 0 {
-				t.Fatalf("execute calls = %d, want 0", executor.executeCalls)
+			if executor.executeCalls != 1 {
+				t.Fatalf("execute calls = %d, want 1", executor.executeCalls)
 			}
-			assertSurfaceOpenAIErrorBody(t, resp.Body.String(), tc.wantParam, "invalid_value", tc.wantParam)
 		})
 	}
 }
@@ -2459,7 +2500,7 @@ func TestResponses_RejectsNonPreservedAuggieForcedToolChoiceFormsBeforeExecution
 	}
 }
 
-func TestResponses_RejectsNonPreservedAuggieBuiltInWebSearchToolConfigBeforeExecution(t *testing.T) {
+func TestResponses_AllowsAuggieBuiltInWebSearchToolConfigBeforeExecution(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
 	testCases := []struct {
@@ -2503,6 +2544,15 @@ func TestResponses_RejectsNonPreservedAuggieBuiltInWebSearchToolConfigBeforeExec
 			}`,
 			wantParam: "tools[0].user_location",
 		},
+		{
+			name: "web_search_external_web_access",
+			requestBody: `{
+				"model":"gpt-5-4",
+				"input":"Find the latest OpenAI news",
+				"tools":[{"type":"web_search","external_web_access":true}]
+			}`,
+			wantParam: "tools[0].external_web_access",
+		},
 	}
 
 	for _, tc := range testCases {
@@ -2530,13 +2580,12 @@ func TestResponses_RejectsNonPreservedAuggieBuiltInWebSearchToolConfigBeforeExec
 			resp := httptest.NewRecorder()
 			router.ServeHTTP(resp, req)
 
-			if resp.Code != http.StatusBadRequest {
-				t.Fatalf("status = %d, want %d; body=%s", resp.Code, http.StatusBadRequest, resp.Body.String())
+			if resp.Code != http.StatusOK {
+				t.Fatalf("status = %d, want %d; body=%s", resp.Code, http.StatusOK, resp.Body.String())
 			}
-			if executor.executeCalls != 0 {
-				t.Fatalf("execute calls = %d, want 0", executor.executeCalls)
+			if executor.executeCalls != 1 {
+				t.Fatalf("execute calls = %d, want 1", executor.executeCalls)
 			}
-			assertSurfaceOpenAIErrorBody(t, resp.Body.String(), tc.wantParam, "invalid_value", tc.wantParam)
 		})
 	}
 }

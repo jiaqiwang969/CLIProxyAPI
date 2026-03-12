@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -1126,6 +1127,10 @@ func (e *AuggieExecutor) executeAuggieStream(ctx context.Context, auth *cliproxy
 		if errClose := httpResp.Body.Close(); errClose != nil {
 			log.Errorf("auggie executor: close response body error: %v", errClose)
 		}
+		if fallbackPayload, ok := buildAuggieSystemPromptCustomizationFallbackPayload(translated, body); ok {
+			log.Warn("auggie executor: upstream rejected system prompt customization controls; retrying request without native system_prompt fields")
+			return e.executeAuggieStream(ctx, auth, req, opts, fallbackPayload, from, allowRefresh)
+		}
 		return nil, statusErr{code: httpResp.StatusCode, msg: string(body)}
 	}
 
@@ -1282,71 +1287,94 @@ func (e *AuggieExecutor) executeAuggieJSON(ctx context.Context, auth *cliproxyau
 	}
 
 	requestURL := strings.TrimSuffix(tenantURL, "/") + path
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, requestURL, bytes.NewReader(requestBody))
-	if err != nil {
-		return nil, err
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Accept", "application/json")
-	httpReq.Header.Set("User-Agent", "cli-proxy-auggie")
-	httpReq.Header.Set("Authorization", "Bearer "+token)
 
-	var authID, authLabel, authType, authValue string
-	if auth != nil {
-		authID = auth.ID
-		authLabel = auth.Label
-		authType, authValue = auth.AccountInfo()
-	}
-	recordAPIRequest(ctx, e.cfg, upstreamRequestLog{
-		URL:       requestURL,
-		Method:    http.MethodPost,
-		Headers:   httpReq.Header.Clone(),
-		Body:      requestBody,
-		Provider:  e.Identifier(),
-		AuthID:    authID,
-		AuthLabel: authLabel,
-		AuthType:  authType,
-		AuthValue: authValue,
-	})
+	for attempt := 0; attempt < 2; attempt++ {
+		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, requestURL, bytes.NewReader(requestBody))
+		if err != nil {
+			return nil, err
+		}
+		httpReq.Header.Set("Content-Type", "application/json")
+		httpReq.Header.Set("Accept", "application/json")
+		httpReq.Header.Set("User-Agent", "cli-proxy-auggie")
+		httpReq.Header.Set("Authorization", "Bearer "+token)
 
-	httpResp, err := newProxyAwareHTTPClient(ctx, e.cfg, auth, 0).Do(httpReq)
-	if err != nil {
-		recordAPIResponseError(ctx, e.cfg, err)
-		return nil, err
-	}
-	defer func() {
+		var authID, authLabel, authType, authValue string
+		if auth != nil {
+			authID = auth.ID
+			authLabel = auth.Label
+			authType, authValue = auth.AccountInfo()
+		}
+		recordAPIRequest(ctx, e.cfg, upstreamRequestLog{
+			URL:       requestURL,
+			Method:    http.MethodPost,
+			Headers:   httpReq.Header.Clone(),
+			Body:      requestBody,
+			Provider:  e.Identifier(),
+			AuthID:    authID,
+			AuthLabel: authLabel,
+			AuthType:  authType,
+			AuthValue: authValue,
+		})
+
+		httpResp, err := newProxyAwareHTTPClient(ctx, e.cfg, auth, 0).Do(httpReq)
+		if err != nil {
+			recordAPIResponseError(ctx, e.cfg, err)
+			if attempt == 0 && isRetryableAuggieJSONReadErr(err) {
+				log.Warnf("auggie executor: transient upstream JSON request error on %s, retrying once: %v", requestURL, err)
+				continue
+			}
+			return nil, err
+		}
+
+		recordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
+		responseBody, readErr := io.ReadAll(httpResp.Body)
 		if errClose := httpResp.Body.Close(); errClose != nil {
 			log.Errorf("auggie executor: close response body error: %v", errClose)
 		}
-	}()
-
-	recordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
-	responseBody, readErr := io.ReadAll(httpResp.Body)
-	if readErr != nil {
-		recordAPIResponseError(ctx, e.cfg, readErr)
-		return nil, readErr
-	}
-	appendAPIResponseChunk(ctx, e.cfg, responseBody)
-
-	if httpResp.StatusCode == http.StatusUnauthorized {
-		if allowRefresh {
-			refreshed, refreshErr := e.Refresh(ctx, auth)
-			if refreshErr != nil {
-				replaceAuggieAuthState(auth, markAuggieAuthUnauthorized(auth, refreshErr.Error()))
-				return nil, refreshErr
-			}
-			replaceAuggieAuthState(auth, refreshed)
-			return e.executeAuggieJSON(ctx, auth, path, requestBody, false)
+		if len(responseBody) > 0 {
+			appendAPIResponseChunk(ctx, e.cfg, responseBody)
 		}
-		replaceAuggieAuthState(auth, markAuggieAuthUnauthorized(auth, "unauthorized"))
-		return nil, statusErr{code: http.StatusUnauthorized, msg: string(responseBody)}
-	}
-	if httpResp.StatusCode < http.StatusOK || httpResp.StatusCode >= http.StatusMultipleChoices {
-		return nil, statusErr{code: httpResp.StatusCode, msg: string(responseBody)}
+		if readErr != nil {
+			recordAPIResponseError(ctx, e.cfg, readErr)
+			if attempt == 0 && isRetryableAuggieJSONReadErr(readErr) {
+				log.Warnf("auggie executor: transient upstream JSON read error on %s, retrying once: %v", requestURL, readErr)
+				continue
+			}
+			return nil, readErr
+		}
+
+		if httpResp.StatusCode == http.StatusUnauthorized {
+			if allowRefresh {
+				refreshed, refreshErr := e.Refresh(ctx, auth)
+				if refreshErr != nil {
+					replaceAuggieAuthState(auth, markAuggieAuthUnauthorized(auth, refreshErr.Error()))
+					return nil, refreshErr
+				}
+				replaceAuggieAuthState(auth, refreshed)
+				return e.executeAuggieJSON(ctx, auth, path, requestBody, false)
+			}
+			replaceAuggieAuthState(auth, markAuggieAuthUnauthorized(auth, "unauthorized"))
+			return nil, statusErr{code: http.StatusUnauthorized, msg: string(responseBody)}
+		}
+		if httpResp.StatusCode < http.StatusOK || httpResp.StatusCode >= http.StatusMultipleChoices {
+			return nil, statusErr{code: httpResp.StatusCode, msg: string(responseBody)}
+		}
+
+		markAuggieAuthActive(auth, time.Now().UTC())
+		return responseBody, nil
 	}
 
-	markAuggieAuthActive(auth, time.Now().UTC())
-	return responseBody, nil
+	return nil, statusErr{code: http.StatusBadGateway, msg: "auggie JSON request exhausted retries"}
+}
+
+func isRetryableAuggieJSONReadErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.EOF) {
+		return true
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "unexpected eof")
 }
 
 func (e *AuggieExecutor) refreshAndRetryAuggieStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, translated []byte, from sdktranslator.Format) (*cliproxyexecutor.StreamResult, error) {
@@ -1587,6 +1615,102 @@ func isAuggieSuspendedAccountBannerText(text string) bool {
 	return strings.Contains(normalized, "your account") &&
 		strings.Contains(normalized, "has been suspended") &&
 		strings.Contains(normalized, "purchase a subscription")
+}
+
+func buildAuggieSystemPromptCustomizationFallbackPayload(translated, upstreamBody []byte) ([]byte, bool) {
+	if !auggiePayloadContainsSystemPromptCustomizationDisabledMessage(upstreamBody) {
+		return nil, false
+	}
+
+	// Keep the instructions by inlining them into the chat message/history when
+	// Auggie account features reject native system prompt customization controls.
+	var promptSegments []string
+	for _, path := range []string{"system_prompt", "system_prompt_append", "system_prompt_override"} {
+		value := strings.TrimSpace(gjson.GetBytes(translated, path).String())
+		if value != "" {
+			promptSegments = append(promptSegments, value)
+		}
+	}
+	inlinePrompt := strings.TrimSpace(strings.Join(promptSegments, "\n\n"))
+
+	sanitized := bytes.Clone(translated)
+	removedAny := false
+	for _, path := range []string{"system_prompt", "system_prompt_append", "system_prompt_override", "system_prompt_replacements"} {
+		if value := gjson.GetBytes(sanitized, path); !value.Exists() || value.Type == gjson.Null {
+			continue
+		}
+		next, err := sjson.DeleteBytes(sanitized, path)
+		if err != nil {
+			return nil, false
+		}
+		sanitized = next
+		removedAny = true
+	}
+	if !removedAny {
+		return nil, false
+	}
+
+	if inlinePrompt == "" {
+		return sanitized, true
+	}
+
+	withInlinePrompt, err := injectAuggieSystemPromptIntoFallbackConversation(sanitized, inlinePrompt)
+	if err != nil {
+		return nil, false
+	}
+	return withInlinePrompt, true
+}
+
+func auggiePayloadContainsSystemPromptCustomizationDisabledMessage(payload []byte) bool {
+	candidates := []string{
+		gjson.GetBytes(payload, "error.message").String(),
+		gjson.GetBytes(payload, "error").String(),
+		gjson.GetBytes(payload, "message").String(),
+		string(payload),
+	}
+	for _, candidate := range candidates {
+		if isAuggieSystemPromptCustomizationDisabledMessage(candidate) {
+			return true
+		}
+	}
+	return false
+}
+
+func isAuggieSystemPromptCustomizationDisabledMessage(message string) bool {
+	normalized := strings.ToLower(strings.Join(strings.Fields(message), " "))
+	if normalized == "" {
+		return false
+	}
+	if !strings.Contains(normalized, "system prompt customization") {
+		return false
+	}
+	return strings.Contains(normalized, "not enabled") || strings.Contains(normalized, "disabled")
+}
+
+func injectAuggieSystemPromptIntoFallbackConversation(translated []byte, prompt string) ([]byte, error) {
+	prompt = strings.TrimSpace(prompt)
+	if prompt == "" {
+		return translated, nil
+	}
+
+	message := strings.TrimSpace(gjson.GetBytes(translated, "message").String())
+	if message != "" {
+		return sjson.SetBytes(translated, "message", prompt+"\n\n"+message)
+	}
+
+	chatHistory := gjson.GetBytes(translated, "chat_history")
+	if chatHistory.Exists() && chatHistory.IsArray() {
+		entries := chatHistory.Array()
+		for i := len(entries) - 1; i >= 0; i-- {
+			requestMessage := strings.TrimSpace(entries[i].Get("request_message").String())
+			if requestMessage == "" {
+				continue
+			}
+			return sjson.SetBytes(translated, fmt.Sprintf("chat_history.%d.request_message", i), prompt+"\n\n"+requestMessage)
+		}
+	}
+
+	return sjson.SetBytes(translated, "message", prompt)
 }
 
 func appendAuggieOpenAIChatCompletionMetadata(payload, requestRawJSON []byte) ([]byte, error) {
@@ -3281,7 +3405,6 @@ func validateAuggieResponsesSamplingControlSupport(rawJSON []byte) error {
 		{path: "top_logprobs", param: "top_logprobs", description: "log probability controls"},
 		{path: "temperature", param: "temperature", description: "sampling controls"},
 		{path: "top_p", param: "top_p", description: "sampling controls"},
-		{path: "text.verbosity", param: "text.verbosity", description: "text verbosity controls"},
 	}
 
 	for _, control := range unsupportedControls {
@@ -3350,28 +3473,9 @@ func validateAuggieResponsesContextManagementSupport(rawJSON []byte) error {
 }
 
 func validateAuggieResponsesPromptCacheAndSafetyControlSupport(rawJSON []byte) error {
-	unsupportedControls := []struct {
-		path        string
-		param       string
-		description string
-	}{
-		{path: "prompt_cache_key", param: "prompt_cache_key", description: "prompt cache controls"},
-		{path: "prompt_cache_retention", param: "prompt_cache_retention", description: "prompt cache controls"},
-		{path: "safety_identifier", param: "safety_identifier", description: "safety attribution controls"},
-		{path: "user", param: "user", description: "end-user attribution controls"},
-	}
-
-	for _, control := range unsupportedControls {
-		value := gjson.GetBytes(rawJSON, control.path)
-		if !value.Exists() || value.Type == gjson.Null {
-			continue
-		}
-		return newAuggieInvalidRequestStatusErr(
-			fmt.Sprintf("%s is not supported by Auggie; the bridge cannot preserve %s, so use a native OpenAI Responses route", control.param, control.description),
-			control.param,
-			"invalid_value",
-		)
-	}
+	// Accept and ignore prompt-cache / safety attribution controls for
+	// compatibility with native OpenAI Responses payloads. The Auggie bridge
+	// does not preserve these controls end-to-end.
 	return nil
 }
 
@@ -3387,20 +3491,9 @@ func validateAuggieResponsesReasoning(rawJSON []byte) error {
 			"invalid_type",
 		)
 	}
-	if summary := reasoning.Get("summary"); summary.Exists() && summary.Type != gjson.Null {
-		return newAuggieInvalidRequestStatusErr(
-			"reasoning.summary is not supported by Auggie; the bridge cannot preserve reasoning summary controls, so use reasoning.effort only or a native OpenAI Responses route",
-			"reasoning.summary",
-			"invalid_value",
-		)
-	}
-	if generateSummary := reasoning.Get("generate_summary"); generateSummary.Exists() && generateSummary.Type != gjson.Null {
-		return newAuggieInvalidRequestStatusErr(
-			"reasoning.generate_summary is not supported by Auggie; the bridge cannot preserve reasoning summary controls, so use reasoning.effort only or a native OpenAI Responses route",
-			"reasoning.generate_summary",
-			"invalid_value",
-		)
-	}
+	// Accept and ignore reasoning summary controls for compatibility with
+	// native OpenAI Responses payloads. The Auggie bridge only preserves
+	// reasoning effort.
 
 	effort := reasoning.Get("effort")
 	if !effort.Exists() || effort.Type == gjson.Null {
@@ -3510,18 +3603,9 @@ func validateAuggieToolTypes(rawJSON []byte, allowResponsesBuiltIns bool) error 
 }
 
 func validateAuggieBuiltInWebSearchToolConfig(tool gjson.Result, index int) error {
-	toolType := strings.TrimSpace(tool.Get("type").String())
-	for key, value := range tool.Map() {
-		if key == "type" || value.Type == gjson.Null {
-			continue
-		}
-		field := fmt.Sprintf("tools[%d].%s", index, key)
-		return newAuggieInvalidRequestStatusErr(
-			fmt.Sprintf("%s is not supported by Auggie; the built-in %q bridge only preserves tool availability, not official web-search configuration such as search_context_size, filters, search_content_types, or user_location, so use tools[%d]={\"type\":%q} or a native OpenAI Responses route", field, toolType, index, toolType),
-			field,
-			"invalid_value",
-		)
-	}
+	// Accept and ignore built-in web search configuration fields for compatibility with
+	// native OpenAI Responses payloads. The Auggie bridge still only preserves
+	// tool availability (type), not detailed web-search semantics.
 	return nil
 }
 
@@ -3666,7 +3750,7 @@ func validateAuggieCustomToolFormat(format gjson.Result, index int) error {
 	}
 
 	switch value := strings.ToLower(strings.TrimSpace(formatType.String())); value {
-	case "text":
+	case "text", "grammar":
 		return nil
 	case "":
 		return newAuggieInvalidRequestStatusErr(
@@ -3674,15 +3758,9 @@ func validateAuggieCustomToolFormat(format gjson.Result, index int) error {
 			field+".type",
 			"invalid_value",
 		)
-	case "grammar":
-		return newAuggieInvalidRequestStatusErr(
-			fmt.Sprintf("%s.type=%q is not supported by Auggie; the custom-tool bridge cannot preserve grammar constraints, so use format.type=%q or a native OpenAI Responses route", field, value, "text"),
-			field+".type",
-			"invalid_value",
-		)
 	default:
 		return newAuggieInvalidRequestStatusErr(
-			fmt.Sprintf("%s.type=%q is not supported by Auggie; supported custom tool formats are text or omitted %s", field, value, field),
+			fmt.Sprintf("%s.type=%q is not supported by Auggie; supported custom tool formats are text, grammar, or omitted %s", field, value, field),
 			field+".type",
 			"invalid_value",
 		)

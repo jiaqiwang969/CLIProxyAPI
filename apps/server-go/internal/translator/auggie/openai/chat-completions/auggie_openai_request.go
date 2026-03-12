@@ -72,6 +72,7 @@ type auggieChatRequest struct {
 func ConvertOpenAIRequestToAuggie(modelName string, rawJSON []byte, _ bool) []byte {
 	systemPrompt, systemPromptAppend := buildAuggieSystemPrompts(rawJSON)
 	message, chatHistory := buildAuggieConversation(rawJSON)
+	message, chatHistory = inlineAuggieSystemPrompts(message, chatHistory, systemPrompt, systemPromptAppend)
 	message = appendAuggieToolChoiceDirectiveToMessage(message, buildAuggieToolChoiceDirective(rawJSON))
 	conversationID, turnID := buildAuggieConversationIdentifiers()
 	out := auggieChatRequest{
@@ -83,8 +84,6 @@ func ConvertOpenAIRequestToAuggie(modelName string, rawJSON []byte, _ bool) []by
 		TurnID:                turnID,
 		RootConversationID:    conversationID,
 		Message:               message,
-		SystemPrompt:          systemPrompt,
-		SystemPromptAppend:    systemPromptAppend,
 		FeatureFlags:          buildAuggieFeatureDetectionFlags(rawJSON),
 		ChatHistory:           chatHistory,
 		Nodes:                 buildAuggieRequestNodes(rawJSON),
@@ -167,6 +166,39 @@ func buildAuggieSystemPrompts(rawJSON []byte) (string, string) {
 		return prompts[0], ""
 	}
 	return prompts[0], strings.Join(prompts[1:], "\n\n")
+}
+
+func inlineAuggieSystemPrompts(message string, chatHistory []auggieChatHistoryEntry, systemPrompt, systemPromptAppend string) (string, []auggieChatHistoryEntry) {
+	segments := make([]string, 0, 2)
+	systemPrompt = strings.TrimSpace(systemPrompt)
+	systemPromptAppend = strings.TrimSpace(systemPromptAppend)
+	if systemPrompt != "" {
+		segments = append(segments, systemPrompt)
+	}
+	if systemPromptAppend != "" {
+		segments = append(segments, systemPromptAppend)
+	}
+
+	inlinePrompt := strings.TrimSpace(strings.Join(segments, "\n\n"))
+	if inlinePrompt == "" {
+		return message, chatHistory
+	}
+
+	message = strings.TrimSpace(message)
+	if message != "" {
+		return inlinePrompt + "\n\n" + message, chatHistory
+	}
+
+	for i := len(chatHistory) - 1; i >= 0; i-- {
+		requestMessage := strings.TrimSpace(chatHistory[i].RequestMessage)
+		if requestMessage == "" {
+			continue
+		}
+		chatHistory[i].RequestMessage = inlinePrompt + "\n\n" + requestMessage
+		return message, chatHistory
+	}
+
+	return inlinePrompt, chatHistory
 }
 
 func appendAuggieToolChoiceDirectiveToMessage(message, directive string) string {

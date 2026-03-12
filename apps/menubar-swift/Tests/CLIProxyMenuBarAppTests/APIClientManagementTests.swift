@@ -333,7 +333,7 @@ struct APIClientManagementTests {
         let components = try #require(URLComponents(url: url, resolvingAgainstBaseURL: false))
         #expect(request.httpMethod == "PUT")
         #expect(components.path == "/v0/management/client-api-keys")
-        #expect(components.queryItems?.contains(URLQueryItem(name: "key", value: "menubar-key")) == true)
+        #expect(components.queryItems?.isEmpty ?? true)
         #expect(request.value(forHTTPHeaderField: "Authorization") == "Bearer menubar-key")
 
         let payload = try JSONDecoder().decode(

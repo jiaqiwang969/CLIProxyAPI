@@ -24,8 +24,8 @@ func TestConvertOpenAIRequestToAuggie_MinimalChatStreamPayload(t *testing.T) {
 	if got := gjson.GetBytes(out, "model").String(); got != "gpt-5.4" {
 		t.Fatalf("model = %q, want gpt-5.4", got)
 	}
-	if got := gjson.GetBytes(out, "message").String(); got != "help me" {
-		t.Fatalf("message = %q, want help me", got)
+	if got := gjson.GetBytes(out, "message").String(); got != "You are terse.\n\nhelp me" {
+		t.Fatalf("message = %q, want inlined system instructions", got)
 	}
 	if got := gjson.GetBytes(out, "chat_history.#").Int(); got != 1 {
 		t.Fatalf("chat_history length = %d, want 1", got)
@@ -140,7 +140,7 @@ func TestConvertOpenAIRequestToAuggie_KeepsPlainTurnsOnLegacyChatHistoryPath(t *
 	}
 }
 
-func TestConvertOpenAIRequestToAuggie_MapsSystemAndDeveloperMessagesToNativeSystemPromptFields(t *testing.T) {
+func TestConvertOpenAIRequestToAuggie_InlinesSystemAndDeveloperMessagesIntoConversation(t *testing.T) {
 	out := ConvertOpenAIRequestToAuggie("gpt-5.4", []byte(`{
 		"messages":[
 			{"role":"system","content":"You are terse."},
@@ -149,14 +149,14 @@ func TestConvertOpenAIRequestToAuggie_MapsSystemAndDeveloperMessagesToNativeSyst
 		]
 	}`), true)
 
-	if got := gjson.GetBytes(out, "system_prompt").String(); got != "You are terse." {
-		t.Fatalf("system_prompt = %q, want %q; payload=%s", got, "You are terse.", out)
+	if got := gjson.GetBytes(out, "system_prompt").Exists(); got {
+		t.Fatalf("system_prompt should be omitted for account compatibility; payload=%s", out)
 	}
-	if got := gjson.GetBytes(out, "system_prompt_append").String(); got != "Only answer with JSON." {
-		t.Fatalf("system_prompt_append = %q, want %q; payload=%s", got, "Only answer with JSON.", out)
+	if got := gjson.GetBytes(out, "system_prompt_append").Exists(); got {
+		t.Fatalf("system_prompt_append should be omitted for account compatibility; payload=%s", out)
 	}
-	if got := gjson.GetBytes(out, "message").String(); got != "say hi" {
-		t.Fatalf("message = %q, want %q; payload=%s", got, "say hi", out)
+	if got := gjson.GetBytes(out, "message").String(); got != "You are terse.\n\nOnly answer with JSON.\n\nsay hi" {
+		t.Fatalf("message = %q, want inlined prompt+append+user content; payload=%s", got, out)
 	}
 	if got := gjson.GetBytes(out, "chat_history.#").Int(); got != 0 {
 		t.Fatalf("chat_history length = %d, want 0; payload=%s", got, out)

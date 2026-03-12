@@ -1253,20 +1253,9 @@ func validateOpenAIAuggieReasoningRequestSupport(rawJSON []byte) *interfaces.Err
 		return nil
 	}
 
-	if summary := reasoning.Get("summary"); summary.Exists() && summary.Type != gjson.Null {
-		return invalidOpenAIRequestWithDetailf(
-			"reasoning.summary",
-			"invalid_value",
-			"reasoning.summary is not supported on the selected /v1/responses model route because Auggie's bridge cannot preserve reasoning summary controls; use reasoning.effort only or a native OpenAI Responses route",
-		)
-	}
-	if generateSummary := reasoning.Get("generate_summary"); generateSummary.Exists() && generateSummary.Type != gjson.Null {
-		return invalidOpenAIRequestWithDetailf(
-			"reasoning.generate_summary",
-			"invalid_value",
-			"reasoning.generate_summary is not supported on the selected /v1/responses model route because Auggie's bridge cannot preserve reasoning summary controls; use reasoning.effort only or a native OpenAI Responses route",
-		)
-	}
+	// Accept and ignore reasoning summary controls for compatibility with
+	// native OpenAI Responses payloads. The Auggie bridge only preserves
+	// reasoning effort.
 	if effort := reasoning.Get("effort"); effort.Exists() && effort.Type == gjson.String {
 		value := strings.ToLower(strings.TrimSpace(effort.String()))
 		if value == "" {
@@ -1336,30 +1325,9 @@ func validateOpenAIAuggieContextManagementRequestSupport(rawJSON []byte) *interf
 }
 
 func validateOpenAIAuggiePromptCacheAndSafetyRequestSupport(rawJSON []byte) *interfaces.ErrorMessage {
-	unsupportedControls := []struct {
-		path        string
-		param       string
-		description string
-	}{
-		{path: "prompt_cache_key", param: "prompt_cache_key", description: "prompt cache controls"},
-		{path: "prompt_cache_retention", param: "prompt_cache_retention", description: "prompt cache controls"},
-		{path: "safety_identifier", param: "safety_identifier", description: "safety attribution controls"},
-		{path: "user", param: "user", description: "end-user attribution controls"},
-	}
-
-	for _, control := range unsupportedControls {
-		value := gjson.GetBytes(rawJSON, control.path)
-		if !value.Exists() || value.Type == gjson.Null {
-			continue
-		}
-		return invalidOpenAIRequestWithDetailf(
-			control.param,
-			"invalid_value",
-			"%s is not supported on the selected /v1/responses model route because Auggie's bridge cannot preserve %s; use a native OpenAI Responses route",
-			control.param,
-			control.description,
-		)
-	}
+	// Accept and ignore prompt-cache / safety attribution controls for
+	// compatibility with native OpenAI Responses payloads. The Auggie bridge
+	// does not preserve these controls end-to-end.
 	return nil
 }
 
@@ -1476,7 +1444,6 @@ func validateOpenAIAuggieSamplingControlRequestSupport(rawJSON []byte) *interfac
 		{path: "top_logprobs", param: "top_logprobs", description: "log probability controls"},
 		{path: "temperature", param: "temperature", description: "sampling controls"},
 		{path: "top_p", param: "top_p", description: "sampling controls"},
-		{path: "text.verbosity", param: "text.verbosity", description: "text verbosity controls"},
 	}
 
 	for _, control := range unsupportedControls {
@@ -2409,49 +2376,28 @@ func validateOpenAIAuggieCustomToolFormat(format gjson.Result, index int) *inter
 	}
 
 	switch value := strings.ToLower(strings.TrimSpace(formatType.String())); value {
-	case "text":
+	case "text", "grammar":
 		return nil
 	case "":
 		return invalidOpenAIValue(field+".type", "Invalid value for '%s': expected a non-empty string.", field+".type")
-	case "grammar":
-		return invalidOpenAIRequestWithDetailf(
-			field+".type",
-			"invalid_value",
-			"%s=%q is not supported on the selected /v1/responses model route because Auggie's custom-tool bridge cannot preserve grammar constraints; use format.type=%q or a native OpenAI Responses route",
-			field+".type",
-			value,
-			"text",
-		)
 	default:
 		return invalidOpenAIRequestWithDetailf(
 			field+".type",
 			"invalid_value",
-			"%s=%q is not supported on the selected /v1/responses model route; Auggie custom tools support format.type=%q or omitted %s",
+			"%s=%q is not supported on the selected /v1/responses model route; Auggie custom tools support format.type=%q, format.type=%q, or omitted %s",
 			field+".type",
 			value,
 			"text",
+			"grammar",
 			field,
 		)
 	}
 }
 
 func validateOpenAIAuggieBuiltInWebSearchToolConfig(tool gjson.Result, index int) *interfaces.ErrorMessage {
-	toolType := strings.TrimSpace(tool.Get("type").String())
-	for key, value := range tool.Map() {
-		if key == "type" || value.Type == gjson.Null {
-			continue
-		}
-		field := fmt.Sprintf("tools[%d].%s", index, key)
-		return invalidOpenAIRequestWithDetailf(
-			field,
-			"invalid_value",
-			"%s is not supported on the selected /v1/responses model route because Auggie's built-in %q bridge only preserves tool availability, not official web-search configuration such as search_context_size, filters, search_content_types, or user_location; use tools[%d]={\"type\":%q} or a native OpenAI Responses route",
-			field,
-			toolType,
-			index,
-			toolType,
-		)
-	}
+	// Accept and ignore built-in web search configuration fields for compatibility with
+	// native OpenAI Responses payloads. The Auggie bridge still only preserves
+	// tool availability (type), not detailed web-search semantics.
 	return nil
 }
 

@@ -244,7 +244,7 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 				if description := tool.Get("description"); description.Exists() {
 					function, _ = sjson.Set(function, "description", description.String())
 				}
-				function, _ = sjson.SetRaw(function, "parameters", responsesCustomToolShimParametersRaw())
+				function, _ = sjson.SetRaw(function, "parameters", responsesCustomToolShimParametersRaw(tool))
 
 				chatTool, _ = sjson.SetRaw(chatTool, "function", function)
 				chatCompletionsTools = append(chatCompletionsTools, gjson.Parse(chatTool).Value())
@@ -485,8 +485,32 @@ func convertResponsesFunctionCallOutputToOpenAIContent(output gjson.Result) any 
 	return contentItems
 }
 
-func responsesCustomToolShimParametersRaw() string {
-	return `{"type":"object","properties":{"input":{"type":"string"}},"required":["input"],"additionalProperties":false}`
+func responsesCustomToolShimParametersRaw(tool gjson.Result) string {
+	inputProperty := map[string]any{
+		"type": "string",
+	}
+
+	if strings.EqualFold(strings.TrimSpace(tool.Get("format.type").String()), "grammar") &&
+		strings.EqualFold(strings.TrimSpace(tool.Get("format.syntax").String()), "regex") {
+		if definition := tool.Get("format.definition"); definition.Type == gjson.String {
+			if value := strings.TrimSpace(definition.String()); value != "" {
+				inputProperty["pattern"] = value
+			}
+		}
+	}
+
+	parameters := map[string]any{
+		"type":                 "object",
+		"properties":           map[string]any{"input": inputProperty},
+		"required":             []string{"input"},
+		"additionalProperties": false,
+	}
+	raw, err := json.Marshal(parameters)
+	if err != nil {
+		return `{"type":"object","properties":{"input":{"type":"string"}},"required":["input"],"additionalProperties":false}`
+	}
+
+	return string(raw)
 }
 
 func marshalResponsesCustomToolShimInput(input gjson.Result) string {
