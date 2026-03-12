@@ -118,12 +118,49 @@ func cloneOpenAIModelMap(model map[string]any) map[string]any {
 	return cloned
 }
 
+func scopedOpenAIModelMetadata(model map[string]any, canonicalModelID string, scope handlers.AccessScope) map[string]any {
+	scoped := cloneOpenAIModelMap(model)
+	if strings.TrimSpace(scope.Provider) == "" {
+		return scoped
+	}
+
+	info := registry.GetGlobalRegistry().GetModelInfoByAlias(canonicalModelID, scope.Provider)
+	if info == nil {
+		return scoped
+	}
+
+	if info.ID != "" {
+		scoped["id"] = info.ID
+	}
+	if info.Object != "" {
+		scoped["object"] = info.Object
+	}
+	if info.Created > 0 {
+		scoped["created"] = info.Created
+	}
+	if info.OwnedBy != "" {
+		scoped["owned_by"] = info.OwnedBy
+	}
+	if info.Type != "" {
+		scoped["type"] = info.Type
+	}
+	if info.DisplayName != "" {
+		scoped["display_name"] = info.DisplayName
+	}
+	if info.Version != "" {
+		scoped["version"] = info.Version
+	}
+
+	return scoped
+}
+
 // OpenAIModels handles the /v1/models endpoint.
 // It returns a list of available AI models with their capabilities
 // and specifications in OpenAI-compatible format.
 func (h *OpenAIAPIHandler) OpenAIModels(c *gin.Context) {
 	// Get all available models
 	allModels := collapseAuggieCanonicalModels(h.Models())
+	scope := handlers.AccessScopeFromGin(c)
 
 	// Filter to only include the 4 required fields: id, object, created, owned_by
 	filteredModels := make([]map[string]any, 0, len(allModels))
@@ -143,6 +180,7 @@ func (h *OpenAIAPIHandler) OpenAIModels(c *gin.Context) {
 		if !handlers.ModelVisibleForRequest(c, modelID) {
 			continue
 		}
+		model = scopedOpenAIModelMetadata(model, modelID, scope)
 		if _, exists := seenIDs[modelID]; exists {
 			continue
 		}
@@ -195,15 +233,47 @@ func (h *OpenAIAPIHandler) ChatCompletions(c *gin.Context) {
 	streamResult := gjson.GetBytes(rawJSON, "stream")
 	stream := streamResult.Type == gjson.True
 
+	if errMsg := validateOpenAIStoreSupport(rawJSON, "chat/completions"); errMsg != nil {
+		h.WriteErrorResponse(c, errMsg)
+		return
+	}
+	if errMsg := validateOpenAIChatCompletionsConversationSupport(rawJSON); errMsg != nil {
+		h.WriteErrorResponse(c, errMsg)
+		return
+	}
+	if errMsg := validateOpenAIIncludeSupport(rawJSON, "chat/completions"); errMsg != nil {
+		h.WriteErrorResponse(c, errMsg)
+		return
+	}
+
 	// Some clients send OpenAI Responses-format payloads to /v1/chat/completions.
 	// Convert them to Chat Completions so downstream translators preserve tool metadata.
 	if shouldTreatAsResponsesFormat(rawJSON) {
+		if errMsg := validateOpenAIResponsesInput(rawJSON); errMsg != nil {
+			h.WriteErrorResponse(c, errMsg)
+			return
+		}
+		if errMsg := validateOpenAIResponsesChatCompletionsBridge(rawJSON); errMsg != nil {
+			h.WriteErrorResponse(c, errMsg)
+			return
+		}
 		modelName := gjson.GetBytes(rawJSON, "model").String()
 		rawJSON = responsesconverter.ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName, rawJSON, stream)
 		stream = gjson.GetBytes(rawJSON, "stream").Bool()
 	}
 
 	if errMsg := validateOpenAISurfaceModel(gjson.GetBytes(rawJSON, "model").String()); errMsg != nil {
+		h.WriteErrorResponse(c, errMsg)
+		return
+	}
+
+	requestCtx := context.WithValue(c.Request.Context(), "gin", c)
+	providers, normalizedModel, detailsErr := h.GetRequestDetailsForContext(requestCtx, gjson.GetBytes(rawJSON, "model").String())
+	if detailsErr != nil {
+		h.WriteErrorResponse(c, detailsErr)
+		return
+	}
+	if errMsg := validateOpenAIChatCompletionsProviderRequestFeatureSupport(rawJSON, normalizedModel, providers); errMsg != nil {
 		h.WriteErrorResponse(c, errMsg)
 		return
 	}

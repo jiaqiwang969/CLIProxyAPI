@@ -85,6 +85,156 @@ func emitEvent(event string, payload string) string {
 	return fmt.Sprintf("event: %s\ndata: %s", event, payload)
 }
 
+func responseObjectPath(prefix, field string) string {
+	if prefix == "" {
+		return field
+	}
+	return prefix + "." + field
+}
+
+func deepMergeJSONObject(dst, src any) any {
+	srcMap, ok := src.(map[string]any)
+	if !ok {
+		return src
+	}
+
+	dstMap, _ := dst.(map[string]any)
+	merged := make(map[string]any, len(dstMap)+len(srcMap))
+	for k, v := range dstMap {
+		merged[k] = v
+	}
+	for k, v := range srcMap {
+		merged[k] = deepMergeJSONObject(merged[k], v)
+	}
+	return merged
+}
+
+func applyMergedRequestField(payload string, objectPath string, field string, value any) string {
+	path := responseObjectPath(objectPath, field)
+	merged := deepMergeJSONObject(gjson.Get(payload, path).Value(), value)
+	payload, _ = sjson.Set(payload, path, merged)
+	return payload
+}
+
+func applyDefaultFieldsToResponsesObject(payload string, objectPath string, fallbackModel string) string {
+	defaults := []struct {
+		field string
+		value any
+	}{
+		{field: "background", value: false},
+		{field: "completed_at", value: nil},
+		{field: "error", value: nil},
+		{field: "incomplete_details", value: nil},
+		{field: "instructions", value: nil},
+		{field: "max_output_tokens", value: nil},
+		{field: "metadata", value: map[string]any{}},
+		{field: "output", value: []any{}},
+		{field: "parallel_tool_calls", value: true},
+		{field: "previous_response_id", value: nil},
+		{field: "reasoning", value: map[string]any{"effort": nil, "summary": nil}},
+		{field: "store", value: true},
+		{field: "temperature", value: 1.0},
+		{field: "text", value: map[string]any{"format": map[string]any{"type": "text"}}},
+		{field: "tool_choice", value: "auto"},
+		{field: "tools", value: []any{}},
+		{field: "top_p", value: 1.0},
+		{field: "truncation", value: "disabled"},
+		{field: "usage", value: nil},
+		{field: "user", value: nil},
+	}
+	for _, def := range defaults {
+		payload, _ = sjson.Set(payload, responseObjectPath(objectPath, def.field), def.value)
+	}
+	if fallbackModel != "" {
+		payload, _ = sjson.Set(payload, responseObjectPath(objectPath, "model"), fallbackModel)
+	}
+	return payload
+}
+
+func applyRequestFieldsToResponsesObject(payload string, objectPath string, requestRawJSON []byte, fallbackModel string) string {
+	if len(requestRawJSON) > 0 {
+		req := unwrapRequestRoot(gjson.ParseBytes(requestRawJSON))
+		if v := req.Get("instructions"); v.Exists() {
+			payload, _ = sjson.Set(payload, responseObjectPath(objectPath, "instructions"), v.Value())
+		}
+		if v := req.Get("max_output_tokens"); v.Exists() {
+			payload, _ = sjson.Set(payload, responseObjectPath(objectPath, "max_output_tokens"), v.Int())
+		} else if v = req.Get("max_tokens"); v.Exists() {
+			payload, _ = sjson.Set(payload, responseObjectPath(objectPath, "max_output_tokens"), v.Int())
+		}
+		if v := req.Get("max_tool_calls"); v.Exists() {
+			payload, _ = sjson.Set(payload, responseObjectPath(objectPath, "max_tool_calls"), v.Int())
+		}
+		if v := req.Get("model"); v.Exists() {
+			payload, _ = sjson.Set(payload, responseObjectPath(objectPath, "model"), v.String())
+		} else if fallbackModel != "" {
+			payload, _ = sjson.Set(payload, responseObjectPath(objectPath, "model"), fallbackModel)
+		}
+		if v := req.Get("parallel_tool_calls"); v.Exists() {
+			payload, _ = sjson.Set(payload, responseObjectPath(objectPath, "parallel_tool_calls"), v.Bool())
+		}
+		if v := req.Get("previous_response_id"); v.Exists() {
+			payload, _ = sjson.Set(payload, responseObjectPath(objectPath, "previous_response_id"), v.String())
+		}
+		if v := req.Get("prompt"); v.Exists() {
+			payload, _ = sjson.Set(payload, responseObjectPath(objectPath, "prompt"), v.Value())
+		}
+		if v := req.Get("prompt_cache_key"); v.Exists() {
+			payload, _ = sjson.Set(payload, responseObjectPath(objectPath, "prompt_cache_key"), v.String())
+		}
+		if v := req.Get("prompt_cache_retention"); v.Exists() {
+			payload, _ = sjson.Set(payload, responseObjectPath(objectPath, "prompt_cache_retention"), v.String())
+		}
+		if v := req.Get("reasoning"); v.Exists() {
+			payload = applyMergedRequestField(payload, objectPath, "reasoning", v.Value())
+		}
+		if v := req.Get("store"); v.Exists() {
+			payload, _ = sjson.Set(payload, responseObjectPath(objectPath, "store"), v.Bool())
+		}
+		if v := req.Get("safety_identifier"); v.Exists() {
+			payload, _ = sjson.Set(payload, responseObjectPath(objectPath, "safety_identifier"), v.String())
+		}
+		if v := req.Get("service_tier"); v.Exists() {
+			payload, _ = sjson.Set(payload, responseObjectPath(objectPath, "service_tier"), v.String())
+		}
+		if v := req.Get("background"); v.Exists() {
+			payload, _ = sjson.Set(payload, responseObjectPath(objectPath, "background"), v.Bool())
+		}
+		if v := req.Get("temperature"); v.Exists() {
+			payload, _ = sjson.Set(payload, responseObjectPath(objectPath, "temperature"), v.Float())
+		}
+		if v := req.Get("text"); v.Exists() {
+			payload = applyMergedRequestField(payload, objectPath, "text", v.Value())
+		}
+		if v := req.Get("tool_choice"); v.Exists() {
+			payload, _ = sjson.Set(payload, responseObjectPath(objectPath, "tool_choice"), v.Value())
+		}
+		if v := req.Get("tools"); v.Exists() {
+			payload, _ = sjson.Set(payload, responseObjectPath(objectPath, "tools"), v.Value())
+		}
+		if v := req.Get("top_logprobs"); v.Exists() {
+			payload, _ = sjson.Set(payload, responseObjectPath(objectPath, "top_logprobs"), v.Int())
+		}
+		if v := req.Get("top_p"); v.Exists() {
+			payload, _ = sjson.Set(payload, responseObjectPath(objectPath, "top_p"), v.Float())
+		}
+		if v := req.Get("truncation"); v.Exists() {
+			payload, _ = sjson.Set(payload, responseObjectPath(objectPath, "truncation"), v.String())
+		}
+		if v := req.Get("user"); v.Exists() {
+			payload, _ = sjson.Set(payload, responseObjectPath(objectPath, "user"), v.Value())
+		}
+		if v := req.Get("metadata"); v.Exists() {
+			payload, _ = sjson.Set(payload, responseObjectPath(objectPath, "metadata"), v.Value())
+		}
+		return payload
+	}
+	if fallbackModel != "" {
+		payload, _ = sjson.Set(payload, responseObjectPath(objectPath, "model"), fallbackModel)
+	}
+	return payload
+}
+
 // ConvertGeminiResponseToOpenAIResponses converts Gemini SSE chunks into OpenAI Responses SSE events.
 func ConvertGeminiResponseToOpenAIResponses(_ context.Context, modelName string, originalRequestRawJSON, requestRawJSON, rawJSON []byte, param *any) []string {
 	if *param == nil {
@@ -123,9 +273,17 @@ func ConvertGeminiResponseToOpenAIResponses(_ context.Context, modelName string,
 		return []string{}
 	}
 	root = unwrapGeminiResponseRoot(root)
+	fallbackModel := strings.TrimSpace(modelName)
+	if fallbackModel == "" {
+		fallbackModel = strings.TrimSpace(root.Get("modelVersion").String())
+	}
 
 	var out []string
-	nextSeq := func() int { st.Seq++; return st.Seq }
+	nextSeq := func() int {
+		current := st.Seq
+		st.Seq++
+		return current
+	}
 
 	// Helper to finalize reasoning summary events in correct order.
 	// It emits response.reasoning_summary_text.done followed by
@@ -192,6 +350,7 @@ func ConvertGeminiResponseToOpenAIResponses(_ context.Context, modelName string,
 
 	// Initialize per-response fields and emit created/in_progress once
 	if !st.Started {
+		st.Seq = 0
 		st.ResponseID = root.Get("responseId").String()
 		if st.ResponseID == "" {
 			st.ResponseID = fmt.Sprintf("resp_%x_%d", time.Now().UnixNano(), atomic.AddUint64(&responseIDCounter, 1))
@@ -212,12 +371,16 @@ func ConvertGeminiResponseToOpenAIResponses(_ context.Context, modelName string,
 		created, _ = sjson.Set(created, "sequence_number", nextSeq())
 		created, _ = sjson.Set(created, "response.id", st.ResponseID)
 		created, _ = sjson.Set(created, "response.created_at", st.CreatedAt)
+		created = applyDefaultFieldsToResponsesObject(created, "response", fallbackModel)
+		created = applyRequestFieldsToResponsesObject(created, "response", pickRequestJSON(originalRequestRawJSON, requestRawJSON), fallbackModel)
 		out = append(out, emitEvent("response.created", created))
 
 		inprog := `{"type":"response.in_progress","sequence_number":0,"response":{"id":"","object":"response","created_at":0,"status":"in_progress"}}`
 		inprog, _ = sjson.Set(inprog, "sequence_number", nextSeq())
 		inprog, _ = sjson.Set(inprog, "response.id", st.ResponseID)
 		inprog, _ = sjson.Set(inprog, "response.created_at", st.CreatedAt)
+		inprog = applyDefaultFieldsToResponsesObject(inprog, "response", fallbackModel)
+		inprog = applyRequestFieldsToResponsesObject(inprog, "response", pickRequestJSON(originalRequestRawJSON, requestRawJSON), fallbackModel)
 		out = append(out, emitEvent("response.in_progress", inprog))
 
 		st.Started = true
@@ -428,70 +591,9 @@ func ConvertGeminiResponseToOpenAIResponses(_ context.Context, modelName string,
 		completed, _ = sjson.Set(completed, "sequence_number", nextSeq())
 		completed, _ = sjson.Set(completed, "response.id", st.ResponseID)
 		completed, _ = sjson.Set(completed, "response.created_at", st.CreatedAt)
-
-		if reqJSON := pickRequestJSON(originalRequestRawJSON, requestRawJSON); len(reqJSON) > 0 {
-			req := unwrapRequestRoot(gjson.ParseBytes(reqJSON))
-			if v := req.Get("instructions"); v.Exists() {
-				completed, _ = sjson.Set(completed, "response.instructions", v.String())
-			}
-			if v := req.Get("max_output_tokens"); v.Exists() {
-				completed, _ = sjson.Set(completed, "response.max_output_tokens", v.Int())
-			}
-			if v := req.Get("max_tool_calls"); v.Exists() {
-				completed, _ = sjson.Set(completed, "response.max_tool_calls", v.Int())
-			}
-			if v := req.Get("model"); v.Exists() {
-				completed, _ = sjson.Set(completed, "response.model", v.String())
-			}
-			if v := req.Get("parallel_tool_calls"); v.Exists() {
-				completed, _ = sjson.Set(completed, "response.parallel_tool_calls", v.Bool())
-			}
-			if v := req.Get("previous_response_id"); v.Exists() {
-				completed, _ = sjson.Set(completed, "response.previous_response_id", v.String())
-			}
-			if v := req.Get("prompt_cache_key"); v.Exists() {
-				completed, _ = sjson.Set(completed, "response.prompt_cache_key", v.String())
-			}
-			if v := req.Get("reasoning"); v.Exists() {
-				completed, _ = sjson.Set(completed, "response.reasoning", v.Value())
-			}
-			if v := req.Get("safety_identifier"); v.Exists() {
-				completed, _ = sjson.Set(completed, "response.safety_identifier", v.String())
-			}
-			if v := req.Get("service_tier"); v.Exists() {
-				completed, _ = sjson.Set(completed, "response.service_tier", v.String())
-			}
-			if v := req.Get("store"); v.Exists() {
-				completed, _ = sjson.Set(completed, "response.store", v.Bool())
-			}
-			if v := req.Get("temperature"); v.Exists() {
-				completed, _ = sjson.Set(completed, "response.temperature", v.Float())
-			}
-			if v := req.Get("text"); v.Exists() {
-				completed, _ = sjson.Set(completed, "response.text", v.Value())
-			}
-			if v := req.Get("tool_choice"); v.Exists() {
-				completed, _ = sjson.Set(completed, "response.tool_choice", v.Value())
-			}
-			if v := req.Get("tools"); v.Exists() {
-				completed, _ = sjson.Set(completed, "response.tools", v.Value())
-			}
-			if v := req.Get("top_logprobs"); v.Exists() {
-				completed, _ = sjson.Set(completed, "response.top_logprobs", v.Int())
-			}
-			if v := req.Get("top_p"); v.Exists() {
-				completed, _ = sjson.Set(completed, "response.top_p", v.Float())
-			}
-			if v := req.Get("truncation"); v.Exists() {
-				completed, _ = sjson.Set(completed, "response.truncation", v.String())
-			}
-			if v := req.Get("user"); v.Exists() {
-				completed, _ = sjson.Set(completed, "response.user", v.Value())
-			}
-			if v := req.Get("metadata"); v.Exists() {
-				completed, _ = sjson.Set(completed, "response.metadata", v.Value())
-			}
-		}
+		completed = applyDefaultFieldsToResponsesObject(completed, "response", fallbackModel)
+		completed = applyRequestFieldsToResponsesObject(completed, "response", pickRequestJSON(originalRequestRawJSON, requestRawJSON), fallbackModel)
+		completed, _ = sjson.Set(completed, "response.completed_at", time.Now().Unix())
 
 		// Compose outputs in output_index order.
 		outputsWrapper := `{"arr":[]}`
@@ -561,12 +663,19 @@ func ConvertGeminiResponseToOpenAIResponses(_ context.Context, modelName string,
 }
 
 // ConvertGeminiResponseToOpenAIResponsesNonStream aggregates Gemini response JSON into a single OpenAI Responses JSON object.
-func ConvertGeminiResponseToOpenAIResponsesNonStream(_ context.Context, _ string, originalRequestRawJSON, requestRawJSON, rawJSON []byte, _ *any) string {
+func ConvertGeminiResponseToOpenAIResponsesNonStream(_ context.Context, modelName string, originalRequestRawJSON, requestRawJSON, rawJSON []byte, _ *any) string {
 	root := gjson.ParseBytes(rawJSON)
 	root = unwrapGeminiResponseRoot(root)
+	fallbackModel := strings.TrimSpace(modelName)
+	if fallbackModel == "" {
+		fallbackModel = strings.TrimSpace(root.Get("modelVersion").String())
+	}
 
 	// Base response scaffold
 	resp := `{"id":"","object":"response","created_at":0,"status":"completed","background":false,"error":null,"incomplete_details":null}`
+	resp = applyDefaultFieldsToResponsesObject(resp, "", fallbackModel)
+	resp, _ = sjson.Set(resp, "status", "completed")
+	resp, _ = sjson.Set(resp, "completed_at", time.Now().Unix())
 
 	// id: prefer provider responseId, otherwise synthesize
 	id := root.Get("responseId").String()
@@ -588,74 +697,7 @@ func ConvertGeminiResponseToOpenAIResponsesNonStream(_ context.Context, _ string
 	}
 	resp, _ = sjson.Set(resp, "created_at", createdAt)
 
-	// Echo request fields when present; fallback model from response modelVersion
-	if reqJSON := pickRequestJSON(originalRequestRawJSON, requestRawJSON); len(reqJSON) > 0 {
-		req := unwrapRequestRoot(gjson.ParseBytes(reqJSON))
-		if v := req.Get("instructions"); v.Exists() {
-			resp, _ = sjson.Set(resp, "instructions", v.String())
-		}
-		if v := req.Get("max_output_tokens"); v.Exists() {
-			resp, _ = sjson.Set(resp, "max_output_tokens", v.Int())
-		}
-		if v := req.Get("max_tool_calls"); v.Exists() {
-			resp, _ = sjson.Set(resp, "max_tool_calls", v.Int())
-		}
-		if v := req.Get("model"); v.Exists() {
-			resp, _ = sjson.Set(resp, "model", v.String())
-		} else if v = root.Get("modelVersion"); v.Exists() {
-			resp, _ = sjson.Set(resp, "model", v.String())
-		}
-		if v := req.Get("parallel_tool_calls"); v.Exists() {
-			resp, _ = sjson.Set(resp, "parallel_tool_calls", v.Bool())
-		}
-		if v := req.Get("previous_response_id"); v.Exists() {
-			resp, _ = sjson.Set(resp, "previous_response_id", v.String())
-		}
-		if v := req.Get("prompt_cache_key"); v.Exists() {
-			resp, _ = sjson.Set(resp, "prompt_cache_key", v.String())
-		}
-		if v := req.Get("reasoning"); v.Exists() {
-			resp, _ = sjson.Set(resp, "reasoning", v.Value())
-		}
-		if v := req.Get("safety_identifier"); v.Exists() {
-			resp, _ = sjson.Set(resp, "safety_identifier", v.String())
-		}
-		if v := req.Get("service_tier"); v.Exists() {
-			resp, _ = sjson.Set(resp, "service_tier", v.String())
-		}
-		if v := req.Get("store"); v.Exists() {
-			resp, _ = sjson.Set(resp, "store", v.Bool())
-		}
-		if v := req.Get("temperature"); v.Exists() {
-			resp, _ = sjson.Set(resp, "temperature", v.Float())
-		}
-		if v := req.Get("text"); v.Exists() {
-			resp, _ = sjson.Set(resp, "text", v.Value())
-		}
-		if v := req.Get("tool_choice"); v.Exists() {
-			resp, _ = sjson.Set(resp, "tool_choice", v.Value())
-		}
-		if v := req.Get("tools"); v.Exists() {
-			resp, _ = sjson.Set(resp, "tools", v.Value())
-		}
-		if v := req.Get("top_logprobs"); v.Exists() {
-			resp, _ = sjson.Set(resp, "top_logprobs", v.Int())
-		}
-		if v := req.Get("top_p"); v.Exists() {
-			resp, _ = sjson.Set(resp, "top_p", v.Float())
-		}
-		if v := req.Get("truncation"); v.Exists() {
-			resp, _ = sjson.Set(resp, "truncation", v.String())
-		}
-		if v := req.Get("user"); v.Exists() {
-			resp, _ = sjson.Set(resp, "user", v.Value())
-		}
-		if v := req.Get("metadata"); v.Exists() {
-			resp, _ = sjson.Set(resp, "metadata", v.Value())
-		}
-	} else if v := root.Get("modelVersion"); v.Exists() {
-		resp, _ = sjson.Set(resp, "model", v.String())
-	}
+	resp = applyRequestFieldsToResponsesObject(resp, "", pickRequestJSON(originalRequestRawJSON, requestRawJSON), fallbackModel)
 
 	// Build outputs from candidates[0].content.parts
 	var reasoningText strings.Builder

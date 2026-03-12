@@ -39,6 +39,8 @@ func (w *Watcher) start(ctx context.Context) error {
 	}
 	log.Debugf("watching auth directory: %s", w.authDir)
 
+	w.ensureAuggieSessionSourceWatches()
+
 	go w.processEvents(ctx)
 
 	w.reloadClients(true, nil, false)
@@ -65,7 +67,7 @@ func (w *Watcher) processEvents(ctx context.Context) {
 }
 
 func (w *Watcher) handleEvent(event fsnotify.Event) {
-	// Filter only relevant events: config file or auth-dir JSON files.
+	// Filter only relevant events: config file, auth-dir JSON files, or the Auggie session file.
 	configOps := fsnotify.Write | fsnotify.Create | fsnotify.Rename
 	normalizedName := w.normalizeAuthPath(event.Name)
 	normalizedConfigPath := w.normalizeAuthPath(w.configPath)
@@ -73,7 +75,17 @@ func (w *Watcher) handleEvent(event fsnotify.Event) {
 	isConfigEvent := normalizedName == normalizedConfigPath && event.Op&configOps != 0
 	authOps := fsnotify.Create | fsnotify.Write | fsnotify.Remove | fsnotify.Rename
 	isAuthJSON := strings.HasPrefix(normalizedName, normalizedAuthDir) && strings.HasSuffix(normalizedName, ".json") && event.Op&authOps != 0
-	if !isConfigEvent && !isAuthJSON {
+	normalizedAuggieSessionPath := ""
+	if auggieSessionPath, errResolve := resolveAuggieSessionPath(); errResolve == nil {
+		normalizedAuggieSessionPath = w.normalizeAuthPath(auggieSessionPath)
+	}
+	normalizedAuggieSessionDir := ""
+	if auggieSessionDir, errResolve := resolveAuggieSessionWatchDir(); errResolve == nil {
+		normalizedAuggieSessionDir = w.normalizeAuthPath(auggieSessionDir)
+	}
+	isAuggieSessionEvent := normalizedAuggieSessionPath != "" && normalizedName == normalizedAuggieSessionPath && event.Op&authOps != 0
+	isAuggieSessionDirEvent := normalizedAuggieSessionDir != "" && normalizedName == normalizedAuggieSessionDir && event.Op&(fsnotify.Create|fsnotify.Rename|fsnotify.Remove) != 0
+	if !isConfigEvent && !isAuthJSON && !isAuggieSessionEvent && !isAuggieSessionDirEvent {
 		// Ignore unrelated files (e.g., cookie snapshots *.cookie) and other noise.
 		return
 	}
@@ -85,6 +97,24 @@ func (w *Watcher) handleEvent(event fsnotify.Event) {
 	if isConfigEvent {
 		log.Debugf("config file change details - operation: %s, timestamp: %s", event.Op.String(), now.Format("2006-01-02 15:04:05.000"))
 		w.scheduleConfigReload()
+		return
+	}
+
+	if isAuggieSessionEvent {
+		log.Infof("Auggie session changed (%s): %s, refreshing auth state", event.Op.String(), filepath.Base(event.Name))
+		w.refreshAuthState(false)
+		return
+	}
+
+	if isAuggieSessionDirEvent {
+		if event.Op&(fsnotify.Create|fsnotify.Rename) != 0 {
+			w.ensureAuggieSessionDirWatch()
+		}
+		if event.Op&(fsnotify.Remove|fsnotify.Rename) != 0 {
+			w.ensureAuggieHomeWatch()
+		}
+		log.Infof("Auggie session directory changed (%s): %s, refreshing auth state", event.Op.String(), filepath.Base(event.Name))
+		w.refreshAuthState(false)
 		return
 	}
 
@@ -164,6 +194,89 @@ func (w *Watcher) normalizeAuthPath(path string) string {
 		cleaned = strings.ToLower(cleaned)
 	}
 	return cleaned
+}
+
+func resolveAuggieSessionPath() (string, error) {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(homeDir, ".augment", "session.json"), nil
+}
+
+func resolveAuggieSessionWatchDir() (string, error) {
+	sessionPath, err := resolveAuggieSessionPath()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Dir(sessionPath), nil
+}
+
+func resolveAuggieHomeDir() (string, error) {
+	return os.UserHomeDir()
+}
+
+func (w *Watcher) ensureAuggieHomeWatch() {
+	homeDir, err := resolveAuggieHomeDir()
+	if err != nil {
+		log.WithError(err).Debug("failed to resolve Auggie home directory")
+		return
+	}
+	w.ensureDirectoryWatch(homeDir, "Auggie home directory")
+}
+
+func (w *Watcher) ensureAuggieSessionSourceWatches() {
+	sessionDir, err := resolveAuggieSessionWatchDir()
+	if err != nil {
+		log.WithError(err).Debug("failed to resolve Auggie session watch directory")
+		return
+	}
+	if info, errStat := os.Stat(sessionDir); errStat == nil && info.IsDir() {
+		w.ensureDirectoryWatch(sessionDir, "Auggie session directory")
+		return
+	} else if errStat != nil && !os.IsNotExist(errStat) {
+		log.WithError(errStat).Debugf("failed to stat Auggie session directory %s", sessionDir)
+	}
+	w.ensureAuggieHomeWatch()
+}
+
+func (w *Watcher) ensureAuggieSessionDirWatch() {
+	sessionDir, err := resolveAuggieSessionWatchDir()
+	if err != nil {
+		log.WithError(err).Debug("failed to resolve Auggie session watch directory")
+		return
+	}
+	w.ensureDirectoryWatch(sessionDir, "Auggie session directory")
+}
+
+func (w *Watcher) ensureDirectoryWatch(path, label string) {
+	if w == nil || w.watcher == nil {
+		return
+	}
+	normalizedTarget := w.normalizeAuthPath(path)
+	if normalizedTarget == "" {
+		return
+	}
+	for _, watchedPath := range w.watcher.WatchList() {
+		if w.normalizeAuthPath(watchedPath) == normalizedTarget {
+			return
+		}
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			log.WithError(err).Debugf("failed to stat %s %s", label, path)
+		}
+		return
+	}
+	if !info.IsDir() {
+		return
+	}
+	if err = w.watcher.Add(path); err != nil {
+		log.WithError(err).Warnf("failed to watch %s %s", label, path)
+		return
+	}
+	log.Debugf("watching %s: %s", label, path)
 }
 
 func (w *Watcher) shouldDebounceRemove(normalizedPath string, now time.Time) bool {

@@ -325,7 +325,20 @@ func (s *Server) setupRoutes() {
 		v1.POST("/messages/count_tokens", claudeCodeHandlers.ClaudeCountTokens)
 		v1.GET("/responses", openaiResponsesHandlers.ResponsesWebsocket)
 		v1.POST("/responses", openaiResponsesHandlers.Responses)
+		v1.POST("/responses/input_tokens", openaiResponsesHandlers.InputTokens)
+		v1.GET("/responses/:response_id", openaiResponsesHandlers.GetResponse)
+		v1.DELETE("/responses/:response_id", openaiResponsesHandlers.DeleteResponse)
+		v1.POST("/responses/:response_id/cancel", openaiResponsesHandlers.CancelResponse)
+		v1.GET("/responses/:response_id/input_items", openaiResponsesHandlers.GetResponseInputItems)
 		v1.POST("/responses/compact", openaiResponsesHandlers.Compact)
+		v1.POST("/conversations", openaiResponsesHandlers.CreateConversation)
+		v1.GET("/conversations/:conversation_id", openaiResponsesHandlers.GetConversation)
+		v1.POST("/conversations/:conversation_id", openaiResponsesHandlers.UpdateConversation)
+		v1.DELETE("/conversations/:conversation_id", openaiResponsesHandlers.DeleteConversation)
+		v1.GET("/conversations/:conversation_id/items", openaiResponsesHandlers.GetConversationItems)
+		v1.POST("/conversations/:conversation_id/items", openaiResponsesHandlers.AddConversationItems)
+		v1.GET("/conversations/:conversation_id/items/:item_id", openaiResponsesHandlers.GetConversationItem)
+		v1.DELETE("/conversations/:conversation_id/items/:item_id", openaiResponsesHandlers.DeleteConversationItem)
 	}
 
 	// Gemini compatible API routes
@@ -922,6 +935,9 @@ func AuthMiddleware(manager *sdkaccess.Manager) gin.HandlerFunc {
 		if statusCode >= http.StatusInternalServerError {
 			log.Errorf("authentication middleware error: %v", err)
 		}
-		c.AbortWithStatusJSON(statusCode, gin.H{"error": err.Message})
+		body := handlers.BuildErrorResponseBody(statusCode, err.Message)
+		c.Header("Content-Type", "application/json")
+		c.AbortWithStatus(statusCode)
+		_, _ = c.Writer.Write(body)
 	}
 }

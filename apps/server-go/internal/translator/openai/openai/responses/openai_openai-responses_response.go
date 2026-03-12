@@ -3,6 +3,8 @@ package responses
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"regexp"
@@ -85,6 +87,46 @@ func emitRespEvent(event string, payload string) string {
 	return fmt.Sprintf("event: %s\ndata: %s", event, payload)
 }
 
+func newOpenAIResponsesID() string {
+	return fmt.Sprintf("resp_%x_%d", time.Now().UnixNano(), atomic.AddUint64(&responseIDCounter, 1))
+}
+
+func publicOpenAIResponsesID(chatCompletionID string) string {
+	chatCompletionID = strings.TrimSpace(chatCompletionID)
+	if chatCompletionID == "" {
+		return newOpenAIResponsesID()
+	}
+	if strings.HasPrefix(chatCompletionID, "resp_") {
+		return chatCompletionID
+	}
+	if strings.HasPrefix(chatCompletionID, "chatcmpl-") {
+		return "resp_" + strings.TrimPrefix(chatCompletionID, "chatcmpl-")
+	}
+	if strings.HasPrefix(chatCompletionID, "chatcmpl_") {
+		return "resp_" + strings.TrimPrefix(chatCompletionID, "chatcmpl_")
+	}
+
+	var b strings.Builder
+	b.Grow(len(chatCompletionID))
+	for _, r := range chatCompletionID {
+		switch {
+		case r >= 'a' && r <= 'z':
+			b.WriteRune(r)
+		case r >= 'A' && r <= 'Z':
+			b.WriteRune(r)
+		case r >= '0' && r <= '9':
+			b.WriteRune(r)
+		default:
+			b.WriteByte('_')
+		}
+	}
+	sanitized := strings.Trim(b.String(), "_")
+	if sanitized == "" {
+		return newOpenAIResponsesID()
+	}
+	return "resp_" + sanitized
+}
+
 type responsesTerminalState struct {
 	Event            string
 	PayloadType      string
@@ -143,6 +185,30 @@ func responsesRequestIncludes(rawJSON []byte, want string) bool {
 		}
 	}
 	return false
+}
+
+func responsesStreamIncludesObfuscation(rawJSON []byte) bool {
+	includeObfuscation := gjson.GetBytes(rawJSON, "stream_options.include_obfuscation")
+	if !includeObfuscation.Exists() || includeObfuscation.Type == gjson.Null {
+		return true
+	}
+	return includeObfuscation.Bool()
+}
+
+func appendResponsesStreamObfuscation(payload string, rawJSON []byte) string {
+	if !responsesStreamIncludesObfuscation(rawJSON) {
+		return payload
+	}
+
+	var buf [8]byte
+	if _, err := rand.Read(buf[:]); err != nil {
+		// Keep streaming resilient even if entropy is unavailable.
+		payload, _ = sjson.Set(payload, "obfuscation", fmt.Sprintf("%d", time.Now().UnixNano()))
+		return payload
+	}
+
+	payload, _ = sjson.Set(payload, "obfuscation", hex.EncodeToString(buf[:]))
+	return payload
 }
 
 func parseResponsesBuiltInToolOutputs(root gjson.Result) []oaiToResponsesStateWebSearchCall {
@@ -366,8 +432,14 @@ func applyRequestFieldsToResponsesObject(payload string, objectPath string, requ
 		if v := req.Get("previous_response_id"); v.Exists() {
 			payload, _ = sjson.Set(payload, responseObjectPath(objectPath, "previous_response_id"), v.String())
 		}
+		if v := req.Get("prompt"); v.Exists() {
+			payload, _ = sjson.Set(payload, responseObjectPath(objectPath, "prompt"), v.Value())
+		}
 		if v := req.Get("prompt_cache_key"); v.Exists() {
 			payload, _ = sjson.Set(payload, responseObjectPath(objectPath, "prompt_cache_key"), v.String())
+		}
+		if v := req.Get("prompt_cache_retention"); v.Exists() {
+			payload, _ = sjson.Set(payload, responseObjectPath(objectPath, "prompt_cache_retention"), v.String())
 		}
 		if v := req.Get("reasoning"); v.Exists() {
 			payload = applyMergedRequestField(payload, objectPath, "reasoning", v.Value())
@@ -394,7 +466,7 @@ func applyRequestFieldsToResponsesObject(payload string, objectPath string, requ
 			payload, _ = sjson.Set(payload, responseObjectPath(objectPath, "tool_choice"), v.Value())
 		}
 		if v := req.Get("tools"); v.Exists() {
-			payload, _ = sjson.Set(payload, responseObjectPath(objectPath, "tools"), v.Value())
+			payload, _ = sjson.Set(payload, responseObjectPath(objectPath, "tools"), normalizeResponsesToolsForResponseObject(v))
 		}
 		if v := req.Get("top_logprobs"); v.Exists() {
 			payload, _ = sjson.Set(payload, responseObjectPath(objectPath, "top_logprobs"), v.Int())
@@ -417,6 +489,103 @@ func applyRequestFieldsToResponsesObject(payload string, objectPath string, requ
 		payload, _ = sjson.Set(payload, responseObjectPath(objectPath, "model"), fallbackModel)
 	}
 	return payload
+}
+
+func normalizeResponsesToolsForResponseObject(tools gjson.Result) any {
+	if !tools.Exists() || !tools.IsArray() {
+		return tools.Value()
+	}
+
+	out := make([]any, 0, len(tools.Array()))
+	for _, tool := range tools.Array() {
+		if strings.TrimSpace(tool.Get("type").String()) != "function" || !tool.IsObject() {
+			out = append(out, tool.Value())
+			continue
+		}
+
+		normalized := map[string]any{
+			"type":   "function",
+			"strict": responsesFunctionToolStrictMode(tool),
+		}
+
+		if name := strings.TrimSpace(tool.Get("name").String()); name != "" {
+			normalized["name"] = name
+		}
+		if description := strings.TrimSpace(tool.Get("description").String()); description != "" {
+			normalized["description"] = description
+		}
+
+		strictMode := normalized["strict"].(bool)
+		if parameters := tool.Get("parameters"); parameters.Exists() {
+			parametersRaw := parameters.Raw
+			if strictMode {
+				parametersRaw = normalizeResponsesStrictJSONSchema(parametersRaw)
+			}
+			normalized["parameters"] = gjson.Parse(parametersRaw).Value()
+		} else if strictMode {
+			normalized["parameters"] = gjson.Parse(normalizeResponsesStrictJSONSchema("")).Value()
+		}
+
+		out = append(out, normalized)
+	}
+
+	return out
+}
+
+func responsesRequestedToolType(requestRawJSON []byte, name string) string {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return ""
+	}
+
+	tools := gjson.GetBytes(requestRawJSON, "tools")
+	if !tools.Exists() || !tools.IsArray() {
+		return ""
+	}
+
+	for _, tool := range tools.Array() {
+		toolName := strings.TrimSpace(tool.Get("name").String())
+		if toolName == "" {
+			toolName = strings.TrimSpace(tool.Get("function.name").String())
+		}
+		if !strings.EqualFold(toolName, name) {
+			continue
+		}
+		return strings.ToLower(strings.TrimSpace(tool.Get("type").String()))
+	}
+
+	return ""
+}
+
+func responsesIsCustomTool(requestRawJSON []byte, name string) bool {
+	return responsesRequestedToolType(requestRawJSON, name) == "custom"
+}
+
+func responsesToolCallItemID(callID string, isCustom bool) string {
+	if isCustom {
+		return "ctc_" + callID
+	}
+	return "fc_" + callID
+}
+
+func responsesCustomToolInput(rawArguments string) string {
+	rawArguments = strings.TrimSpace(rawArguments)
+	if rawArguments == "" {
+		return ""
+	}
+	if gjson.Valid(rawArguments) {
+		parsed := gjson.Parse(rawArguments)
+		if parsed.Type == gjson.String {
+			return parsed.String()
+		}
+		if parsed.IsObject() {
+			input := parsed.Get("input")
+			if input.Exists() && input.Type == gjson.String {
+				return input.String()
+			}
+		}
+	}
+	return rawArguments
 }
 
 // ConvertOpenAIChatCompletionsResponseToOpenAIResponses converts OpenAI Chat Completions streaming chunks
@@ -492,7 +661,11 @@ func ConvertOpenAIChatCompletionsResponseToOpenAIResponses(ctx context.Context, 
 		}
 	}
 
-	nextSeq := func() int { st.Seq++; return st.Seq }
+	nextSeq := func() int {
+		current := st.Seq
+		st.Seq++
+		return current
+	}
 	nextOutputIndex := func() int {
 		index := st.NextOutputIndex
 		st.NextOutputIndex++
@@ -501,7 +674,8 @@ func ConvertOpenAIChatCompletionsResponseToOpenAIResponses(ctx context.Context, 
 	var out []string
 
 	if !st.Started {
-		st.ResponseID = root.Get("id").String()
+		st.Seq = 0
+		st.ResponseID = publicOpenAIResponsesID(root.Get("id").String())
 		st.Created = root.Get("created").Int()
 		// reset aggregation state for a new streaming response
 		st.MsgTextBuf = make(map[int]*strings.Builder)
@@ -548,7 +722,8 @@ func ConvertOpenAIChatCompletionsResponseToOpenAIResponses(ctx context.Context, 
 		st.Started = true
 	}
 
-	for _, builtInCall := range parseResponsesBuiltInToolOutputs(root) {
+	builtInToolOutputs := parseResponsesBuiltInToolOutputs(root)
+	for _, builtInCall := range builtInToolOutputs {
 		existing, seen := st.WebSearchCalls[builtInCall.ID]
 		if !seen {
 			builtInCall.OutputIndex = nextOutputIndex()
@@ -715,6 +890,7 @@ func ConvertOpenAIChatCompletionsResponseToOpenAIResponses(ctx context.Context, 
 					msg, _ = sjson.Set(msg, "output_index", outputIndex)
 					msg, _ = sjson.Set(msg, "content_index", 0)
 					msg, _ = sjson.Set(msg, "delta", c.String())
+					msg = appendResponsesStreamObfuscation(msg, requestRawJSON)
 					out = append(out, emitRespEvent("response.output_text.delta", msg))
 					// aggregate for response.output
 					if st.MsgTextBuf[idx] == nil {
@@ -749,12 +925,14 @@ func ConvertOpenAIChatCompletionsResponseToOpenAIResponses(ctx context.Context, 
 					reasoningDelta, _ = sjson.Set(reasoningDelta, "output_index", st.ReasoningIndex)
 					reasoningDelta, _ = sjson.Set(reasoningDelta, "content_index", 0)
 					reasoningDelta, _ = sjson.Set(reasoningDelta, "delta", rc.String())
+					reasoningDelta = appendResponsesStreamObfuscation(reasoningDelta, requestRawJSON)
 					out = append(out, emitRespEvent("response.reasoning_text.delta", reasoningDelta))
 					msg := `{"type":"response.reasoning_summary_text.delta","sequence_number":0,"item_id":"","output_index":0,"summary_index":0,"delta":""}`
 					msg, _ = sjson.Set(msg, "sequence_number", nextSeq())
 					msg, _ = sjson.Set(msg, "item_id", st.ReasoningID)
 					msg, _ = sjson.Set(msg, "output_index", st.ReasoningIndex)
 					msg, _ = sjson.Set(msg, "delta", rc.String())
+					msg = appendResponsesStreamObfuscation(msg, requestRawJSON)
 					out = append(out, emitRespEvent("response.reasoning_summary_text.delta", msg))
 				}
 
@@ -825,10 +1003,14 @@ func ConvertOpenAIChatCompletionsResponseToOpenAIResponses(ctx context.Context, 
 						}
 
 						if shouldEmitItem && effectiveCallID != "" {
+							isCustom := responsesIsCustomTool(requestRawJSON, st.FuncNames[funcKey])
 							o := `{"type":"response.output_item.added","sequence_number":0,"output_index":0,"item":{"id":"","type":"function_call","status":"in_progress","arguments":"","call_id":"","name":""}}`
+							if isCustom {
+								o = `{"type":"response.output_item.added","sequence_number":0,"output_index":0,"item":{"id":"","type":"custom_tool_call","status":"in_progress","input":"","call_id":"","name":""}}`
+							}
 							o, _ = sjson.Set(o, "sequence_number", nextSeq())
 							o, _ = sjson.Set(o, "output_index", outputIndex)
-							o, _ = sjson.Set(o, "item.id", fmt.Sprintf("fc_%s", effectiveCallID))
+							o, _ = sjson.Set(o, "item.id", responsesToolCallItemID(effectiveCallID, isCustom))
 							o, _ = sjson.Set(o, "item.call_id", effectiveCallID)
 							o, _ = sjson.Set(o, "item.name", st.FuncNames[funcKey])
 							out = append(out, emitRespEvent("response.output_item.added", o))
@@ -844,12 +1026,21 @@ func ConvertOpenAIChatCompletionsResponseToOpenAIResponses(ctx context.Context, 
 								refCallID = newCallID
 							}
 							if refCallID != "" {
+								isCustom := responsesIsCustomTool(requestRawJSON, st.FuncNames[funcKey])
+								eventName := "response.function_call_arguments.delta"
 								ad := `{"type":"response.function_call_arguments.delta","sequence_number":0,"item_id":"","output_index":0,"delta":""}`
+								deltaValue := args.String()
+								if isCustom {
+									eventName = "response.custom_tool_call_input.delta"
+									ad = `{"type":"response.custom_tool_call_input.delta","sequence_number":0,"item_id":"","output_index":0,"delta":""}`
+									deltaValue = responsesCustomToolInput(args.String())
+								}
 								ad, _ = sjson.Set(ad, "sequence_number", nextSeq())
-								ad, _ = sjson.Set(ad, "item_id", fmt.Sprintf("fc_%s", refCallID))
+								ad, _ = sjson.Set(ad, "item_id", responsesToolCallItemID(refCallID, isCustom))
 								ad, _ = sjson.Set(ad, "output_index", outputIndex)
-								ad, _ = sjson.Set(ad, "delta", args.String())
-								out = append(out, emitRespEvent("response.function_call_arguments.delta", ad))
+								ad, _ = sjson.Set(ad, "delta", deltaValue)
+								ad = appendResponsesStreamObfuscation(ad, requestRawJSON)
+								out = append(out, emitRespEvent(eventName, ad))
 							}
 							st.FuncArgsBuf[funcKey].WriteString(args.String())
 						}
@@ -975,22 +1166,43 @@ func ConvertOpenAIChatCompletionsResponseToOpenAIResponses(ctx context.Context, 
 							args = b.String()
 						}
 						outputIndex := st.FuncOutputs[funcKey]
-						fcDone := `{"type":"response.function_call_arguments.done","sequence_number":0,"item_id":"","output_index":0,"arguments":"","name":""}`
-						fcDone, _ = sjson.Set(fcDone, "sequence_number", nextSeq())
-						fcDone, _ = sjson.Set(fcDone, "item_id", fmt.Sprintf("fc_%s", callID))
-						fcDone, _ = sjson.Set(fcDone, "output_index", outputIndex)
-						fcDone, _ = sjson.Set(fcDone, "arguments", args)
-						fcDone, _ = sjson.Set(fcDone, "name", st.FuncNames[funcKey])
-						out = append(out, emitRespEvent("response.function_call_arguments.done", fcDone))
+						isCustom := responsesIsCustomTool(requestRawJSON, st.FuncNames[funcKey])
+						itemID := responsesToolCallItemID(callID, isCustom)
+						if isCustom {
+							customInput := responsesCustomToolInput(args)
+							customDone := `{"type":"response.custom_tool_call_input.done","sequence_number":0,"item_id":"","output_index":0,"input":""}`
+							customDone, _ = sjson.Set(customDone, "sequence_number", nextSeq())
+							customDone, _ = sjson.Set(customDone, "item_id", itemID)
+							customDone, _ = sjson.Set(customDone, "output_index", outputIndex)
+							customDone, _ = sjson.Set(customDone, "input", customInput)
+							out = append(out, emitRespEvent("response.custom_tool_call_input.done", customDone))
 
-						itemDone := `{"type":"response.output_item.done","sequence_number":0,"output_index":0,"item":{"id":"","type":"function_call","status":"completed","arguments":"","call_id":"","name":""}}`
-						itemDone, _ = sjson.Set(itemDone, "sequence_number", nextSeq())
-						itemDone, _ = sjson.Set(itemDone, "output_index", outputIndex)
-						itemDone, _ = sjson.Set(itemDone, "item.id", fmt.Sprintf("fc_%s", callID))
-						itemDone, _ = sjson.Set(itemDone, "item.arguments", args)
-						itemDone, _ = sjson.Set(itemDone, "item.call_id", callID)
-						itemDone, _ = sjson.Set(itemDone, "item.name", st.FuncNames[funcKey])
-						out = append(out, emitRespEvent("response.output_item.done", itemDone))
+							itemDone := `{"type":"response.output_item.done","sequence_number":0,"output_index":0,"item":{"id":"","type":"custom_tool_call","status":"completed","input":"","call_id":"","name":""}}`
+							itemDone, _ = sjson.Set(itemDone, "sequence_number", nextSeq())
+							itemDone, _ = sjson.Set(itemDone, "output_index", outputIndex)
+							itemDone, _ = sjson.Set(itemDone, "item.id", itemID)
+							itemDone, _ = sjson.Set(itemDone, "item.input", customInput)
+							itemDone, _ = sjson.Set(itemDone, "item.call_id", callID)
+							itemDone, _ = sjson.Set(itemDone, "item.name", st.FuncNames[funcKey])
+							out = append(out, emitRespEvent("response.output_item.done", itemDone))
+						} else {
+							fcDone := `{"type":"response.function_call_arguments.done","sequence_number":0,"item_id":"","output_index":0,"arguments":"","name":""}`
+							fcDone, _ = sjson.Set(fcDone, "sequence_number", nextSeq())
+							fcDone, _ = sjson.Set(fcDone, "item_id", itemID)
+							fcDone, _ = sjson.Set(fcDone, "output_index", outputIndex)
+							fcDone, _ = sjson.Set(fcDone, "arguments", args)
+							fcDone, _ = sjson.Set(fcDone, "name", st.FuncNames[funcKey])
+							out = append(out, emitRespEvent("response.function_call_arguments.done", fcDone))
+
+							itemDone := `{"type":"response.output_item.done","sequence_number":0,"output_index":0,"item":{"id":"","type":"function_call","status":"completed","arguments":"","call_id":"","name":""}}`
+							itemDone, _ = sjson.Set(itemDone, "sequence_number", nextSeq())
+							itemDone, _ = sjson.Set(itemDone, "output_index", outputIndex)
+							itemDone, _ = sjson.Set(itemDone, "item.id", itemID)
+							itemDone, _ = sjson.Set(itemDone, "item.arguments", args)
+							itemDone, _ = sjson.Set(itemDone, "item.call_id", callID)
+							itemDone, _ = sjson.Set(itemDone, "item.name", st.FuncNames[funcKey])
+							out = append(out, emitRespEvent("response.output_item.done", itemDone))
+						}
 						st.FuncItemDone[funcKey] = true
 						st.FuncArgsDone[funcKey] = true
 					}
@@ -1072,9 +1284,17 @@ func ConvertOpenAIChatCompletionsResponseToOpenAIResponses(ctx context.Context, 
 						if b := st.FuncArgsBuf[funcKey]; b != nil {
 							args = b.String()
 						}
+						isCustom := responsesIsCustomTool(requestRawJSON, st.FuncNames[funcKey])
 						item := `{"id":"","type":"function_call","status":"completed","arguments":"","call_id":"","name":""}`
-						item, _ = sjson.Set(item, "id", fmt.Sprintf("fc_%s", callID))
-						item, _ = sjson.Set(item, "arguments", args)
+						if isCustom {
+							item = `{"id":"","type":"custom_tool_call","status":"completed","input":"","call_id":"","name":""}`
+						}
+						item, _ = sjson.Set(item, "id", responsesToolCallItemID(callID, isCustom))
+						if isCustom {
+							item, _ = sjson.Set(item, "input", responsesCustomToolInput(args))
+						} else {
+							item, _ = sjson.Set(item, "arguments", args)
+						}
 						item, _ = sjson.Set(item, "call_id", callID)
 						item, _ = sjson.Set(item, "name", st.FuncNames[funcKey])
 						outputItems = append(outputItems, indexedOutputItem{Index: outputIndex, Raw: item})
@@ -1147,10 +1367,7 @@ func ConvertOpenAIChatCompletionsResponseToOpenAIResponsesNonStream(_ context.Co
 	}
 
 	// id: use provider id if present, otherwise synthesize
-	id := root.Get("id").String()
-	if id == "" {
-		id = fmt.Sprintf("resp_%x_%d", time.Now().UnixNano(), atomic.AddUint64(&responseIDCounter, 1))
-	}
+	id := publicOpenAIResponsesID(root.Get("id").String())
 	resp, _ = sjson.Set(resp, "id", id)
 
 	// created_at: map from chat.completion created
@@ -1170,9 +1387,6 @@ func ConvertOpenAIChatCompletionsResponseToOpenAIResponsesNonStream(_ context.Co
 	rcEncrypted := gjson.GetBytes(rawJSON, "choices.0.message.reasoning_encrypted_content").String()
 	includeReasoningEncryptedContent := responsesRequestIncludes(requestRawJSON, "reasoning.encrypted_content")
 	includeReasoning := rcText != "" || (includeReasoningEncryptedContent && strings.TrimSpace(rcEncrypted) != "")
-	if !includeReasoning && len(requestRawJSON) > 0 {
-		includeReasoning = gjson.GetBytes(requestRawJSON, "reasoning").Exists()
-	}
 	if includeReasoning {
 		reasoningItem := `{"id":"","type":"reasoning","status":"completed","summary":[],"content":[]}`
 		if rcItemID != "" {
@@ -1227,9 +1441,17 @@ func ConvertOpenAIChatCompletionsResponseToOpenAIResponsesNonStream(_ context.Co
 						callID := tc.Get("id").String()
 						name := tc.Get("function.name").String()
 						args := tc.Get("function.arguments").String()
+						isCustom := responsesIsCustomTool(requestRawJSON, name)
 						item := `{"id":"","type":"function_call","status":"completed","arguments":"","call_id":"","name":""}`
-						item, _ = sjson.Set(item, "id", fmt.Sprintf("fc_%s", callID))
-						item, _ = sjson.Set(item, "arguments", args)
+						if isCustom {
+							item = `{"id":"","type":"custom_tool_call","status":"completed","input":"","call_id":"","name":""}`
+						}
+						item, _ = sjson.Set(item, "id", responsesToolCallItemID(callID, isCustom))
+						if isCustom {
+							item, _ = sjson.Set(item, "input", responsesCustomToolInput(args))
+						} else {
+							item, _ = sjson.Set(item, "arguments", args)
+						}
 						item, _ = sjson.Set(item, "call_id", callID)
 						item, _ = sjson.Set(item, "name", name)
 						outputsWrapper, _ = sjson.SetRaw(outputsWrapper, "arr.-1", item)

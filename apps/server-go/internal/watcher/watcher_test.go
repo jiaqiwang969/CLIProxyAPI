@@ -354,6 +354,122 @@ func TestSnapshotCoreAuths_UpdatesAllSameTenantAuggieAuthFilesFromSession(t *tes
 	}
 }
 
+func TestStartWatchesAuggieSessionDirectoryWhenPresent(t *testing.T) {
+	useRealAuggieSessionLoader(t)
+
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+	writeWatcherAuggieSessionFile(t, homeDir, `{"accessToken":"session-token","tenantURL":"https://tenant.augmentcode.com","scopes":["email"]}`)
+
+	tmpDir := t.TempDir()
+	authDir := filepath.Join(tmpDir, "auth")
+	if err := os.MkdirAll(authDir, 0o755); err != nil {
+		t.Fatalf("failed to create auth dir: %v", err)
+	}
+	configPath := filepath.Join(tmpDir, "config.yaml")
+	if err := os.WriteFile(configPath, []byte("auth_dir: "+authDir+"\n"), 0o644); err != nil {
+		t.Fatalf("failed to write config file: %v", err)
+	}
+
+	w, err := NewWatcher(configPath, authDir, nil)
+	if err != nil {
+		t.Fatalf("failed to create watcher: %v", err)
+	}
+	w.SetConfig(&config.Config{AuthDir: authDir})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if err := w.Start(ctx); err != nil {
+		t.Fatalf("expected Start to succeed: %v", err)
+	}
+	defer w.Stop()
+
+	wantDir := w.normalizeAuthPath(filepath.Join(homeDir, ".augment"))
+	for _, path := range w.watcher.WatchList() {
+		if w.normalizeAuthPath(path) == wantDir {
+			return
+		}
+	}
+	t.Fatalf("expected watch list to include %s, got %v", wantDir, w.watcher.WatchList())
+}
+
+func TestStartDoesNotWatchAuggieHomeDirectoryWhenSessionDirExists(t *testing.T) {
+	useRealAuggieSessionLoader(t)
+
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+	writeWatcherAuggieSessionFile(t, homeDir, `{"accessToken":"session-token","tenantURL":"https://tenant.augmentcode.com","scopes":["email"]}`)
+
+	tmpDir := t.TempDir()
+	authDir := filepath.Join(tmpDir, "auth")
+	if err := os.MkdirAll(authDir, 0o755); err != nil {
+		t.Fatalf("failed to create auth dir: %v", err)
+	}
+	configPath := filepath.Join(tmpDir, "config.yaml")
+	if err := os.WriteFile(configPath, []byte("auth_dir: "+authDir+"\n"), 0o644); err != nil {
+		t.Fatalf("failed to write config file: %v", err)
+	}
+
+	w, err := NewWatcher(configPath, authDir, nil)
+	if err != nil {
+		t.Fatalf("failed to create watcher: %v", err)
+	}
+	w.SetConfig(&config.Config{AuthDir: authDir})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if err := w.Start(ctx); err != nil {
+		t.Fatalf("expected Start to succeed: %v", err)
+	}
+	defer w.Stop()
+
+	unwantedDir := w.normalizeAuthPath(homeDir)
+	for _, path := range w.watcher.WatchList() {
+		if w.normalizeAuthPath(path) == unwantedDir {
+			t.Fatalf("did not expect watch list to include %s, got %v", unwantedDir, w.watcher.WatchList())
+		}
+	}
+}
+
+func TestStartWatchesAuggieHomeDirectoryWhenSessionDirMissing(t *testing.T) {
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+
+	tmpDir := t.TempDir()
+	authDir := filepath.Join(tmpDir, "auth")
+	if err := os.MkdirAll(authDir, 0o755); err != nil {
+		t.Fatalf("failed to create auth dir: %v", err)
+	}
+	configPath := filepath.Join(tmpDir, "config.yaml")
+	if err := os.WriteFile(configPath, []byte("auth_dir: "+authDir+"\n"), 0o644); err != nil {
+		t.Fatalf("failed to write config file: %v", err)
+	}
+
+	w, err := NewWatcher(configPath, authDir, nil)
+	if err != nil {
+		t.Fatalf("failed to create watcher: %v", err)
+	}
+	w.SetConfig(&config.Config{AuthDir: authDir})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if err := w.Start(ctx); err != nil {
+		t.Fatalf("expected Start to succeed: %v", err)
+	}
+	defer w.Stop()
+
+	wantDir := w.normalizeAuthPath(homeDir)
+	for _, path := range w.watcher.WatchList() {
+		if w.normalizeAuthPath(path) == wantDir {
+			return
+		}
+	}
+	t.Fatalf("expected watch list to include %s, got %v", wantDir, w.watcher.WatchList())
+}
+
 func TestReloadConfigIfChanged_TriggersOnChangeAndSkipsUnchanged(t *testing.T) {
 	tmpDir := t.TempDir()
 	authDir := filepath.Join(tmpDir, "auth")
@@ -1003,6 +1119,106 @@ func TestHandleEventAuthWriteTriggersUpdate(t *testing.T) {
 	if atomic.LoadInt32(&reloads) != 1 {
 		t.Fatalf("expected auth write to trigger reload callback, got %d", reloads)
 	}
+}
+
+func TestHandleEventAuggieSessionWriteRefreshesAuthState(t *testing.T) {
+	useRealAuggieSessionLoader(t)
+
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+	writeWatcherAuggieSessionFile(t, homeDir, `{"accessToken":"session-token-1","tenantURL":"https://tenant.augmentcode.com","scopes":["email"]}`)
+
+	authDir := t.TempDir()
+	queue := make(chan AuthUpdate, 4)
+	w := &Watcher{
+		authDir:        authDir,
+		lastAuthHashes: make(map[string]string),
+	}
+	w.SetConfig(&config.Config{AuthDir: authDir})
+	w.SetAuthUpdateQueue(queue)
+	defer w.stopDispatch()
+
+	w.refreshAuthState(false)
+
+	select {
+	case initial := <-queue:
+		if initial.Action != AuthUpdateActionAdd {
+			t.Fatalf("expected initial add update, got %+v", initial)
+		}
+		if got := initial.Auth.Metadata["access_token"]; got != "session-token-1" {
+			t.Fatalf("initial access token = %v, want session-token-1", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for initial session auth update")
+	}
+
+	writeWatcherAuggieSessionFile(t, homeDir, `{"accessToken":"session-token-2","tenantURL":"https://tenant.augmentcode.com","scopes":["email"]}`)
+	sessionPath := filepath.Join(homeDir, ".augment", "session.json")
+
+	w.handleEvent(fsnotify.Event{Name: sessionPath, Op: fsnotify.Write})
+
+	select {
+	case update := <-queue:
+		if update.Action != AuthUpdateActionModify {
+			t.Fatalf("expected modify update after session write, got %+v", update)
+		}
+		if got := update.Auth.Metadata["access_token"]; got != "session-token-2" {
+			t.Fatalf("updated access token = %v, want session-token-2", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for refreshed session auth update")
+	}
+}
+
+func TestHandleEventAuggieSessionDirCreateAddsWatchAndRefreshesAuthState(t *testing.T) {
+	useRealAuggieSessionLoader(t)
+
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+	sessionDir := filepath.Join(homeDir, ".augment")
+	if err := os.MkdirAll(sessionDir, 0o700); err != nil {
+		t.Fatalf("failed to create session dir: %v", err)
+	}
+	writeWatcherAuggieSessionFile(t, homeDir, `{"accessToken":"session-token-created","tenantURL":"https://tenant.augmentcode.com","scopes":["email"]}`)
+
+	authDir := t.TempDir()
+	fsWatcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		t.Fatalf("failed to create fsnotify watcher: %v", err)
+	}
+	defer fsWatcher.Close()
+
+	queue := make(chan AuthUpdate, 4)
+	w := &Watcher{
+		authDir:        authDir,
+		watcher:        fsWatcher,
+		lastAuthHashes: make(map[string]string),
+	}
+	w.SetConfig(&config.Config{AuthDir: authDir})
+	w.SetAuthUpdateQueue(queue)
+	defer w.stopDispatch()
+
+	w.handleEvent(fsnotify.Event{Name: sessionDir, Op: fsnotify.Create})
+
+	select {
+	case update := <-queue:
+		if update.Action != AuthUpdateActionAdd {
+			t.Fatalf("expected add update after session dir create, got %+v", update)
+		}
+		if got := update.Auth.Metadata["access_token"]; got != "session-token-created" {
+			t.Fatalf("updated access token = %v, want session-token-created", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for session dir create auth update")
+	}
+
+	wantDir := w.normalizeAuthPath(sessionDir)
+	for _, path := range w.watcher.WatchList() {
+		if w.normalizeAuthPath(path) == wantDir {
+			return
+		}
+	}
+	t.Fatalf("expected watch list to include %s, got %v", wantDir, w.watcher.WatchList())
 }
 
 func TestHandleEventRemoveDebounceSkips(t *testing.T) {

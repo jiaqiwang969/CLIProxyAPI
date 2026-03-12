@@ -17,6 +17,7 @@ import (
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
 	log "github.com/sirupsen/logrus"
+	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
 
@@ -81,23 +82,18 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 		return
 	}
 
-	from := opts.SourceFormat
-	to := sdktranslator.FromString("openai")
-	endpoint := "/chat/completions"
-	if opts.Alt == "responses/compact" {
-		to = sdktranslator.FromString("openai-response")
-		endpoint = "/responses/compact"
-	}
 	originalPayloadSource := req.Payload
 	if len(opts.OriginalRequest) > 0 {
 		originalPayloadSource = opts.OriginalRequest
 	}
+	from := opts.SourceFormat
+	to, endpoint := openAICompatTarget(opts, originalPayloadSource)
 	originalPayload := originalPayloadSource
 	originalTranslated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, opts.Stream)
 	translated := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, opts.Stream)
 	requestedModel := payloadRequestedModel(opts, req.Model)
 	translated = applyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", translated, originalTranslated, requestedModel)
-	if opts.Alt == "responses/compact" {
+	if endpoint == "/responses/compact" {
 		if updated, errDelete := sjson.DeleteBytes(translated, "stream"); errDelete == nil {
 			translated = updated
 		}
@@ -155,10 +151,10 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 	recordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
 		b, _ := io.ReadAll(httpResp.Body)
-	if err := SanityCheckResponse(b); err != nil {
-		recordAPIResponseError(ctx, e.cfg, err)
-		return cliproxyexecutor.Response{}, err
-	}
+		if err := SanityCheckResponse(b); err != nil {
+			recordAPIResponseError(ctx, e.cfg, err)
+			return cliproxyexecutor.Response{}, err
+		}
 		appendAPIResponseChunk(ctx, e.cfg, b)
 		logWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, summarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
 		err = statusErr{code: httpResp.StatusCode, msg: string(b)}
@@ -196,12 +192,12 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 		return nil, err
 	}
 
-	from := opts.SourceFormat
-	to := sdktranslator.FromString("openai")
 	originalPayloadSource := req.Payload
 	if len(opts.OriginalRequest) > 0 {
 		originalPayloadSource = opts.OriginalRequest
 	}
+	from := opts.SourceFormat
+	to, endpoint := openAICompatTarget(opts, originalPayloadSource)
 	originalPayload := originalPayloadSource
 	originalTranslated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, true)
 	translated := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, true)
@@ -213,7 +209,7 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 		return nil, err
 	}
 
-	url := strings.TrimSuffix(baseURL, "/") + "/chat/completions"
+	url := strings.TrimSuffix(baseURL, "/") + endpoint
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(translated))
 	if err != nil {
 		return nil, err
@@ -388,6 +384,121 @@ func (e *OpenAICompatExecutor) overrideModel(payload []byte, model string) []byt
 	}
 	payload, _ = sjson.SetBytes(payload, "model", model)
 	return payload
+}
+
+func openAICompatTarget(opts cliproxyexecutor.Options, originalPayload []byte) (sdktranslator.Format, string) {
+	if opts.Alt == "responses/compact" {
+		return sdktranslator.FormatOpenAIResponse, "/responses/compact"
+	}
+	if opts.SourceFormat == sdktranslator.FormatOpenAIResponse && usesNativeResponsesEndpoint(originalPayload) {
+		return sdktranslator.FormatOpenAIResponse, "/responses"
+	}
+	return sdktranslator.FormatOpenAI, "/chat/completions"
+}
+
+func usesNativeResponsesEndpoint(payload []byte) bool {
+	if prompt := gjson.GetBytes(payload, "prompt"); prompt.Exists() && prompt.Type != gjson.Null {
+		return true
+	}
+	if strings.EqualFold(strings.TrimSpace(gjson.GetBytes(payload, "truncation").String()), "auto") {
+		return true
+	}
+	if gjson.GetBytes(payload, "stream_options.include_obfuscation").Exists() {
+		return true
+	}
+	if strings.EqualFold(strings.TrimSpace(gjson.GetBytes(payload, "prompt_cache_retention").String()), "in-memory") {
+		return true
+	}
+	if strings.EqualFold(strings.TrimSpace(gjson.GetBytes(payload, "prompt_cache_retention").String()), "24h") {
+		return true
+	}
+	if textFormat := gjson.GetBytes(payload, "text.format"); textFormat.Exists() && textFormat.Type != gjson.Null {
+		return true
+	}
+	if reasoningSummary := gjson.GetBytes(payload, "reasoning.summary"); reasoningSummary.Exists() && reasoningSummary.Type != gjson.Null {
+		return true
+	}
+	if include := gjson.GetBytes(payload, "include"); include.Exists() && include.Type != gjson.Null {
+		return true
+	}
+	if strings.TrimSpace(gjson.GetBytes(payload, "previous_response_id").String()) != "" {
+		return true
+	}
+	if payloadRequiresNativeResponsesInputItems(payload) {
+		return true
+	}
+	if payloadRequiresNativeResponsesMessageContent(payload) {
+		return true
+	}
+
+	contextManagement := gjson.GetBytes(payload, "context_management")
+	if !contextManagement.Exists() || !contextManagement.IsArray() {
+		return false
+	}
+	for _, item := range contextManagement.Array() {
+		if strings.EqualFold(strings.TrimSpace(item.Get("type").String()), "compaction") {
+			return true
+		}
+	}
+	return false
+}
+
+func payloadRequiresNativeResponsesInputItems(payload []byte) bool {
+	input := gjson.GetBytes(payload, "input")
+	if !input.Exists() || !input.IsArray() {
+		return false
+	}
+
+	for _, item := range input.Array() {
+		itemType := strings.TrimSpace(item.Get("type").String())
+		if itemType == "" && strings.TrimSpace(item.Get("role").String()) != "" {
+			itemType = "message"
+		}
+		switch itemType {
+		case "", "message", "function_call", "function_call_output":
+			continue
+		default:
+			return true
+		}
+	}
+
+	return false
+}
+
+func payloadRequiresNativeResponsesMessageContent(payload []byte) bool {
+	input := gjson.GetBytes(payload, "input")
+	if !input.Exists() || !input.IsArray() {
+		return false
+	}
+
+	for _, item := range input.Array() {
+		itemType := strings.TrimSpace(item.Get("type").String())
+		if itemType == "" && strings.TrimSpace(item.Get("role").String()) != "" {
+			itemType = "message"
+		}
+		if itemType != "message" {
+			continue
+		}
+
+		content := item.Get("content")
+		if !content.Exists() || content.Type == gjson.Null || content.Type == gjson.String || !content.IsArray() {
+			continue
+		}
+		for _, contentItem := range content.Array() {
+			contentType := strings.TrimSpace(contentItem.Get("type").String())
+			if contentType == "" && contentItem.Get("text").Exists() {
+				contentType = "input_text"
+			}
+			switch contentType {
+			case "input_text", "output_text", "input_image":
+				continue
+			default:
+				return true
+			}
+		}
+	}
+
+	return false
 }
 
 type statusErr struct {

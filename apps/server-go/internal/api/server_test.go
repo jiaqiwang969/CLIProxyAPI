@@ -109,3 +109,22 @@ func TestAmpProviderModelRoutes(t *testing.T) {
 		})
 	}
 }
+
+func TestServerRegistersOpenAIResponsesLifecycleRoutes(t *testing.T) {
+	server := newTestServer(t)
+
+	routes := make(map[string]struct{}, len(server.engine.Routes()))
+	for _, route := range server.engine.Routes() {
+		routes[route.Method+" "+route.Path] = struct{}{}
+	}
+
+	for _, want := range []string{
+		"DELETE /v1/responses/:response_id",
+		"POST /v1/responses/:response_id/cancel",
+		"POST /v1/responses/input_tokens",
+	} {
+		if _, ok := routes[want]; !ok {
+			t.Fatalf("route %s not registered", want)
+		}
+	}
+}

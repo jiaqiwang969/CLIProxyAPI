@@ -716,6 +716,11 @@ func SanityCheckResponse(data []byte) error {
 		return nil
 	}
 
+	switch strings.TrimSpace(res.Get("object").String()) {
+	case "response", "response.compaction":
+		return nil
+	}
+
 	// If it has usage but no choices, it might be a terminal chunk or a metadata-only response.
 	// We allow these for now to be safe, as long as it's valid JSON.
 	if res.Get("usage").Exists() || res.Get("usageMetadata").Exists() || res.Get("response.usageMetadata").Exists() {

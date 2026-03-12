@@ -17,7 +17,11 @@ build/
 # Logs and temp
 logs/
 tmp/
+temp/
 *.log
+.codex/
+.entire/
+openai-*.tgz
 
 # Local environment
 .env

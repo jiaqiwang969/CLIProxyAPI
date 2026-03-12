@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -64,5 +65,26 @@ func TestWriteErrorResponse_AddonHeadersEnabled(t *testing.T) {
 	}
 	if got := recorder.Header().Values("X-Request-Id"); !reflect.DeepEqual(got, []string{"new-1", "new-2"}) {
 		t.Fatalf("X-Request-Id = %#v, want %#v", got, []string{"new-1", "new-2"})
+	}
+}
+
+func TestBuildErrorResponseBody_MapsForbiddenToPermissionErrorWithNullParam(t *testing.T) {
+	body := BuildErrorResponseBody(http.StatusForbidden, "account suspended")
+
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got := payload["error"].(map[string]any)["type"]; got != "permission_error" {
+		t.Fatalf("error.type = %v, want %q", got, "permission_error")
+	}
+	if got := payload["error"].(map[string]any)["code"]; got != "insufficient_quota" {
+		t.Fatalf("error.code = %v, want %q", got, "insufficient_quota")
+	}
+	if got := payload["error"].(map[string]any)["message"]; got != "account suspended" {
+		t.Fatalf("error.message = %v, want %q", got, "account suspended")
+	}
+	if got, exists := payload["error"].(map[string]any)["param"]; !exists || got != nil {
+		t.Fatalf("error.param = %v (exists=%v), want null", got, exists)
 	}
 }

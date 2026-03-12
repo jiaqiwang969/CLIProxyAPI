@@ -54,6 +54,42 @@ func TestUnifiedModelsHandler_DoesNotSwitchOnUserAgent(t *testing.T) {
 	}
 }
 
+func TestUnifiedModelsHandler_InvalidAPIKeyReturnsOpenAIStructuredError(t *testing.T) {
+	server := newTestServer(t)
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	req.Header.Set("Authorization", "Bearer invalid-key")
+
+	rec := httptest.NewRecorder()
+	server.engine.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusUnauthorized, rec.Body.String())
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("unmarshal response: %v; body=%s", err, rec.Body.String())
+	}
+
+	errorPayload, ok := payload["error"].(map[string]any)
+	if !ok {
+		t.Fatalf("error payload missing: %v", payload)
+	}
+	if got := errorPayload["message"]; got != "Invalid API key" {
+		t.Fatalf("error.message = %v, want %q", got, "Invalid API key")
+	}
+	if got := errorPayload["type"]; got != "authentication_error" {
+		t.Fatalf("error.type = %v, want %q", got, "authentication_error")
+	}
+	if got := errorPayload["code"]; got != "invalid_api_key" {
+		t.Fatalf("error.code = %v, want %q", got, "invalid_api_key")
+	}
+	if got, exists := errorPayload["param"]; !exists || got != nil {
+		t.Fatalf("error.param = %v (exists=%v), want null", got, exists)
+	}
+}
+
 type openAIModelsResponse struct {
 	Object string `json:"object"`
 	Data   []struct {

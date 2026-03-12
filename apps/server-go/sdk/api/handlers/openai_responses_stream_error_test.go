@@ -46,3 +46,27 @@ func TestBuildOpenAIResponsesStreamErrorChunkExtractsHTTPErrorBody(t *testing.T)
 		t.Fatalf("message = %v, want %q", payload["message"], "oops")
 	}
 }
+
+func TestBuildOpenAIResponsesStreamErrorChunk_MapsForbiddenToPermissionErrorWithNullParam(t *testing.T) {
+	chunk := BuildOpenAIResponsesStreamErrorChunk(http.StatusForbidden, "account suspended", 3)
+
+	var payload map[string]any
+	if err := json.Unmarshal(chunk, &payload); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if payload["type"] != "error" {
+		t.Fatalf("type = %v, want %q", payload["type"], "error")
+	}
+	if payload["code"] != "insufficient_quota" {
+		t.Fatalf("code = %v, want %q", payload["code"], "insufficient_quota")
+	}
+	if payload["message"] != "account suspended" {
+		t.Fatalf("message = %v, want %q", payload["message"], "account suspended")
+	}
+	if got, exists := payload["param"]; !exists || got != nil {
+		t.Fatalf("param = %v (exists=%v), want null", got, exists)
+	}
+	if payload["sequence_number"] != float64(3) {
+		t.Fatalf("sequence_number = %v, want %v", payload["sequence_number"], 3)
+	}
+}

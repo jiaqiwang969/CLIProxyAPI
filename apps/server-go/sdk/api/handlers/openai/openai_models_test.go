@@ -285,3 +285,127 @@ func TestOpenAIModels_FiltersToScopedAuthModels(t *testing.T) {
 		t.Fatalf("did not expect out-of-scope model %q in OpenAI catalog, ids=%v", "claude-opus-4-6", modelByID)
 	}
 }
+
+func TestScopedOpenAIModelMetadata_PrefersScopedProviderInfoForCanonicalFamily(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	reg := registry.GetGlobalRegistry()
+	const scopedAuthID = "openai-models-scoped-provider-auggie"
+	const otherAuthID = "openai-models-scoped-provider-antigravity"
+	reg.UnregisterClient(scopedAuthID)
+	reg.UnregisterClient(otherAuthID)
+	t.Cleanup(func() {
+		reg.UnregisterClient(scopedAuthID)
+		reg.UnregisterClient(otherAuthID)
+	})
+
+	reg.RegisterClient(scopedAuthID, "auggie", []*registry.ModelInfo{
+		{
+			ID:          "claude-sonnet-4-5-20250929",
+			Object:      "model",
+			OwnedBy:     "auggie",
+			Type:        "auggie",
+			DisplayName: "Claude Sonnet 4.5",
+			Version:     "claude-sonnet-4-5",
+		},
+	})
+	reg.RegisterClient(otherAuthID, "antigravity", []*registry.ModelInfo{
+		{
+			ID:      "claude-sonnet-4-5",
+			Object:  "model",
+			OwnedBy: "antigravity",
+			Type:    "antigravity",
+		},
+	})
+
+	scoped := scopedOpenAIModelMetadata(
+		map[string]any{
+			"id":       "claude-sonnet-4-5",
+			"object":   "model",
+			"owned_by": "antigravity",
+			"type":     "antigravity",
+		},
+		"claude-sonnet-4-5",
+		handlers.AccessScope{Provider: "auggie", AuthID: scopedAuthID},
+	)
+
+	if got := scoped["owned_by"]; got != "auggie" {
+		t.Fatalf("owned_by = %#v, want %q", got, "auggie")
+	}
+	if got := scoped["version"]; got != "claude-sonnet-4-5" {
+		t.Fatalf("version = %#v, want %q", got, "claude-sonnet-4-5")
+	}
+	if got := scoped["type"]; got != "auggie" {
+		t.Fatalf("type = %#v, want %q", got, "auggie")
+	}
+}
+
+func TestOpenAIModels_PrefersScopedProviderMetadataForCanonicalFamily(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	reg := registry.GetGlobalRegistry()
+	const scopedAuthID = "openai-models-handler-scoped-provider-auggie"
+	const otherAuthID = "openai-models-handler-scoped-provider-antigravity"
+	reg.UnregisterClient(scopedAuthID)
+	reg.UnregisterClient(otherAuthID)
+	t.Cleanup(func() {
+		reg.UnregisterClient(scopedAuthID)
+		reg.UnregisterClient(otherAuthID)
+	})
+
+	reg.RegisterClient(scopedAuthID, "auggie", []*registry.ModelInfo{
+		{
+			ID:          "claude-sonnet-4-5-20250929",
+			Object:      "model",
+			OwnedBy:     "auggie",
+			Type:        "auggie",
+			DisplayName: "Claude Sonnet 4.5",
+			Version:     "claude-sonnet-4-5",
+		},
+	})
+	reg.RegisterClient(otherAuthID, "antigravity", []*registry.ModelInfo{
+		{
+			ID:      "claude-sonnet-4-5",
+			Object:  "model",
+			OwnedBy: "antigravity",
+			Type:    "antigravity",
+		},
+	})
+
+	base := handlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, nil)
+	h := NewOpenAIAPIHandler(base)
+	router := gin.New()
+	router.Use(func(c *gin.Context) {
+		c.Set("accessScopeProvider", "auggie")
+		c.Set("accessScopeAuthID", scopedAuthID)
+		c.Next()
+	})
+	router.GET("/v1/models", h.OpenAIModels)
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	resp := httptest.NewRecorder()
+	router.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.Code, http.StatusOK)
+	}
+
+	var payload struct {
+		Data []struct {
+			ID      string `json:"id"`
+			OwnedBy string `json:"owned_by"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(resp.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+
+	modelByID := make(map[string]string, len(payload.Data))
+	for _, model := range payload.Data {
+		modelByID[model.ID] = model.OwnedBy
+	}
+
+	if got := modelByID["claude-sonnet-4-5"]; got != "auggie" {
+		t.Fatalf("owned_by for %q = %q, want %q; payload=%v", "claude-sonnet-4-5", got, "auggie", modelByID)
+	}
+}

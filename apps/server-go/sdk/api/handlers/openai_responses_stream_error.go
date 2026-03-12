@@ -11,6 +11,7 @@ type openAIResponsesStreamErrorChunk struct {
 	Type           string `json:"type"`
 	Code           string `json:"code"`
 	Message        string `json:"message"`
+	Param          any    `json:"param"`
 	SequenceNumber int    `json:"sequence_number"`
 }
 
@@ -56,6 +57,7 @@ func BuildOpenAIResponsesStreamErrorChunk(status int, errText string, sequenceNu
 	}
 
 	code := openAIResponsesStreamErrorCode(status)
+	var param any
 
 	trimmed := strings.TrimSpace(errText)
 	if trimmed != "" && json.Valid([]byte(trimmed)) {
@@ -72,6 +74,9 @@ func BuildOpenAIResponsesStreamErrorChunk(status int, errText string, sequenceNu
 						code = strings.TrimSpace(fmt.Sprint(v))
 					}
 				}
+				if v, exists := payload["param"]; exists {
+					param = v
+				}
 				if v, ok := payload["sequence_number"].(float64); ok && sequenceNumber == 0 {
 					sequenceNumber = int(v)
 				}
@@ -87,6 +92,9 @@ func BuildOpenAIResponsesStreamErrorChunk(status int, errText string, sequenceNu
 						code = strings.TrimSpace(fmt.Sprint(v))
 					}
 				}
+				if v, exists := e["param"]; exists {
+					param = v
+				}
 			}
 		}
 	}
@@ -99,6 +107,7 @@ func BuildOpenAIResponsesStreamErrorChunk(status int, errText string, sequenceNu
 		Type:           "error",
 		Code:           code,
 		Message:        message,
+		Param:          param,
 		SequenceNumber: sequenceNumber,
 	})
 	if err == nil {
@@ -110,6 +119,7 @@ func BuildOpenAIResponsesStreamErrorChunk(status int, errText string, sequenceNu
 		Type:           "error",
 		Code:           "internal_server_error",
 		Message:        message,
+		Param:          nil,
 		SequenceNumber: sequenceNumber,
 	})
 	if len(data) > 0 {

@@ -4,18 +4,34 @@ import (
 	"encoding/json"
 	"strings"
 
+	"github.com/google/uuid"
 	"github.com/tidwall/gjson"
 )
 
 type auggieChatHistoryEntry struct {
-	RequestMessage string `json:"request_message,omitempty"`
-	ResponseText   string `json:"response_text,omitempty"`
+	RequestMessage string                   `json:"request_message,omitempty"`
+	ResponseText   string                   `json:"response_text,omitempty"`
+	ResponseNodes  []auggieChatResponseNode `json:"response_nodes,omitempty"`
 }
 
 type auggieToolDefinition struct {
 	Name            string `json:"name"`
 	Description     string `json:"description,omitempty"`
 	InputSchemaJSON string `json:"input_schema_json,omitempty"`
+}
+
+type auggieChatToolUse struct {
+	ToolUseID string `json:"tool_use_id"`
+	ToolName  string `json:"tool_name"`
+	InputJSON string `json:"input_json"`
+	IsPartial bool   `json:"is_partial"`
+}
+
+type auggieChatResponseNode struct {
+	ID      int                `json:"id"`
+	Type    int                `json:"type"`
+	Content string             `json:"content,omitempty"`
+	ToolUse *auggieChatToolUse `json:"tool_use,omitempty"`
 }
 
 type auggieChatRequestToolResult struct {
@@ -35,31 +51,44 @@ type auggieFeatureDetectionFlags struct {
 }
 
 type auggieChatRequest struct {
-	Model              string                       `json:"model"`
-	Mode               string                       `json:"mode"`
-	Message            string                       `json:"message"`
-	SystemPrompt       string                       `json:"system_prompt,omitempty"`
-	SystemPromptAppend string                       `json:"system_prompt_append,omitempty"`
-	FeatureFlags       *auggieFeatureDetectionFlags `json:"feature_detection_flags,omitempty"`
-	ChatHistory        []auggieChatHistoryEntry     `json:"chat_history"`
-	Nodes              []auggieChatRequestNode      `json:"nodes,omitempty"`
-	ToolDefinitions    []auggieToolDefinition       `json:"tool_definitions"`
+	Model                 string                       `json:"model"`
+	Mode                  string                       `json:"mode"`
+	ReasoningEffort       string                       `json:"reasoning_effort,omitempty"`
+	EnableParallelToolUse *bool                        `json:"enable_parallel_tool_use,omitempty"`
+	ConversationID        string                       `json:"conversation_id,omitempty"`
+	TurnID                string                       `json:"turn_id,omitempty"`
+	RootConversationID    string                       `json:"root_conversation_id,omitempty"`
+	Message               string                       `json:"message"`
+	SystemPrompt          string                       `json:"system_prompt,omitempty"`
+	SystemPromptAppend    string                       `json:"system_prompt_append,omitempty"`
+	FeatureFlags          *auggieFeatureDetectionFlags `json:"feature_detection_flags,omitempty"`
+	ChatHistory           []auggieChatHistoryEntry     `json:"chat_history"`
+	Nodes                 []auggieChatRequestNode      `json:"nodes,omitempty"`
+	ToolDefinitions       []auggieToolDefinition       `json:"tool_definitions"`
 }
 
 // ConvertOpenAIRequestToAuggie converts an OpenAI chat-completions payload into
 // the minimal Auggie chat-stream request used by the v1 executor.
 func ConvertOpenAIRequestToAuggie(modelName string, rawJSON []byte, _ bool) []byte {
 	systemPrompt, systemPromptAppend := buildAuggieSystemPrompts(rawJSON)
+	message, chatHistory := buildAuggieConversation(rawJSON)
+	message = appendAuggieToolChoiceDirectiveToMessage(message, buildAuggieToolChoiceDirective(rawJSON))
+	conversationID, turnID := buildAuggieConversationIdentifiers()
 	out := auggieChatRequest{
-		Model:              modelName,
-		Mode:               "CHAT",
-		Message:            lastOpenAIUserMessage(rawJSON),
-		SystemPrompt:       systemPrompt,
-		SystemPromptAppend: systemPromptAppend,
-		FeatureFlags:       buildAuggieFeatureDetectionFlags(rawJSON),
-		ChatHistory:        buildAuggieChatHistory(rawJSON),
-		Nodes:              buildAuggieRequestNodes(rawJSON),
-		ToolDefinitions:    buildAuggieToolDefinitions(rawJSON),
+		Model:                 modelName,
+		Mode:                  "CHAT",
+		ReasoningEffort:       buildAuggieReasoningEffort(rawJSON),
+		EnableParallelToolUse: buildAuggieEnableParallelToolUse(rawJSON),
+		ConversationID:        conversationID,
+		TurnID:                turnID,
+		RootConversationID:    conversationID,
+		Message:               message,
+		SystemPrompt:          systemPrompt,
+		SystemPromptAppend:    systemPromptAppend,
+		FeatureFlags:          buildAuggieFeatureDetectionFlags(rawJSON),
+		ChatHistory:           chatHistory,
+		Nodes:                 buildAuggieRequestNodes(rawJSON),
+		ToolDefinitions:       buildAuggieToolDefinitions(rawJSON),
 	}
 	if out.ChatHistory == nil {
 		out.ChatHistory = []auggieChatHistoryEntry{}
@@ -75,6 +104,10 @@ func ConvertOpenAIRequestToAuggie(modelName string, rawJSON []byte, _ bool) []by
 	return body
 }
 
+func buildAuggieConversationIdentifiers() (string, string) {
+	return uuid.NewString(), uuid.NewString()
+}
+
 func buildAuggieFeatureDetectionFlags(rawJSON []byte) *auggieFeatureDetectionFlags {
 	parallelToolCalls := gjson.GetBytes(rawJSON, "parallel_tool_calls")
 	if !parallelToolCalls.Exists() {
@@ -84,6 +117,26 @@ func buildAuggieFeatureDetectionFlags(rawJSON []byte) *auggieFeatureDetectionFla
 	supportParallelToolUse := parallelToolCalls.Bool()
 	return &auggieFeatureDetectionFlags{
 		SupportParallelToolUse: &supportParallelToolUse,
+	}
+}
+
+func buildAuggieEnableParallelToolUse(rawJSON []byte) *bool {
+	parallelToolCalls := gjson.GetBytes(rawJSON, "parallel_tool_calls")
+	if !parallelToolCalls.Exists() {
+		return nil
+	}
+
+	enableParallelToolUse := parallelToolCalls.Bool()
+	return &enableParallelToolUse
+}
+
+func buildAuggieReasoningEffort(rawJSON []byte) string {
+	effort := strings.ToLower(strings.TrimSpace(gjson.GetBytes(rawJSON, "reasoning_effort").String()))
+	switch effort {
+	case "low", "medium", "high":
+		return effort
+	default:
+		return ""
 	}
 }
 
@@ -116,96 +169,109 @@ func buildAuggieSystemPrompts(rawJSON []byte) (string, string) {
 	return prompts[0], strings.Join(prompts[1:], "\n\n")
 }
 
-func lastOpenAIUserMessage(rawJSON []byte) string {
-	messages := gjson.GetBytes(rawJSON, "messages")
-	if !messages.IsArray() {
-		return ""
+func appendAuggieToolChoiceDirectiveToMessage(message, directive string) string {
+	message = strings.TrimSpace(message)
+	directive = strings.TrimSpace(directive)
+	switch {
+	case directive == "":
+		return message
+	case message == "":
+		return message
+	default:
+		return message + "\n\n" + directive
 	}
-
-	last := ""
-	for _, message := range messages.Array() {
-		if message.Get("role").String() != "user" {
-			continue
-		}
-		text := openAIMessageText(message.Get("content"))
-		if text != "" {
-			last = text
-		}
-	}
-	return last
 }
 
-func buildAuggieChatHistory(rawJSON []byte) []auggieChatHistoryEntry {
-	messagesResult := gjson.GetBytes(rawJSON, "messages")
-	if !messagesResult.IsArray() {
-		return nil
+func buildAuggieConversation(rawJSON []byte) (string, []auggieChatHistoryEntry) {
+	messages := gjson.GetBytes(rawJSON, "messages")
+	if !messages.IsArray() {
+		return "", nil
 	}
 
-	messages := messagesResult.Array()
-	lastUserIndex := -1
-	for i := len(messages) - 1; i >= 0; i-- {
-		if messages[i].Get("role").String() != "user" {
-			continue
-		}
-		if openAIMessageText(messages[i].Get("content")) == "" {
-			continue
-		}
-		lastUserIndex = i
-		break
-	}
-	if lastUserIndex <= 0 {
-		return nil
-	}
-
-	history := make([]auggieChatHistoryEntry, 0, lastUserIndex/2)
+	history := make([]auggieChatHistoryEntry, 0, len(messages.Array())/2)
 	pendingRequest := ""
-	for i := 0; i < lastUserIndex; i++ {
-		message := messages[i]
+	currentMessage := ""
+	for _, message := range messages.Array() {
+		role := strings.TrimSpace(message.Get("role").String())
 		text := openAIMessageText(message.Get("content"))
-		if text == "" {
-			continue
-		}
-
-		switch message.Get("role").String() {
+		switch role {
 		case "user":
+			if text == "" {
+				continue
+			}
 			if pendingRequest != "" {
 				history = append(history, auggieChatHistoryEntry{RequestMessage: pendingRequest})
 			}
 			pendingRequest = text
+			currentMessage = text
 		case "assistant":
 			if pendingRequest == "" {
 				continue
 			}
-			history = append(history, auggieChatHistoryEntry{
-				RequestMessage: pendingRequest,
-				ResponseText:   text,
-			})
+			hasToolCalls := openAIAssistantHasToolCalls(message)
+			if text == "" && !hasToolCalls {
+				continue
+			}
+			entry := auggieChatHistoryEntry{RequestMessage: pendingRequest}
+			if text != "" {
+				entry.ResponseText = text
+			}
+			if hasToolCalls {
+				entry.ResponseNodes = buildAuggieAssistantResponseNodes(message)
+			}
+			history = append(history, entry)
 			pendingRequest = ""
+			currentMessage = ""
+		case "tool":
+			currentMessage = ""
 		}
 	}
 
 	if pendingRequest != "" {
-		history = append(history, auggieChatHistoryEntry{RequestMessage: pendingRequest})
+		currentMessage = pendingRequest
 	}
-	return history
+	if len(history) == 0 {
+		return currentMessage, nil
+	}
+	return currentMessage, history
 }
 
 func buildAuggieToolDefinitions(rawJSON []byte) []auggieToolDefinition {
-	if strings.EqualFold(strings.TrimSpace(gjson.GetBytes(rawJSON, "tool_choice").String()), "none") {
+	if shouldOmitAuggieToolDefinitions(rawJSON) {
 		return nil
 	}
+	selectedToolNames := selectedAuggieToolChoiceNames(rawJSON)
 
 	tools := gjson.GetBytes(rawJSON, "tools")
-	if !tools.IsArray() {
-		return nil
+	if tools.IsArray() {
+		return buildAuggieToolDefinitionsFromTools(tools.Array(), selectedToolNames)
 	}
 
-	out := make([]auggieToolDefinition, 0, len(tools.Array()))
-	for _, tool := range tools.Array() {
-		switch strings.TrimSpace(tool.Get("type").String()) {
-		case "function":
+	functions := gjson.GetBytes(rawJSON, "functions")
+	if !functions.IsArray() {
+		return nil
+	}
+	return buildAuggieToolDefinitionsFromLegacyFunctions(functions.Array(), selectedToolNames)
+}
+
+func shouldOmitAuggieToolDefinitions(rawJSON []byte) bool {
+	if strings.EqualFold(strings.TrimSpace(gjson.GetBytes(rawJSON, "tool_choice").String()), "none") {
+		return true
+	}
+	functions := gjson.GetBytes(rawJSON, "functions")
+	return functions.IsArray() && strings.EqualFold(strings.TrimSpace(gjson.GetBytes(rawJSON, "function_call").String()), "none")
+}
+
+func buildAuggieToolDefinitionsFromTools(tools []gjson.Result, selectedToolNames map[string]bool) []auggieToolDefinition {
+	out := make([]auggieToolDefinition, 0, len(tools))
+	for _, tool := range tools {
+		switch toolType := strings.TrimSpace(tool.Get("type").String()); {
+		case toolType == "function":
 			name := strings.TrimSpace(tool.Get("function.name").String())
 			if name == "" {
+				continue
+			}
+			if len(selectedToolNames) > 0 && !selectedToolNames[strings.ToLower(name)] {
 				continue
 			}
 
@@ -219,13 +285,170 @@ func buildAuggieToolDefinitions(rawJSON []byte) []auggieToolDefinition {
 				Description:     strings.TrimSpace(tool.Get("function.description").String()),
 				InputSchemaJSON: inputSchemaJSON,
 			})
-		case "web_search":
+		case isAuggieSupportedWebSearchToolType(toolType):
+			if len(selectedToolNames) > 0 && !selectedToolNames["web_search"] && !selectedToolNames["web-search"] {
+				continue
+			}
 			out = append(out, auggieToolDefinition{
 				Name: "web-search",
 			})
 		}
 	}
 	return out
+}
+
+func buildAuggieToolDefinitionsFromLegacyFunctions(functions []gjson.Result, selectedToolNames map[string]bool) []auggieToolDefinition {
+	out := make([]auggieToolDefinition, 0, len(functions))
+	for _, function := range functions {
+		name := strings.TrimSpace(function.Get("name").String())
+		if name == "" {
+			continue
+		}
+		if len(selectedToolNames) > 0 && !selectedToolNames[strings.ToLower(name)] {
+			continue
+		}
+
+		inputSchemaJSON := "{}"
+		if parameters := function.Get("parameters"); parameters.Exists() {
+			inputSchemaJSON = parameters.Raw
+		}
+
+		out = append(out, auggieToolDefinition{
+			Name:            name,
+			Description:     strings.TrimSpace(function.Get("description").String()),
+			InputSchemaJSON: inputSchemaJSON,
+		})
+	}
+	return out
+}
+
+func buildAuggieToolChoiceDirective(rawJSON []byte) string {
+	return ""
+}
+
+func selectedAuggieFunctionToolChoiceName(rawJSON []byte) string {
+	toolChoice := gjson.GetBytes(rawJSON, "tool_choice")
+	if toolChoice.IsObject() {
+		toolChoiceType := strings.TrimSpace(toolChoice.Get("type").String())
+		if strings.EqualFold(toolChoiceType, "function") || strings.EqualFold(toolChoiceType, "custom") {
+			name := strings.TrimSpace(toolChoice.Get("function.name").String())
+			if name != "" {
+				return name
+			}
+			if name = strings.TrimSpace(toolChoice.Get("name").String()); name != "" {
+				return name
+			}
+		}
+	}
+
+	functionCall := gjson.GetBytes(rawJSON, "function_call")
+	if !functionCall.IsObject() {
+		return ""
+	}
+	if name := strings.TrimSpace(functionCall.Get("name").String()); name != "" {
+		return name
+	}
+	return strings.TrimSpace(functionCall.Get("function.name").String())
+}
+
+func selectedAuggieToolChoiceNames(rawJSON []byte) map[string]bool {
+	if name := selectedAuggieFunctionToolChoiceName(rawJSON); name != "" {
+		return map[string]bool{strings.ToLower(name): true}
+	}
+	_, selected := selectedAuggieAllowedToolsChoice(rawJSON)
+	if len(selected) == 0 {
+		return nil
+	}
+	return selected
+}
+
+func selectedAuggieAllowedToolsChoice(rawJSON []byte) (string, map[string]bool) {
+	toolChoice := gjson.GetBytes(rawJSON, "tool_choice")
+	if !toolChoice.IsObject() || !strings.EqualFold(strings.TrimSpace(toolChoice.Get("type").String()), "allowed_tools") {
+		return "", nil
+	}
+
+	container := toolChoice.Get("allowed_tools")
+	if !container.Exists() || !container.IsObject() {
+		container = toolChoice
+	}
+
+	selectedToolNames := make(map[string]bool)
+	if tools := container.Get("tools"); tools.Exists() && tools.IsArray() {
+		for _, tool := range tools.Array() {
+			toolType := strings.TrimSpace(tool.Get("type").String())
+			switch toolType {
+			case "function", "custom":
+				name := strings.TrimSpace(tool.Get("function.name").String())
+				if name == "" {
+					name = strings.TrimSpace(tool.Get("name").String())
+				}
+				if name != "" {
+					selectedToolNames[strings.ToLower(name)] = true
+				}
+			default:
+				if isAuggieSupportedWebSearchToolType(toolType) {
+					selectedToolNames["web_search"] = true
+				}
+			}
+		}
+	}
+
+	return strings.TrimSpace(container.Get("mode").String()), selectedToolNames
+}
+
+func openAIAssistantHasToolCalls(message gjson.Result) bool {
+	toolCalls := message.Get("tool_calls")
+	return toolCalls.Exists() && toolCalls.IsArray() && len(toolCalls.Array()) > 0
+}
+
+func isAuggieSupportedWebSearchToolType(toolType string) bool {
+	switch strings.ToLower(strings.TrimSpace(toolType)) {
+	case "web_search", "web_search_preview", "web_search_preview_2025_03_11", "web_search_2025_08_26":
+		return true
+	default:
+		return false
+	}
+}
+
+func buildAuggieAssistantResponseNodes(message gjson.Result) []auggieChatResponseNode {
+	toolCalls := message.Get("tool_calls")
+	if !toolCalls.Exists() || !toolCalls.IsArray() {
+		return nil
+	}
+
+	nodes := make([]auggieChatResponseNode, 0, len(toolCalls.Array()))
+	nodeID := 1
+	for _, toolCall := range toolCalls.Array() {
+		toolUseID := strings.TrimSpace(toolCall.Get("id").String())
+		toolName := strings.TrimSpace(toolCall.Get("function.name").String())
+		if toolUseID == "" || toolName == "" {
+			continue
+		}
+
+		inputJSON := strings.TrimSpace(toolCall.Get("function.arguments").String())
+		if inputJSON == "" && toolCall.Get("function.arguments").Exists() {
+			inputJSON = strings.TrimSpace(toolCall.Get("function.arguments").Raw)
+		}
+		if inputJSON == "" {
+			inputJSON = "{}"
+		}
+
+		nodes = append(nodes, auggieChatResponseNode{
+			ID:      nodeID,
+			Type:    5,
+			Content: "",
+			ToolUse: &auggieChatToolUse{
+				ToolUseID: toolUseID,
+				ToolName:  toolName,
+				InputJSON: inputJSON,
+				IsPartial: false,
+			},
+		})
+		nodeID++
+	}
+
+	return nodes
 }
 
 func buildAuggieRequestNodes(rawJSON []byte) []auggieChatRequestNode {

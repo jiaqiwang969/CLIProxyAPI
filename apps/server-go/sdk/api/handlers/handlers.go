@@ -42,6 +42,10 @@ type ErrorDetail struct {
 	// Type is the category of error that occurred (e.g., "invalid_request_error").
 	Type string `json:"type"`
 
+	// Param identifies the request parameter associated with the error when available.
+	// OpenAI-compatible generic errors serialize this as null when no specific parameter applies.
+	Param any `json:"param"`
+
 	// Code is a short code identifying the error, if applicable.
 	Code string `json:"code,omitempty"`
 }
@@ -133,6 +137,7 @@ func BuildErrorResponseBody(status int, errText string) []byte {
 		Error: ErrorDetail{
 			Message: errText,
 			Type:    errType,
+			Param:   nil,
 			Code:    code,
 		},
 	})
@@ -862,6 +867,12 @@ func (h *BaseAPIHandler) getRequestDetailsForContext(ctx context.Context, modelN
 	}
 
 	return providers, normalizedModel, nil
+}
+
+// GetRequestDetailsForContext resolves the candidate providers and normalized model
+// after applying request-scoped access restrictions.
+func (h *BaseAPIHandler) GetRequestDetailsForContext(ctx context.Context, modelName string) (providers []string, normalizedModel string, err *interfaces.ErrorMessage) {
+	return h.getRequestDetailsForContext(ctx, modelName)
 }
 
 func filterProvidersByScope(providers []string, scopedProvider string) []string {
