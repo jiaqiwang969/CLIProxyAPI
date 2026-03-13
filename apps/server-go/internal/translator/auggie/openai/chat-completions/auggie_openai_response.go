@@ -153,6 +153,12 @@ func ConvertAuggieResponseToOpenAI(_ context.Context, modelName string, original
 				argsStr = "{}"
 			}
 
+			// Auggie generates unified-diff patches for apply_patch, but
+			// Codex CLI expects the *** Begin Patch format. Convert here.
+			if toolName == "apply_patch" {
+				argsStr = convertApplyPatchArgs(argsStr)
+			}
+
 			tcArray = append(tcArray, map[string]any{
 				"index": state.FunctionIndex,
 				"id":    toolID,
@@ -272,6 +278,12 @@ func auggieTextFromNode(node gjson.Result) string {
 	if !node.Exists() || !node.IsObject() {
 		return ""
 	}
+	// Type 0 nodes are final accumulated text summaries that duplicate content
+	// already streamed via the top-level "text" field. Skip them to avoid
+	// emitting the same content twice.
+	if nodeType := node.Get("type"); nodeType.Exists() && nodeType.Int() == 0 {
+		return ""
+	}
 	if tu := node.Get("tool_use"); tu.Exists() && tu.Type != gjson.Null {
 		return ""
 	}
@@ -289,6 +301,157 @@ func auggieTextFromNode(node gjson.Result) string {
 		return ""
 	}
 	return content.String()
+}
+
+// convertApplyPatchArgs rewrites the apply_patch arguments so that the
+// freeform "input" field uses the *** Begin Patch format that Codex CLI
+// expects, instead of the unified-diff format that Auggie produces.
+func convertApplyPatchArgs(argsStr string) string {
+	argsStr = strings.TrimSpace(argsStr)
+	if argsStr == "" || argsStr == "{}" {
+		return argsStr
+	}
+
+	// Extract the raw patch text from the JSON wrapper {"input": "..."}
+	var patchText string
+	if gjson.Valid(argsStr) {
+		parsed := gjson.Parse(argsStr)
+		if parsed.IsObject() {
+			if input := parsed.Get("input"); input.Exists() && input.Type == gjson.String {
+				patchText = input.String()
+			}
+		}
+		if patchText == "" && parsed.Type == gjson.String {
+			patchText = parsed.String()
+		}
+	}
+	if patchText == "" {
+		patchText = argsStr
+	}
+
+	// Already in Codex format – nothing to do.
+	if strings.HasPrefix(strings.TrimSpace(patchText), "*** Begin Patch") {
+		return argsStr
+	}
+
+	// Only convert if it looks like a unified diff.
+	trimmed := strings.TrimSpace(patchText)
+	if !strings.HasPrefix(trimmed, "--- ") && !strings.HasPrefix(trimmed, "diff ") {
+		return argsStr
+	}
+
+	converted := unifiedDiffToCodexPatch(patchText)
+	if converted == "" {
+		return argsStr
+	}
+
+	result, err := sjson.Set("{}", "input", converted)
+	if err != nil {
+		return argsStr
+	}
+	return result
+}
+
+// unifiedDiffToCodexPatch converts a unified-diff string into the
+// *** Begin Patch / *** End Patch format expected by Codex CLI.
+func unifiedDiffToCodexPatch(diff string) string {
+	lines := strings.Split(diff, "\n")
+	var out strings.Builder
+	out.WriteString("*** Begin Patch\n")
+
+	i := 0
+	for i < len(lines) {
+		line := lines[i]
+
+		// Skip "diff --git ..." header lines
+		if strings.HasPrefix(line, "diff ") {
+			i++
+			continue
+		}
+
+		// Detect file header: --- a/path or --- /dev/null
+		if strings.HasPrefix(line, "--- ") && i+1 < len(lines) && strings.HasPrefix(lines[i+1], "+++ ") {
+			oldFile := strings.TrimPrefix(line, "--- ")
+			newFile := strings.TrimPrefix(lines[i+1], "+++ ")
+			// Strip a/ b/ prefixes
+			oldFile = strings.TrimPrefix(strings.TrimPrefix(oldFile, "a/"), "/dev/null")
+			newFile = strings.TrimPrefix(strings.TrimPrefix(newFile, "b/"), "/dev/null")
+			oldFile = strings.TrimSpace(oldFile)
+			newFile = strings.TrimSpace(newFile)
+			i += 2
+
+			isNew := oldFile == "" || strings.TrimSpace(line) == "--- /dev/null"
+			isDelete := newFile == "" || strings.TrimSpace(lines[i-1]) == "+++ /dev/null"
+
+			if isDelete {
+				out.WriteString("*** Delete File: " + oldFile + "\n")
+				// Skip remaining hunks for this file
+				for i < len(lines) && !strings.HasPrefix(lines[i], "--- ") && !strings.HasPrefix(lines[i], "diff ") {
+					i++
+				}
+				continue
+			}
+
+			if isNew {
+				out.WriteString("*** Add File: " + newFile + "\n")
+				// Skip @@ line
+				if i < len(lines) && strings.HasPrefix(lines[i], "@@") {
+					i++
+				}
+				// Collect all + lines
+				for i < len(lines) {
+					l := lines[i]
+					if strings.HasPrefix(l, "--- ") || strings.HasPrefix(l, "diff ") || l == "" && i+1 < len(lines) && (strings.HasPrefix(lines[i+1], "--- ") || strings.HasPrefix(lines[i+1], "diff ")) {
+						break
+					}
+					if strings.HasPrefix(l, "+") {
+						out.WriteString(l + "\n")
+					} else if strings.HasPrefix(l, "@@") {
+						// Another hunk in the same new file – shouldn't happen but handle it
+						i++
+						continue
+					}
+					i++
+				}
+				continue
+			}
+
+			// Update file
+			out.WriteString("*** Update File: " + newFile + "\n")
+			// Process hunks
+			for i < len(lines) {
+				l := lines[i]
+				if strings.HasPrefix(l, "--- ") || strings.HasPrefix(l, "diff ") {
+					break
+				}
+				if strings.HasPrefix(l, "@@") {
+					// Extract context from @@ -n,m +n,m @@ context
+					parts := strings.SplitN(l, "@@", 3)
+					ctx := ""
+					if len(parts) >= 3 {
+						ctx = strings.TrimSpace(parts[2])
+					}
+					if ctx != "" {
+						out.WriteString("@@ " + ctx + "\n")
+					} else {
+						out.WriteString("@@\n")
+					}
+					i++
+					continue
+				}
+				if strings.HasPrefix(l, "+") || strings.HasPrefix(l, "-") || strings.HasPrefix(l, " ") {
+					out.WriteString(l + "\n")
+				}
+				i++
+			}
+			continue
+		}
+
+		i++
+	}
+
+	out.WriteString("*** End Patch\n")
+	return out.String()
 }
 
 func requestIncludesReasoningEncryptedContent(rawJSON []byte) bool {

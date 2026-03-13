@@ -108,14 +108,24 @@ func buildAuggieConversationIdentifiers() (string, string) {
 }
 
 func buildAuggieFeatureDetectionFlags(rawJSON []byte) *auggieFeatureDetectionFlags {
+	// Auggie upstream requires feature_detection_flags to enable tool-use mode.
+	// Without this field, tool_definitions are ignored and the model falls back
+	// to emitting tool invocations as plain-text code fences.
+	// Always emit the flags when tool definitions are present.
+	hasTools := gjson.GetBytes(rawJSON, "tools").Exists() ||
+		gjson.GetBytes(rawJSON, "functions").Exists()
+
 	parallelToolCalls := gjson.GetBytes(rawJSON, "parallel_tool_calls")
-	if !parallelToolCalls.Exists() {
+	if !parallelToolCalls.Exists() && !hasTools {
 		return nil
 	}
 
-	supportParallelToolUse := parallelToolCalls.Bool()
+	supportParallel := true
+	if parallelToolCalls.Exists() {
+		supportParallel = parallelToolCalls.Bool()
+	}
 	return &auggieFeatureDetectionFlags{
-		SupportParallelToolUse: &supportParallelToolUse,
+		SupportParallelToolUse: &supportParallel,
 	}
 }
 
@@ -237,10 +247,24 @@ func buildAuggieConversation(rawJSON []byte) (string, []auggieChatHistoryEntry) 
 			pendingRequest = text
 			currentMessage = text
 		case "assistant":
+			hasToolCalls := openAIAssistantHasToolCalls(message)
 			if pendingRequest == "" {
+				// Responses API may split a single assistant turn into
+				// many messages: text, tool_calls, more text, more
+				// tool_calls, etc. All of these belong to the same
+				// logical turn. Merge tool_calls (and any extra text)
+				// into the most recent history entry.
+				if len(history) > 0 {
+					last := &history[len(history)-1]
+					if hasToolCalls {
+						last.ResponseNodes = append(last.ResponseNodes, buildAuggieAssistantResponseNodes(message)...)
+					}
+					if text != "" && last.ResponseText == "" {
+						last.ResponseText = text
+					}
+				}
 				continue
 			}
-			hasToolCalls := openAIAssistantHasToolCalls(message)
 			if text == "" && !hasToolCalls {
 				continue
 			}
@@ -315,6 +339,33 @@ func buildAuggieToolDefinitionsFromTools(tools []gjson.Result, selectedToolNames
 			out = append(out, auggieToolDefinition{
 				Name:            name,
 				Description:     strings.TrimSpace(tool.Get("function.description").String()),
+				InputSchemaJSON: inputSchemaJSON,
+			})
+		case toolType == "custom":
+			// Custom tools (e.g. apply_patch, js_repl) use a freeform text
+			// input. Bridge them as a single-string-parameter function so
+			// Auggie's upstream can invoke them.
+			name := strings.TrimSpace(tool.Get("name").String())
+			if name == "" {
+				continue
+			}
+			if len(selectedToolNames) > 0 && !selectedToolNames[strings.ToLower(name)] {
+				continue
+			}
+			desc := strings.TrimSpace(tool.Get("description").String())
+			// Append the grammar definition to the description so the upstream
+			// model knows the exact freeform syntax it must produce (e.g. the
+			// *** Begin Patch / *** End Patch format expected by Codex CLI).
+			if formatDef := strings.TrimSpace(tool.Get("format.definition").String()); formatDef != "" {
+				desc += "\n\nThe tool input MUST follow this grammar exactly:\n" + formatDef
+			}
+			inputSchemaJSON := `{"type":"object","properties":{"input":{"type":"string"}},"required":["input"]}`
+			if parameters := tool.Get("parameters"); parameters.Exists() {
+				inputSchemaJSON = parameters.Raw
+			}
+			out = append(out, auggieToolDefinition{
+				Name:            name,
+				Description:     desc,
 				InputSchemaJSON: inputSchemaJSON,
 			})
 		case isAuggieSupportedWebSearchToolType(toolType):
@@ -489,10 +540,29 @@ func buildAuggieRequestNodes(rawJSON []byte) []auggieChatRequestNode {
 		return nil
 	}
 
-	nodes := make([]auggieChatRequestNode, 0, len(messages.Array()))
+	// Only include tool results that belong to the current (final) turn.
+	// In Augment's model a "turn" starts with the last user message.
+	// Everything after that user message (assistant text, tool_calls,
+	// tool results, more assistant text, more tool_calls, more tool
+	// results) is one logical assistant turn. Tool results from earlier
+	// user turns are already captured in chat_history via response_nodes.
+	msgArray := messages.Array()
+	lastUserIdx := -1
+	for i := len(msgArray) - 1; i >= 0; i-- {
+		if msgArray[i].Get("role").String() == "user" {
+			lastUserIdx = i
+			break
+		}
+	}
+
+	nodes := make([]auggieChatRequestNode, 0)
 	nodeID := 1
-	for _, message := range messages.Array() {
+	for i, message := range msgArray {
 		if message.Get("role").String() != "tool" {
+			continue
+		}
+		// Skip tool results from previous user turns.
+		if i <= lastUserIdx {
 			continue
 		}
 

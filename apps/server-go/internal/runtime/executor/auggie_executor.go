@@ -2200,6 +2200,12 @@ func synthesizeOpenAIResponseChunks(openAIPayload []byte) ([][]byte, error) {
 	if reasoningEncrypted := strings.TrimSpace(root.Get("choices.0.message.reasoning_encrypted_content").String()); reasoningEncrypted != "" {
 		delta["reasoning_encrypted_content"] = reasoningEncrypted
 	}
+	// Carry tool_calls from the aggregated message into the synthesized chunk
+	// so the downstream Responses-API translator can emit custom_tool_call /
+	// function_call SSE events.
+	if toolCalls := root.Get("choices.0.message.tool_calls"); toolCalls.Exists() && toolCalls.IsArray() && len(toolCalls.Array()) > 0 {
+		delta["tool_calls"] = toolCalls.Value()
+	}
 
 	firstChunk := map[string]any{
 		"id":      responseID,
